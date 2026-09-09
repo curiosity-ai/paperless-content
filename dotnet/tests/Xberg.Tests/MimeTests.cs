@@ -246,4 +246,51 @@ public class MimeTests
 
         Assert.Equal("text/html", Mime.ResolveWithContent("text/plain", bytes));
     }
+
+    // ── legacy OLE2 typing by root CLSID (xberg-io/xberg#1590) ────────────────
+
+    /// <summary>
+    /// A compound file cannot be typed from its magic bytes alone: <c>.doc</c>, <c>.xls</c> and
+    /// <c>.ppt</c> share the container, and only the root storage's CLSID tells them apart. Before
+    /// upstream's <c>fix(pdf,mime): … type OLE2 files by path</c> the port answered
+    /// <c>application/msword</c> for all three.
+    /// </summary>
+    [Theory]
+    [InlineData("00020906-0000-0000-c000-000000000046", "application/msword")]
+    [InlineData("00020810-0000-0000-c000-000000000046", "application/vnd.ms-excel")]
+    [InlineData("00020820-0000-0000-c000-000000000046", "application/vnd.ms-excel")]
+    [InlineData("64818d10-4f9b-11cf-86ea-00aa00b929e8", "application/vnd.ms-powerpoint")]
+    public void ALegacyOleDocumentIsTypedByItsRootClsid(string clsid, string expected)
+    {
+        // Padded past the 4 KiB sniff window, which is the size a real Office document has and
+        // the reason the header alone can never settle this: the FAT chain that locates the root
+        // directory entry references sectors a truncated prefix does not contain.
+        byte[] content = CfbBuilder.Build(Guid.Parse(clsid), ("Padding", new byte[8192]));
+        Assert.True(content.Length > 4096);
+
+        Assert.Equal(expected, Mime.DetectMimeTypeFromBytes(content));
+    }
+
+    /// <summary>The CLSID is confident enough to overrule a wrong extension, as any other
+    /// content-based finding is.</summary>
+    [Fact]
+    public void AWorkbookNamedDocIsStillAWorkbook()
+    {
+        byte[] content = CfbBuilder.Build(
+            Guid.Parse("00020810-0000-0000-c000-000000000046"), ("Padding", new byte[8192]));
+
+        Assert.Equal("application/vnd.ms-excel", Mime.ResolveWithContent("application/msword", content));
+    }
+
+    /// <summary>A container declaring a CLSID this port does not recognise stays ambiguous, so
+    /// the extension keeps its say — an <c>.msg</c> or <c>.hwp</c> must not be renamed to Word.
+    /// </summary>
+    [Fact]
+    public void AnUnrecognisedClsidLeavesTheExtensionInCharge()
+    {
+        byte[] content = CfbBuilder.Build(
+            Guid.Parse("0006f020-0000-0000-c000-000000000046"), ("Padding", new byte[8192]));
+
+        Assert.Equal("application/vnd.ms-outlook", Mime.ResolveWithContent("application/vnd.ms-outlook", content));
+    }
 }

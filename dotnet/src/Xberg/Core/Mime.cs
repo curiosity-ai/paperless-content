@@ -40,12 +40,50 @@ public static class Mime
     /// <summary>The MIME every source file resolves to, whatever language it turns out to be.</summary>
     public const string CodeMimeType = "text/x-source-code";
 
+    /// <summary>The MS-CFB (compound binary file) signature, shared by legacy .doc/.xls/.ppt.</summary>
+    private static bool IsOle2(ReadOnlySpan<byte> b) =>
+        b.Length >= 8 && b[0] == 0xD0 && b[1] == 0xCF && b[2] == 0x11 && b[3] == 0xE0 &&
+        b[4] == 0xA1 && b[5] == 0xB1 && b[6] == 0x1A && b[7] == 0xE1;
+
+    /// <summary>
+    /// Identify a legacy MS-CFB compound document (.doc/.xls/.ppt) from its root storage CLSID,
+    /// returning null when the container declares one this port does not recognise.
+    /// </summary>
+    /// <remarks>
+    /// Ports upstream's <c>detect_ole2_package</c>. The container magic is shared by every legacy
+    /// Office binary format, so without this a <c>.xls</c> or <c>.ppt</c> whose extension is
+    /// missing or wrong was answered as <c>application/msword</c>. A compound file cannot be
+    /// typed from a truncated prefix — locating the root directory entry means following the FAT
+    /// sector chain, and a chain built from a partial read references sectors the buffer does not
+    /// contain — so this is only attempted against the whole file (xberg-io/xberg#1590).
+    /// </remarks>
+    private static string? DetectOle2Package(ReadOnlySpan<byte> content)
+    {
+        if (!IsOle2(content)) return null;
+        try
+        {
+            return Internal.Cfb.CompoundFile.Open(content).RootClsid.ToString() switch
+            {
+                "00020810-0000-0000-c000-000000000046" or "00020820-0000-0000-c000-000000000046"
+                    => "application/vnd.ms-excel",
+                "00020906-0000-0000-c000-000000000046" => "application/msword",
+                "64818d10-4f9b-11cf-86ea-00aa00b929e8" => "application/vnd.ms-powerpoint",
+                _ => null,
+            };
+        }
+        catch (Exception e) when (e is InvalidDataException or ArgumentException or IndexOutOfRangeException)
+        {
+            return null;
+        }
+    }
+
     /// <summary>Content-based detection. Returns null when the type cannot be determined.</summary>
     public static string? DetectMimeTypeFromBytes(ReadOnlySpan<byte> content, bool sourceCode = true)
     {
         string? magic = SniffMagic(content);
         if (magic is not null)
         {
+            if (IsOle2(content) && DetectOle2Package(content) is { } ole2) return ole2;
             if (magic == "application/zip")
             {
                 string? office = DetectOfficeFormatFromZip(content);
@@ -134,7 +172,13 @@ public static class Mime
         var header = content.Length > MagicHeaderBytes ? content[..MagicHeaderBytes] : content;
         if (header.IsEmpty) return extensionMime;
 
-        string? fromMagic = DetectMimeTypeFromBytes(header, sourceCode);
+        // A compound file is the exception to reading only the header: its magic names the
+        // container, not the format, and the root directory entry that does name the format is
+        // reached by following the FAT sector chain — through sectors a 4 KiB prefix does not
+        // contain (xberg-io/xberg#1590). Resolve it over the whole buffer instead.
+        string? fromMagic = IsOle2(content)
+            ? DetectOle2Package(content)
+            : DetectMimeTypeFromBytes(header, sourceCode);
         if (fromMagic is null || fromMagic == extensionMime) return extensionMime;
 
         if (fromMagic == "text/plain") return extensionMime;
@@ -387,9 +431,10 @@ public static class Mime
         if (b.Length >= 4 && ((b[0] == 0x49 && b[1] == 0x49 && b[2] == 0x2A && b[3] == 0x00) ||
                               (b[0] == 0x4D && b[1] == 0x4D && b[2] == 0x00 && b[3] == 0x2A))) return "image/tiff";
         if (b.Length >= 4 && b[0] == 0x25 && b[1] == 0x50 && b[2] == 0x44 && b[3] == 0x46) return "application/pdf";
-        // OLE2 / CFB compound file (doc/xls/ppt/msg/hwp) — default to msword without CLSID resolution.
-        if (b.Length >= 8 && b[0] == 0xD0 && b[1] == 0xCF && b[2] == 0x11 && b[3] == 0xE0 &&
-            b[4] == 0xA1 && b[5] == 0xB1 && b[6] == 0x1A && b[7] == 0xE1) return "application/msword";
+        // OLE2 / CFB compound file (doc/xls/ppt/msg/hwp). The container magic names only the
+        // container, so `DetectMimeTypeFromBytes` follows up with the root storage's CLSID;
+        // `application/msword` is what a caller sees when that read cannot settle it.
+        if (IsOle2(b)) return "application/msword";
         if (b.Length >= 6 && b[0] == 0x37 && b[1] == 0x7A && b[2] == 0xBC && b[3] == 0xAF && b[4] == 0x27 && b[5] == 0x1C)
             return "application/x-7z-compressed";
         if (b.Length >= 2 && b[0] == 0x1F && b[1] == 0x8B) return "application/gzip";

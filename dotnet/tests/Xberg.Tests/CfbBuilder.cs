@@ -29,7 +29,14 @@ internal static class CfbBuilder
 
     /// <summary>Build a container holding the given streams at the root storage.</summary>
     /// <param name="streams">Stream name (no leading '/') and its bytes, in directory order.</param>
-    public static byte[] Build(params (string Name, byte[] Data)[] streams)
+    public static byte[] Build(params (string Name, byte[] Data)[] streams) =>
+        Build(Guid.Empty, streams);
+
+    /// <summary>
+    /// Build a container whose root storage declares <paramref name="rootClsid"/> — the class id
+    /// that tells one legacy Office binary format from another.
+    /// </summary>
+    public static byte[] Build(Guid rootClsid, params (string Name, byte[] Data)[] streams)
     {
         // Small streams are packed into the mini stream, which is itself one ordinary
         // sector-chained stream owned by the root entry.
@@ -113,7 +120,7 @@ internal static class CfbBuilder
             Buffer.BlockCopy(ToBytes(miniFat), 0, image, SectorOffset(miniFatStart), miniFatSectors * SectorSize);
 
         WriteDirectory(image, SectorOffset(dirStart), dirSectorCount, streams, startSectors,
-            miniStreamStart, miniStream.Count);
+            miniStreamStart, miniStream.Count, rootClsid);
 
         Buffer.BlockCopy(ToBytes(fat), 0, image, SectorOffset(fatStart), fatSectorCount * SectorSize);
         return image;
@@ -164,7 +171,7 @@ internal static class CfbBuilder
     private static void WriteDirectory(
         byte[] image, int offset, int dirSectorCount,
         (string Name, byte[] Data)[] streams, uint[] startSectors,
-        uint miniStreamStart, int miniStreamLength)
+        uint miniStreamStart, int miniStreamLength, Guid rootClsid)
     {
         // Unused entries must read as empty (type 0) with no siblings, rather than as an entry
         // at sector 0 pointing back into the tree.
@@ -182,6 +189,7 @@ internal static class CfbBuilder
         WriteDirEntry(image, offset, "Root Entry", type: 5,
             start: miniStreamStart, size: (ulong)miniStreamLength,
             left: Nostream, right: Nostream, child: streams.Length > 0 ? 1u : Nostream);
+        rootClsid.TryWriteBytes(image.AsSpan(offset + 80, 16));
 
         for (int i = 0; i < streams.Length; i++)
             WriteDirEntry(image, offset + (i + 1) * DirEntrySize, streams[i].Name, type: 2,
