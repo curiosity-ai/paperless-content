@@ -1,8 +1,8 @@
-# X-Ray C# Port — Work Breakdown
+# X-Ray.Content C# Port — Work Breakdown
 
 Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[-]` out of scope (dropped)
 
-Each format is "done" when the `XRay.TestRunner` output matches the locally generated
+Each format is "done" when the `XRay.Content.TestRunner` output matches the locally generated
 `{filename}-results-rust.json` golden files for its fixtures (documented deviations allowed).
 See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate them.
 
@@ -637,21 +637,21 @@ Both maths converters are **now ported**, and with them every adoc and typ fixtu
 
 - **asciidoc (0 -> 6 of 6).** `mathemascii` 0.4.0 (scanner, lexer, parser, AST) and the slice of
   `alemat` 0.8.0 it renders MathML through, both translated to C# under
-  `src/XRay/Internal/Math/AsciiMath*.cs`, with the AsciiDoc extractor's inline macros and
+  `src/XRay.Content/Internal/Math/AsciiMath*.cs`, with the AsciiDoc extractor's inline macros and
   `++++` math blocks wired to them. The MathML then goes through this port's existing
   MathML-to-LaTeX converter — the same indirection upstream chose, so AsciiMath inherits that
   converter's fixes. Validated against a probe built on the real crate: 322 expressions — every
   `stem:`/`asciimath:` macro and math-block body in the corpus, plus the crate's own test
   inputs — render byte-identical MathML, panics included.
 - **typst (6 -> 12 of 12).** The math-mode slice of `typst-syntax` 0.15.1 — its scanner, lexer,
-  syntax tree and parser — translated to C# under `src/XRay/Internal/Math/Typst*.cs`, plus the
+  syntax tree and parser — translated to C# under `src/XRay.Content/Internal/Math/Typst*.cs`, plus the
   540-line render walk. Validated the same way: 486 of the 487 `$…$` spans in the corpus parse
   to a tree identical to the crate's own, the last being a documentation placeholder that
   renders the same either way.
 
 Both crates are Apache-2.0, where everything else the port derives from is MIT or dual
 `MIT OR Apache-2.0`. See `dotnet/THIRD_PARTY_NOTICES.md`: the derived files stay under
-Apache-2.0, which is why `<Packagelicense>MIT</Packagelicense>` in `XRay.csproj` no longer
+Apache-2.0, which is why `<Packagelicense>MIT</Packagelicense>` in `XRay.Content.csproj` no longer
 describes the whole assembly.
 
 Two reductions, both recorded in the file headers:
@@ -786,7 +786,7 @@ after the spans — in `PdfOxideSegments.FromPage`'s reorder/rejoin, or in the t
 themselves. Rebuild the probe in the scratchpad with `pdf_oxide = "=0.3.77"` and
 `CARGO_TARGET_DIR` pointed at the reference generator's target directory so the dependency is
 not compiled twice; dump C# spans through a scratch project whose `AssemblyName` is
-`XRay.Tests`, which is how it reaches the internals without touching the repo.
+`XRay.Content.Tests`, which is how it reaches the internals without touching the repo.
 
 **Settled: the upright-frame revert was fitting the port to stale goldens.** `988b17ba14` made
 `SplitSegmentToWords` take its origin from `seg.UprightOrigin()` — where upstream's
@@ -1736,11 +1736,11 @@ attributed to it.
 
 - [x] Analyze the Rust repo; identify the content-extraction subset.
 - [x] Write `dotnet/Claude.md` (architecture + mapping).
-- [x] Create the `dotnet/` solution: `XRay` (lib), `XRay.Tests`, `XRay.TestRunner` (CLI).
+- [x] Create the `dotnet/` solution: `XRay.Content` (lib), `XRay.Content.Tests`, `XRay.Content.TestRunner` (CLI).
 - [x] Write the Rust golden-reference generator (`tools/xberg-reference-gen`).
 - [x] Run the generator over `../test_documents` to produce the `*-results-rust.json`
       goldens (generated locally, not committed — see `Claude.md`).
-- [x] Wire `XRay.TestRunner` to load fixtures + golden files and diff per format.
+- [x] Wire `XRay.Content.TestRunner` to load fixtures + golden files and diff per format.
 
 ## Phase 1 — Core spine (foundational; everything depends on it)
 
@@ -1763,7 +1763,7 @@ attributed to it.
 - [x] `Rendering/Djot`.
 - [x] `Core/Derive`: `InternalDocument → ExtractedDocument` (native path of `derive.rs`):
       page splitting, structure derivation, language detection (optional), URI collection.
-- [x] `XRay` public API: `Extract(input, config)` sync + async, `ExtractBatch`.
+- [x] `XRay.Content` public API: `Extract(input, config)` sync + async, `ExtractBatch`.
 
 ## Phase 2 — Office formats (priority)
 
@@ -1853,7 +1853,7 @@ hand-written ONNX runtime instead of a binding. See `tools/onnx-parity/README.md
       from `layout/types.rs`, including the exact preprocessing contract: bilinear resize to
       an exact 640x640 (aspect ratio *not* preserved), `/255`, no ImageNet normalisation.
 - [x] **Layer-by-layer validation** against ONNX Runtime via `tools/onnx-parity` and
-      `tools/XRay.OnnxParity`. Every operator instance matches in isolation; all detections
+      `tools/XRay.Content.OnnxParity`. Every operator instance matches in isolation; all detections
       above threshold agree in class, confidence and geometry.
 - [x] **Model acquisition** — `layout/model_manager.rs` ported 2026-08-26
       (`Internal/Layout/LayoutModelManager.cs`): seven models each pinned to a Hugging Face
@@ -2024,7 +2024,7 @@ hand-written ONNX runtime instead of a binding. See `tools/onnx-parity/README.md
       closing them and so pass the 1024 nesting cap. Upstream refuses them too — its golden for
       `redp5110_sampled.doctags.txt` records exactly the message this port now produces. Corpus
       parity was unchanged at 2926/3007.
-- [ ] CI: build + run `XRay.TestRunner` on the fixtures; publish NuGet on tag. Note the
+- [ ] CI: build + run `XRay.Content.TestRunner` on the fixtures; publish NuGet on tag. Note the
       corpus is no longer self-contained: CI must run `test_documents/scripts/fetch_corpus.py`
       and regenerate goldens, since neither the binaries nor the goldens are in git.
 - [ ] Performance: the 55 MB `parsebench/text_content.jsonl` fixture takes ~29s to render
@@ -2188,7 +2188,7 @@ Requested feature, not upstream parity. Recorded as a deviation in `Claude.md`
       Additive only, never fatal (failures become `ProcessingWarning` source `"ocr"`), and no
       engine is constructed until there is work. Sets `ExtractionMethod.Mixed` — not `Ocr` —
       when it contributes, since the native text is still there.
-- [x] **`XRay.csproj`** — `PaddleOCR` + `PaddleOCR.Pdf` 26.8.4668, and the `<Description>`
+- [x] **`XRay.Content.csproj`** — `PaddleOCR` + `PaddleOCR.Pdf` 26.8.4668, and the `<Description>`
       corrected: it claimed "No native dependencies", which these packages make false.
       They bring SkiaSharp and PDFium transitively, which is why the feature is off by default
       and why this breaks the "pure managed" convention in `Claude.md`.

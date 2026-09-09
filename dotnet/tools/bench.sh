@@ -46,8 +46,8 @@ RS_BIN="$REPO/dotnet/tools/xberg-bench/target/release/xberg-bench"
 
 echo
 echo "=== building c# benchmark (Release) ==="
-( cd "$REPO/dotnet" && dotnet build tools/XRay.Bench -c Release 2>&1 | grep -E "error|Error\(s\)" | head -3 ) || { echo "c# build FAILED"; exit 1; }
-CS_DLL="$REPO/dotnet/tools/XRay.Bench/bin/Release/net10.0/xray-bench.dll"
+( cd "$REPO/dotnet" && dotnet build tools/XRay.Content.Bench -c Release 2>&1 | grep -E "error|Error\(s\)" | head -3 ) || { echo "c# build FAILED"; exit 1; }
+CS_DLL="$REPO/dotnet/tools/XRay.Content.Bench/bin/Release/net10.0/xray-content-bench.dll"
 [ -f "$CS_DLL" ] || { echo "missing $CS_DLL"; exit 1; }
 
 echo

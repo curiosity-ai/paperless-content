@@ -1,0 +1,191 @@
+using System.Text;
+using XRay.Content.Core;
+using XRay.Content.Extractors;
+using XRay.Content.Types;
+using Xunit;
+
+namespace XRay.Content.Tests;
+
+/// <summary>
+/// Tests for the .eml path: sender formatting and the inlining of attachment text.
+/// </summary>
+public class EmailExtractorTests
+{
+    private const string EmlMime = "message/rfc822";
+
+    private static string Extract(string eml, OutputFormat fmt)
+    {
+        var doc = new EmailExtractor().Extract(
+            Encoding.UTF8.GetBytes(eml), EmlMime, new ExtractionConfig { OutputFormat = fmt });
+        return Derive.DeriveExtractionResult(doc, includeDocumentStructure: false, fmt).Content;
+    }
+
+    /// <summary>A multipart message with one base64 attachment of the given type.</summary>
+    private static string WithAttachment(string filename, string contentType, string base64Body) =>
+        "From: Ada Lovelace <ada@example.com>\r\n" +
+        "To: bob@example.com\r\n" +
+        "Subject: See attached\r\n" +
+        "MIME-Version: 1.0\r\n" +
+        "Content-Type: multipart/mixed; boundary=\"BOUND\"\r\n" +
+        "\r\n" +
+        "--BOUND\r\n" +
+        "Content-Type: text/plain; charset=utf-8\r\n" +
+        "\r\n" +
+        "Covering note.\r\n" +
+        "\r\n" +
+        "--BOUND\r\n" +
+        $"Content-Type: {contentType}; name=\"{filename}\"\r\n" +
+        "Content-Transfer-Encoding: base64\r\n" +
+        $"Content-Disposition: attachment; filename=\"{filename}\"\r\n" +
+        "\r\n" +
+        base64Body + "\r\n" +
+        "--BOUND--\r\n";
+
+    /// <summary>
+    /// Naming an attachment says nothing about what it holds. For a message whose body is a
+    /// covering note, the attachment is the document.
+    /// </summary>
+    [Fact]
+    public void AttachmentTextIsInlinedUnderAHeadingNamingIt()
+    {
+        string body = Convert.ToBase64String(Encoding.UTF8.GetBytes("The quarterly numbers are attached."));
+        string plain = Extract(WithAttachment("report.txt", "text/plain", body), OutputFormat.Plain);
+
+        Assert.Contains("Covering note.", plain);
+        Assert.Contains("report.txt", plain);
+        Assert.Contains("The quarterly numbers are attached.", plain);
+    }
+
+    /// <summary>The heading is a real level-2 heading, not a paragraph that looks like one.</summary>
+    [Fact]
+    public void InlinedAttachmentHeadingIsAtLevelTwo()
+    {
+        string body = Convert.ToBase64String(Encoding.UTF8.GetBytes("Inner text."));
+        string markdown = Extract(WithAttachment("notes.txt", "text/plain", body), OutputFormat.Markdown);
+
+        Assert.Contains("## notes.txt", markdown);
+        Assert.Contains("Inner text.", markdown);
+    }
+
+    /// <summary>
+    /// An image carries no text to inline. Under a structured output format an empty document
+    /// still renders as a non-empty envelope, so emptiness cannot be judged on the rendered
+    /// string alone.
+    /// </summary>
+    [Fact]
+    public void ImageAttachmentsAreListedButNotInlined()
+    {
+        // A one-pixel PNG: real enough to be detected by content, and carrying no text.
+        string png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        string json = Extract(WithAttachment("pixel.png", "image/png", png), OutputFormat.Json);
+
+        // Listed in the attachments section...
+        Assert.Contains("pixel.png", json);
+        // ...but contributing no section of its own, and never an empty document envelope.
+        Assert.DoesNotContain("\"heading\":\"pixel.png\"", json);
+        Assert.DoesNotContain("{\\\"body\\\":[{\\\"type\\\":\\\"image\\\"}]}", json);
+    }
+
+    [Fact]
+    public void SenderKeepsBothHalvesOfTheMailbox()
+    {
+        string plain = Extract(
+            "From: Michael Elkins <elkins@aero.org>\r\nSubject: Hi\r\n\r\nBody.\r\n", OutputFormat.Plain);
+        Assert.Contains("From: Michael Elkins <elkins@aero.org>", plain);
+    }
+
+    [Fact]
+    public void SenderWithoutADisplayNameIsJustTheAddress()
+    {
+        string plain = Extract("From: elkins@aero.org\r\nSubject: Hi\r\n\r\nBody.\r\n", OutputFormat.Plain);
+        Assert.Contains("From: elkins@aero.org", plain);
+        Assert.DoesNotContain("<elkins@aero.org>", plain);
+    }
+
+    /// <summary>A name that merely repeats the address must not become `address &lt;address&gt;`.</summary>
+    [Fact]
+    public void SenderDoesNotRepeatTheAddressAsItsOwnName()
+    {
+        string plain = Extract(
+            "From: elkins@aero.org <elkins@aero.org>\r\nSubject: Hi\r\n\r\nBody.\r\n", OutputFormat.Plain);
+        Assert.Contains("From: elkins@aero.org", plain);
+        Assert.DoesNotContain("elkins@aero.org <elkins@aero.org>", plain);
+    }
+
+    /// <summary>An encoded-word display name is decoded before it reaches the header line.</summary>
+    [Fact]
+    public void SenderDisplayNameIsDecodedFromItsEncodedWord()
+    {
+        string plain = Extract(
+            "From: =?utf-8?B?QW5kcsOp?= <andre@example.com>\r\nSubject: Hi\r\n\r\nBody.\r\n", OutputFormat.Plain);
+        Assert.Contains("From: André <andre@example.com>", plain);
+    }
+
+    /// <summary>
+    /// Only a *missing* description becomes the `[Image]` placeholder. `alt=""` is a deliberate
+    /// "this image carries no meaning", and a marketing email's tracking pixels and social icons
+    /// all carry one — placeholding them puts a column of `[Image]` through the message.
+    /// </summary>
+    [Fact]
+    public void AnEmptyAltIsNotAnImagePlaceholder()
+    {
+        const string eml =
+            "From: a@example.com\r\nSubject: Pixels\r\n" +
+            "Content-Type: text/html; charset=utf-8\r\n\r\n" +
+            "<html><body><p>Hi.</p><img alt=\"\" src=\"/pixel.png\"/><img src=\"/logo.png\"/></body></html>\r\n";
+
+        string plain = Extract(eml, OutputFormat.Plain);
+        Assert.Contains("Hi.", plain);
+        Assert.Single(System.Text.RegularExpressions.Regex.Matches(plain, @"\[Image\]"));
+    }
+
+    /// <summary>
+    /// A message cut off mid-multipart never closes its boundary, so the transfer decoder gives
+    /// up on the last part. That part is re-read raw and demoted out of the body: the text/plain
+    /// alternative is the message, and the unfinished text/html becomes an attachment carrying
+    /// its undecoded bytes.
+    /// </summary>
+    [Fact]
+    public void AnUnclosedBoundaryDemotesTheLastPartToAnAttachment()
+    {
+        const string eml =
+            "From: a@example.com\r\nSubject: Cut off\r\nMIME-Version: 1.0\r\n" +
+            "Content-Type: multipart/alternative; boundary=\"B\"\r\n\r\n" +
+            "--B\r\nContent-Type: text/plain; charset=\"us-ascii\"\r\n" +
+            "Content-Transfer-Encoding: 7bit\r\n\r\n" +
+            "The readable body.\r\n" +
+            "--B\r\nContent-Type: text/html; charset=\"us-ascii\"\r\n" +
+            "Content-Transfer-Encoding: quoted-printable\r\n\r\n" +
+            "<html><body><p>Soft br=\r\neak</p></body></html>\r\n";
+
+        string plain = Extract(eml, OutputFormat.Plain);
+
+        Assert.Contains("The readable body.", plain);
+        Assert.Contains("Attachments:", plain);
+        // The raw part is what the attachment holds: the quoted-printable soft break survives.
+        Assert.Contains("br=", plain);
+    }
+
+    /// <summary>
+    /// The same recovery leaves a closed boundary alone: the html alternative is still the body,
+    /// quoted-printable decoded, and nothing is reported as an attachment.
+    /// </summary>
+    [Fact]
+    public void AClosedBoundaryKeepsTheHtmlAlternativeAsTheBody()
+    {
+        const string eml =
+            "From: a@example.com\r\nSubject: Intact\r\nMIME-Version: 1.0\r\n" +
+            "Content-Type: multipart/alternative; boundary=\"B\"\r\n\r\n" +
+            "--B\r\nContent-Type: text/plain; charset=\"us-ascii\"\r\n\r\n" +
+            "Plain body.\r\n" +
+            "--B\r\nContent-Type: text/html; charset=\"us-ascii\"\r\n" +
+            "Content-Transfer-Encoding: quoted-printable\r\n\r\n" +
+            "<html><body><p>Soft br=\r\neak</p></body></html>\r\n" +
+            "--B--\r\n";
+
+        string plain = Extract(eml, OutputFormat.Plain);
+
+        Assert.Contains("Soft break", plain);
+        Assert.DoesNotContain("Attachments:", plain);
+    }
+}

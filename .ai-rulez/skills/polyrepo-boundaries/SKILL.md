@@ -28,8 +28,9 @@ dependency.
 
 One boundary is in-repo rather than a sibling repository:
 
-- `dotnet/` — **X-Ray**, a native C# port of the extraction engine, published to NuGet as
-  `X-Ray` (namespace `XRay`). It is not a binding over the Rust core and shares no code with it, so a Rust change never
+- `dotnet/` — **X-Ray.Content**, a native C# port of the extraction engine, published to NuGet as
+  `X-Ray.Content` (namespace `XRay.Content`) and the content-extraction member of a planned X-Ray family of
+  .NET libraries. It is not a binding over the Rust core and shares no code with it, so a Rust change never
   propagates there automatically and a change under `dotnet/` never affects the Rust crate or its bindings. Treat it
   as its own project: read `dotnet/Claude.md` before touching it, keep `crates/` untouched from inside it (upstream
   merges depend on that), and do not confuse it with upstream's `packages/csharp` FFI binding (`XbergIo.Xberg`),

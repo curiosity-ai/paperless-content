@@ -1,4 +1,4 @@
-//! Golden reference generator for the XRay C# port.
+//! Golden reference generator for the XRay.Content C# port.
 //!
 //! For every fixture under a `test_documents` tree, this runs the original Rust
 //! `xberg` extractors in each supported output format and writes a

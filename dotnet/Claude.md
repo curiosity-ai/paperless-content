@@ -1,9 +1,11 @@
-# X-Ray — C# / .NET 10 Port
+# X-Ray.Content — C# / .NET 10 Port
+
+Part of the **X-Ray** family of .NET libraries; this is its content-extraction package.
 
 This directory contains a **native C# port** of the content-extraction engine from the
 Rust [`xberg`](../crates/xberg) crate. It is *not* a wrapper around the Rust library or its
 NuGet package — every extractor, type, and renderer is reimplemented in managed C#, shipped
-as the `X-Ray` NuGet package, whose API lives in the `XRay` namespace (a NuGet id may carry
+as the `X-Ray.Content` NuGet package, whose API lives in the `XRay.Content` namespace (a NuGet id may carry
 a hyphen; a C# identifier may not).
 
 The original Rust sources under [`../crates`](../crates) are left untouched so that upstream
@@ -161,7 +163,7 @@ Port the native-only path. `derive.rs` is large; port incrementally, guided by g
 | `roxmltree`/`org`/`biblatex`/`biblib`/`dbase`/`unhwp`/`sevenz-rust2`/`tar`/`flate2` | misc | Port or find managed equivalents (see TODO per-format). |
 
 > **Rule:** if a Rust crate dependency has no suitable managed C# equivalent, port it
-> (into `src/XRay/Internal/<name>/`). Prefer BCL types where they are faithful.
+> (into `src/XRay.Content/Internal/<name>/`). Prefer BCL types where they are faithful.
 
 ---
 
@@ -169,16 +171,16 @@ Port the native-only path. `derive.rs` is large; port incrementally, guided by g
 
 ```
 dotnet/
-  XRay.sln
+  XRay.Content.sln
   Directory.Build.props          # net10.0, nullable, implicit usings
-  src/XRay/                     # the NuGet library
+  src/XRay.Content/                     # the NuGet library
     Types/                       #   InternalDocument, ElementKind, Metadata, Table, ExtractedDocument, ...
     Rendering/                   #   Plain / Markdown / Html / Json renderers + common
     Core/                        #   Config, MIME detection, format registry, pipeline, derive
     Extractors/                  #   one file/folder per format
     Internal/                    #   ported dependencies (Cfb, Blake3, Zip helpers, ...)
-  tests/XRay.Tests/             # xUnit unit tests (renderers, types, per-extractor)
-  tools/XRay.TestRunner/        # CLI: runs every test_documents fixture, diffs vs *-results-rust.json
+  tests/XRay.Content.Tests/             # xUnit unit tests (renderers, types, per-extractor)
+  tools/XRay.Content.TestRunner/        # CLI: runs every test_documents fixture, diffs vs *-results-rust.json
   tools/xberg-reference-gen/     # Rust helper that produces the golden *-results-rust.json files
 ```
 
@@ -206,12 +208,12 @@ dotnet/
    }
    ```
 
-2. **C# test CLI (`XRay.TestRunner`):** runs the C# extractor over the same fixtures and
+2. **C# test CLI (`XRay.Content.TestRunner`):** runs the C# extractor over the same fixtures and
    diffs against the golden JSON. Reports per-format match / mismatch and a summary. This is
    the primary parity signal — a format is "done" when its fixtures match (allowing for
    documented, intentional differences).
 
-3. **Unit tests (`XRay.Tests`):** port the Rust `#[cfg(test)]` cases (renderers have rich
+3. **Unit tests (`XRay.Content.Tests`):** port the Rust `#[cfg(test)]` cases (renderers have rich
    ones) as xUnit tests for fast, isolated feedback.
 
 Exact byte-for-byte parity is the goal for plain/json; Markdown/HTML may differ in
@@ -250,9 +252,9 @@ clean and the whole job is re-deriving the C# port's behaviour. The loop that wo
    fail" into "395 of them diverge at the same smart-quote character":
 
    ```sh
-   dotnet run --project tools/XRay.TestRunner -c Release -- ../test_documents --ext md --cluster
-   dotnet run --project tools/XRay.TestRunner -c Release -- ../test_documents --ext docx --diff --show 3
-   dotnet run --project tools/XRay.TestRunner -c Release -- --dump-metadata ../test_documents/x.pdf
+   dotnet run --project tools/XRay.Content.TestRunner -c Release -- ../test_documents --ext md --cluster
+   dotnet run --project tools/XRay.Content.TestRunner -c Release -- ../test_documents --ext docx --diff --show 3
+   dotnet run --project tools/XRay.Content.TestRunner -c Release -- --dump-metadata ../test_documents/x.pdf
    ```
 
 4. **Fix against the Rust source, not against the golden.** Read the current Rust for the
@@ -304,7 +306,7 @@ re-sync will otherwise read it as drift and try to "fix" it.
 ### What changed, and why it is a deviation
 
 The charter above excluded OCR outright. It is now available as an **opt-in extraction
-pass**, `XRay.Core.Ocr`, driven by `ExtractionConfig.Ocr`. Three things make this a
+pass**, `XRay.Content.Core.Ocr`, driven by `ExtractionConfig.Ocr`. Three things make this a
 deviation rather than a port:
 
 1. **Different engine family.** Upstream reaches for Tesseract, or candle-hosted VLMs

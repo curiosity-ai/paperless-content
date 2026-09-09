@@ -1,6 +1,6 @@
 # Third-Party Notices — .NET port
 
-X-Ray is licensed under [MIT](../LICENSE). The C# files listed below are
+X-Ray.Content is licensed under [MIT](../LICENSE). The C# files listed below are
 **derivative works of Apache-2.0 licensed Rust crates**, translated to C#. They
 remain subject to the Apache License 2.0, a copy of which is in
 [`third_party/LICENSE-Apache-2.0.txt`](third_party/LICENSE-Apache-2.0.txt).
@@ -15,8 +15,8 @@ crates ships a `NOTICE` file, so §4(d) does not apply.
 > previously MIT throughout. These three are Apache-2.0 *only*, so plain MIT does
 > not describe the whole assembly. The package therefore declares
 > `<PackageLicenseExpression>MIT AND Apache-2.0</PackageLicenseExpression>` in
-> `src/XRay/XRay.csproj`, which is what a consumer of
-> `XRay` on NuGet now sees. Both halves are satisfied by shipping the
+> `src/XRay.Content/XRay.Content.csproj`, which is what a consumer of
+> `XRay.Content` on NuGet now sees. Both halves are satisfied by shipping the
 > repository's [MIT `LICENSE`](../LICENSE) and the Apache-2.0 text in
 > [`third_party/`](third_party/LICENSE-Apache-2.0.txt); removing the last
 > Apache-2.0-derived file is what would let the expression narrow back to MIT.
@@ -25,12 +25,12 @@ crates ships a `NOTICE` file, so §4(d) does not apply.
 
 - Copyright: The Typst Project Developers
 - Source: <https://github.com/typst/typst>
-- Derived files: `src/XRay/Internal/Math/TypstKind.cs`,
-  `src/XRay/Internal/Math/TypstLexer.cs`,
-  `src/XRay/Internal/Math/TypstNode.cs`,
-  `src/XRay/Internal/Math/TypstParser.cs`,
+- Derived files: `src/XRay.Content/Internal/Math/TypstKind.cs`,
+  `src/XRay.Content/Internal/Math/TypstLexer.cs`,
+  `src/XRay.Content/Internal/Math/TypstNode.cs`,
+  `src/XRay.Content/Internal/Math/TypstParser.cs`,
   and the `default_math_class` overrides in
-  `src/XRay/Internal/Math/TypstMathClass.cs` (from `typst-utils` 0.15.1, also
+  `src/XRay.Content/Internal/Math/TypstMathClass.cs` (from `typst-utils` 0.15.1, also
   Apache-2.0 and also by The Typst Project Developers)
 - Modifications: the math-mode slice of the crate's lexer, syntax tree, and
   parser translated to C#. Markup mode, spans, the newline modes, incremental
@@ -47,9 +47,9 @@ crates ships a `NOTICE` file, so §4(d) does not apply.
 
 - Copyright: Nadir Fejzic
 - Source: <https://github.com/nfejzic/mathemascii>
-- Derived files: `src/XRay/Internal/Math/AsciiMathLexer.cs`,
-  `src/XRay/Internal/Math/AsciiMath.cs`,
-  `src/XRay/Internal/Math/AsciiMathSymbols.cs`
+- Derived files: `src/XRay.Content/Internal/Math/AsciiMathLexer.cs`,
+  `src/XRay.Content/Internal/Math/AsciiMath.cs`,
+  `src/XRay.Content/Internal/Math/AsciiMathSymbols.cs`
 - Modifications: the scanner, lexer, parser, and AST translated to C#. The
   crate's panics on multi-byte input and on `cancel` are raised as an exception
   rather than aborting, so the caller can drop the equation instead of the
@@ -59,8 +59,8 @@ crates ships a `NOTICE` file, so §4(d) does not apply.
 
 - Copyright: Nadir Fejzic
 - Source: <https://github.com/nfejzic/alemat>
-- Derived files: `src/XRay/Internal/Math/AsciiMath.cs` (the MathML element
-  tree and its writer), `src/XRay/Internal/Math/AsciiMathSymbols.cs` (symbol
+- Derived files: `src/XRay.Content/Internal/Math/AsciiMath.cs` (the MathML element
+  tree and its writer), `src/XRay.Content/Internal/Math/AsciiMathSymbols.cs` (symbol
   values resolved through the crate's `Ident`/`Operator` dictionaries)
 - Modifications: only the element kinds `mathemascii` builds are ported, with
   the builder and writer behaviour of `BufMathMlWriter` reproduced; the crate's

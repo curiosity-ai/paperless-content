@@ -1,5 +1,5 @@
 //! Per-file extraction benchmark for the Rust implementation, written to be comparable with
-//! the C# `xray-bench`: same fixture walk, same output format, same TSV columns.
+//! the C# `xray-content-bench`: same fixture walk, same output format, same TSV columns.
 //!
 //! Rust needs no JIT warm-up, but it does need a warm-up pass for a different reason:
 //! `pdf_oxide` keeps a process-global font cache, so a document extracted early in a process
