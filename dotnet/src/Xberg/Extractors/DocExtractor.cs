@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.Json;
 using Xberg.Core;
 using Xberg.Internal.Cfb;
+using Xberg.Internal.Doc;
 using Xberg.Types;
 
 namespace Xberg.Extractors;
@@ -62,9 +63,10 @@ public sealed class DocExtractor : IExtractor
         bool use1Table = (flagsA & 0x0200) != 0;
         byte[] tableStream = comp.TryReadStream(use1Table ? "/1Table" : "/0Table") ?? Array.Empty<byte>();
 
-        string text = nFib >= 101
+        var extracted = nFib >= 101
             ? ExtractTextWord97(wordDoc, tableStream)
-            : ExtractTextWord6(wordDoc);
+            : new DocText(ExtractTextWord6(wordDoc), new List<DocParagraph>());
+        string text = extracted.Content;
 
         var doc = new InternalDocument("doc") { MimeType = mimeType };
 
@@ -83,29 +85,172 @@ public sealed class DocExtractor : IExtractor
             Additional = additional,
         };
 
-        var paragraphs = text.Split("\n\n");
-        for (int i = 0; i < paragraphs.Length; i++)
+        // Elements follow Word's own paragraph structure, matching what the DOCX path does with
+        // `w:p`. The blank-line fallback is only for documents carrying no paragraph properties
+        // at all — Word 6/95, or the contiguous fallback — where there is nothing finer to use.
+        if (extracted.Paragraphs.Count == 0)
         {
-            string trimmed = paragraphs[i].Trim();
-            if (trimmed.Length == 0) continue;
-
-            bool isSingleLine = !trimmed.Contains('\n');
-            bool isShort = trimmed.Length <= 80;
-            bool noTrailingPunct = !trimmed.EndsWith('.') && !trimmed.EndsWith(':') && !trimmed.EndsWith(';');
-            bool nextIsLonger = i + 1 < paragraphs.Length && paragraphs[i + 1].Trim() is { Length: > 0 } next
-                && next.Length > trimmed.Length;
-
-            if (isSingleLine && isShort && noTrailingPunct && nextIsLonger)
-                doc.PushElement(InternalElement.TextElement(ElementKind.Heading(2), trimmed, 0));
-            else
-                doc.PushElement(InternalElement.TextElement(ElementKind.Paragraph, trimmed, 0));
+            PushBlankLineChunks(doc, text);
+        }
+        else
+        {
+            PushParagraphElements(doc, extracted.Paragraphs);
+            PushSubdocumentSections(doc, extracted.Sections);
         }
 
         return doc;
     }
 
+    /// <summary>
+    /// Whether a chunk looks like a heading, by shape rather than by style.
+    /// </summary>
+    /// <remarks>
+    /// Used only for documents whose style sheet declares no heading style at all. Deriving
+    /// headings purely from <c>istd</c> would delete all 13 headings from one reporter document
+    /// and all 12 from another, because both style their headings as bold <c>Normal</c>. Half the
+    /// corpus does. Shape is the only signal those documents carry (xberg-io/xberg#1553).
+    /// </remarks>
+    private static bool LooksLikeHeading(string text, string? next) =>
+        !text.Contains('\n')
+        && text.Length <= 80
+        && !text.EndsWith('.') && !text.EndsWith(':') && !text.EndsWith(';')
+        && next is { Length: > 0 } && next.Length > text.Length;
+
+    /// <summary>
+    /// Emit the labelled footnote, header, comment and text-box sections after the body.
+    /// </summary>
+    /// <remarks>
+    /// A deliberate deviation from upstream, which this port does not follow. Upstream assembles
+    /// these sections into its <c>content</c> string but builds its element stream from the main
+    /// paragraphs alone, and never marks the content pre-rendered — so once paragraph properties
+    /// exist, every footnote, header, comment and text box silently disappears from the output
+    /// (xberg-io/xberg#1550 against #77). Reproducing that would undo the subdocument extraction
+    /// this port gained in the same pass, to no one's benefit.
+    /// </remarks>
+    private static void PushSubdocumentSections(InternalDocument doc, List<(string Label, string Text)> sections)
+    {
+        foreach (var (label, text) in sections)
+        {
+            doc.PushElement(InternalElement.TextElement(ElementKind.Heading(2), label, 0));
+            foreach (var chunk in text.Split("\n\n"))
+            {
+                string trimmed = chunk.Trim();
+                if (trimmed.Length > 0)
+                    doc.PushElement(InternalElement.TextElement(ElementKind.Paragraph, trimmed, 0));
+            }
+        }
+    }
+
+    /// <summary>Emit one element per blank-line-separated chunk.</summary>
+    /// <remarks>
+    /// Only reachable for documents that carry no paragraph properties, where Word's own
+    /// paragraph boundaries are not available. It merges any two paragraphs not separated by a
+    /// blank line, which is why it is no longer the main path.
+    /// </remarks>
+    private static void PushBlankLineChunks(InternalDocument doc, string content)
+    {
+        var chunks = content.Split("\n\n");
+        for (int i = 0; i < chunks.Length; i++)
+        {
+            string trimmed = chunks[i].Trim();
+            if (trimmed.Length == 0) continue;
+            string? next = i + 1 < chunks.Length ? chunks[i + 1].Trim() : null;
+            var kind = LooksLikeHeading(trimmed, next) ? ElementKind.Heading(2) : ElementKind.Paragraph;
+            doc.PushElement(InternalElement.TextElement(kind, trimmed, 0));
+        }
+    }
+
+    /// <summary>
+    /// Emit one element per Word paragraph, so a list-bound paragraph becomes a list item inside
+    /// a list container — the shape the DOCX path already produces for <c>w:numPr</c>.
+    /// </summary>
+    /// <remarks>
+    /// Consecutive bound paragraphs share a container. A change of nesting depth opens or closes
+    /// nested containers, and a change of <em>kind</em> at the same depth closes and reopens: a
+    /// document can move from a numbered run straight into a bulleted one at the same level, and
+    /// merging those would label half the items wrongly.
+    /// </remarks>
+    private static void PushParagraphElements(InternalDocument doc, List<DocParagraph> paragraphs)
+    {
+        // The switch is "does this document EMIT styled headings", which is narrower than either
+        // alternative that looks right.
+        //
+        // Not "does the style sheet define headings": nearly every Word style sheet defines
+        // heading 1..9 whether or not the author applied one, so that answers yes almost always.
+        //
+        // And not merely "does any paragraph carry a heading style": a list-bound paragraph is
+        // emitted as a list item regardless of its style, matching the DOCX path's handling of
+        // `w:numPr`. `simple.doc` is the case — its one Heading 1 paragraph is also list-bound,
+        // so counting it flipped the document into styled mode and suppressed every heading
+        // while emitting none, leaving it with no heading structure at all.
+        bool styledHeadings = paragraphs.Any(p => p.HeadingLevel is not null && p.List is null);
+
+        // One entry per open container, holding whether it is ordered.
+        var open = new List<bool>();
+
+        for (int i = 0; i < paragraphs.Count; i++)
+        {
+            string text = paragraphs[i].Content.Trim();
+            if (text.Length == 0) continue;
+
+            if (paragraphs[i].List is not { } list)
+            {
+                CloseLists(doc, open, 0);
+                var kind = HeadingKind(paragraphs, i, text, styledHeadings) is { } level
+                    ? ElementKind.Heading(level)
+                    : ElementKind.Paragraph;
+                doc.PushElement(InternalElement.TextElement(kind, text, 0));
+                continue;
+            }
+
+            int depth = list.Level + 1;
+            CloseLists(doc, open, depth);
+            if (open.Count == depth && open[^1] != list.Ordered) CloseLists(doc, open, depth - 1);
+            while (open.Count < depth)
+            {
+                doc.PushElement(InternalElement.TextElement(
+                    ElementKind.ListStart(list.Ordered), "", (ushort)Math.Min(open.Count, ushort.MaxValue)));
+                open.Add(list.Ordered);
+            }
+
+            doc.PushElement(InternalElement.TextElement(
+                ElementKind.ListItem(list.Ordered), text, (ushort)Math.Min(open.Count, ushort.MaxValue)));
+        }
+
+        CloseLists(doc, open, 0);
+    }
+
+    /// <summary>Decide whether a paragraph is a heading, and at what level.</summary>
+    /// <remarks>
+    /// The two signals are not interchangeable and neither is usable alone. A document that
+    /// declares heading styles is taken at its word — <c>istd</c> is what Word itself renders
+    /// from, and the shape heuristic invents headings there (1 detected against 7 declared in one
+    /// corpus document). A document that declares none has nothing to be taken at its word about,
+    /// and falls back to shape. The switch is per <em>document</em>, not per paragraph:
+    /// per-paragraph fallback would re-add the invented headings alongside the declared ones,
+    /// which is the worst of both (xberg-io/xberg#1553).
+    /// </remarks>
+    private static byte? HeadingKind(List<DocParagraph> paragraphs, int index, string text, bool styledHeadings)
+    {
+        if (styledHeadings) return paragraphs[index].HeadingLevel;
+        string? next = index + 1 < paragraphs.Count ? paragraphs[index + 1].Content.Trim() : null;
+        // The shape heuristic has no notion of depth; it only ever claimed h2.
+        return LooksLikeHeading(text, next is { Length: > 0 } ? next : null) ? (byte)2 : null;
+    }
+
+    /// <summary>Close open list containers until only <paramref name="target"/> remain.</summary>
+    private static void CloseLists(InternalDocument doc, List<bool> open, int target)
+    {
+        while (open.Count > target)
+        {
+            open.RemoveAt(open.Count - 1);
+            doc.PushElement(InternalElement.TextElement(
+                ElementKind.ListEnd, "", (ushort)Math.Min(open.Count, ushort.MaxValue)));
+        }
+    }
+
     // ── FIB / piece-table parsing (extraction/doc/mod.rs) ────────────────────────
-    private static string ExtractTextWord97(byte[] wordDoc, byte[] table)
+    private static DocText ExtractTextWord97(byte[] wordDoc, byte[] table)
     {
         const int fibBaseSize = 32;
         int cswOffset = fibBaseSize;
@@ -135,7 +280,7 @@ public sealed class DocExtractor : IExtractor
         int lcbClx = (int)OleUtil.U32(wordDoc, lcbClxOffset);
 
         if (fcClx == 0 || lcbClx == 0)
-            return ExtractTextContiguous(wordDoc, ccpText);
+            return new DocText(ExtractTextContiguous(wordDoc, ccpText), new List<DocParagraph>());
         if (table.Length < fcClx + lcbClx)
             throw new InvalidDataException("CLX extends beyond table stream");
 
@@ -150,7 +295,8 @@ public sealed class DocExtractor : IExtractor
                 pos += 1;
                 if (pos + 4 > clxEnd) throw new InvalidDataException("Pcdt truncated at lcb");
                 pos += 4; // lcb of PlcPcd
-                return ExtractFromPieceTable(wordDoc, table, pos, clxEnd, ranges);
+                return ExtractFromPieceTable(wordDoc, table, pos, clxEnd, ranges,
+                    DocPapx.ListTables.Build(wordDoc, table, rgFcLcbOffset));
             }
             if (clxt == 0x01)
             {
@@ -161,7 +307,7 @@ public sealed class DocExtractor : IExtractor
             }
             else break;
         }
-        return ExtractTextFallback(wordDoc);
+        return new DocText(ExtractTextFallback(wordDoc), new List<DocParagraph>());
     }
 
     /// <summary>
@@ -174,15 +320,19 @@ public sealed class DocExtractor : IExtractor
     /// piece — used to be skipped outright, so none of that content ever appeared
     /// (xberg-io/xberg#77).
     /// </remarks>
-    private static string ExtractFromPieceTable(
-        byte[] wordDoc, byte[] table, int plcStart, int plcEnd, SubdocRanges ranges)
+    private static DocText ExtractFromPieceTable(
+        byte[] wordDoc, byte[] table, int plcStart, int plcEnd, SubdocRanges ranges,
+        DocPapx.ListTables listTables)
     {
         int plcSize = plcEnd - plcStart;
         if (plcSize < 16) throw new InvalidDataException("PlcPcd too small");
         int n = (plcSize - 4) / 12;
-        if (n == 0) return "";
+        if (n == 0) return new DocText("", new List<DocParagraph>());
 
         var main = new StringBuilder(ranges.Main.Length);
+        // Only the main document needs per-character FCs: paragraph properties are bound to body
+        // text, and a subdocument paragraph carries no list numbering a reader would see.
+        var mainFcEnds = new List<uint>(ranges.Main.Length);
         var footnote = new StringBuilder();
         var header = new StringBuilder();
         var annotation = new StringBuilder();
@@ -201,17 +351,18 @@ public sealed class DocExtractor : IExtractor
 
             uint fcRaw = OleUtil.U32(table, pcdOff + 2);
             int charCount = Math.Max(0, cpEnd - cpStart);
-            string piece = DecodePieceChars(wordDoc, fcRaw, charCount);
-            if (piece.Length == 0) continue;
+            var piece = DecodePieceChars(wordDoc, fcRaw, charCount);
+            if (piece.Text.Length == 0) continue;
 
-            AppendRangeOverlap(piece, cpStart, ranges.Main, main);
-            AppendRangeOverlap(piece, cpStart, ranges.Footnote, footnote);
-            AppendRangeOverlap(piece, cpStart, ranges.Header, header);
-            AppendRangeOverlap(piece, cpStart, ranges.Annotation, annotation);
-            AppendRangeOverlap(piece, cpStart, ranges.Textbox, textbox);
+            AppendRangeOverlap(piece, cpStart, ranges.Main, main, mainFcEnds);
+            AppendRangeOverlap(piece, cpStart, ranges.Footnote, footnote, null);
+            AppendRangeOverlap(piece, cpStart, ranges.Header, header, null);
+            AppendRangeOverlap(piece, cpStart, ranges.Annotation, annotation, null);
+            AppendRangeOverlap(piece, cpStart, ranges.Textbox, textbox, null);
         }
 
         var content = new StringBuilder(NormalizeDocText(main.ToString()));
+        var sections = new List<(string Label, string Text)>();
         foreach (var (label, section) in new[]
         {
             ("Footnotes", footnote),
@@ -222,54 +373,177 @@ public sealed class DocExtractor : IExtractor
         {
             string normalized = NormalizeDocText(section.ToString());
             if (normalized.Length == 0) continue;
+            sections.Add((label, normalized));
             if (content.Length > 0) content.Append("\n\n");
             content.Append(label).Append("\n\n").Append(normalized);
         }
-        return content.ToString();
+        // `content` stays a single normalization pass over the whole main text, unchanged and
+        // byte-identical: `NormalizeDocText` carries a field stack across the string, so deriving
+        // it from per-paragraph normalization would make "no field spans a paragraph mark" an
+        // unstated assumption.
+        return new DocText(
+            content.ToString(), SplitMainParagraphs(main.ToString(), mainFcEnds, listTables), sections);
     }
 
-    /// <summary>Decode one piece's characters, choosing CP1252 or UTF-16LE from its FC.</summary>
-    private static string DecodePieceChars(byte[] wordDoc, uint fcRaw, int charCount)
+    /// <summary>Word's paragraph mark. Splitting the raw main text on it gives the document's own
+    /// paragraph granularity, which is finer than the blank-line chunking.</summary>
+    private const char ParagraphMark = '\r';
+
+    /// <summary>
+    /// Split the raw main text into paragraphs and attach each one's list binding and style.
+    /// </summary>
+    /// <remarks>
+    /// Operates on the <em>raw</em> text so character positions still line up with the recorded
+    /// FCs; each paragraph's text is normalized individually afterwards. Elements used to be built
+    /// from blank-line chunks, but Word's paragraph mark is a single CR, so any two consecutive
+    /// non-empty paragraphs without a blank line between them arrived as one element — one
+    /// corpus document returned its entire ten-paragraph body as a single element
+    /// (xberg-io/xberg#1550).
+    /// </remarks>
+    private static List<DocParagraph> SplitMainParagraphs(
+        string main, List<uint> mainFcEnds, DocPapx.ListTables listTables)
     {
-        var sb = new StringBuilder(charCount);
-        if ((fcRaw & 0x4000_0000) != 0)
+        var paragraphs = new List<DocParagraph>();
+        int start = 0;
+
+        for (int i = 0; i < main.Length; i++)
         {
-            int byteOffset = (int)(fcRaw & 0x3FFF_FFFF) / 2;
-            int end = byteOffset + charCount;
-            if (end <= wordDoc.Length)
-                for (int k = byteOffset; k < end; k++) sb.Append(OleUtil.Cp1252ToChar(wordDoc[k]));
-            return sb.ToString();
+            if (main[i] != ParagraphMark) continue;
+            PushParagraph(paragraphs, main, start, i, FcEndAt(mainFcEnds, i), listTables);
+            start = i + 1;
         }
 
-        int utf16Offset = (int)(fcRaw & 0x3FFF_FFFF);
-        int utf16End = utf16Offset + charCount * 2;
-        if (utf16End <= wordDoc.Length)
-            for (int k = utf16Offset; k + 1 < utf16End; k += 2)
+        if (start < main.Length)
+        {
+            // A final run with no paragraph mark still has properties keyed on the FC one past
+            // its last character.
+            PushParagraph(paragraphs, main, start, main.Length, FcEndAt(mainFcEnds, main.Length - 1), listTables);
+        }
+
+        return paragraphs;
+    }
+
+    private static uint? FcEndAt(List<uint> fcEnds, int index) =>
+        index >= 0 && index < fcEnds.Count ? fcEnds[index] : null;
+
+    /// <summary>Normalize one paragraph's raw text and record it when it survives.</summary>
+    private static void PushParagraph(
+        List<DocParagraph> outParagraphs, string main, int start, int end, uint? markFcEnd,
+        DocPapx.ListTables listTables)
+    {
+        string content = NormalizeDocText(main[start..end]);
+        if (content.Length == 0) return;
+
+        // Word keys a paragraph's PAPX on the FC one past its paragraph mark, which is exactly
+        // what the piece walk recorded for that character.
+        outParagraphs.Add(new DocParagraph
+        {
+            Content = content,
+            List = markFcEnd is { } fc ? listTables.MembershipForParagraphEnd(fc) : null,
+            HeadingLevel = markFcEnd is { } fc2 ? listTables.HeadingLevelForParagraphEnd(fc2) : null,
+        });
+    }
+
+    /// <summary>
+    /// One decoded piece: its characters, and the byte offset (<c>FC</c>) one past each of them.
+    /// </summary>
+    /// <remarks>
+    /// The FCs are what bind text to paragraph properties: PAPX is FC-addressed while text is
+    /// CP-addressed, so the piece table's mapping is the only thing that relates the two.
+    /// </remarks>
+    private readonly record struct DecodedPiece(string Text, uint[] FcEnds);
+
+    /// <summary>Decode one piece's characters, choosing CP1252 or UTF-16LE from its FC.</summary>
+    private static DecodedPiece DecodePieceChars(byte[] wordDoc, uint fcRaw, int charCount)
+    {
+        // Compressed (CP1252) pieces address the stream at half the raw FC value; uncompressed
+        // (UTF-16LE) pieces address it directly.
+        bool isCompressed = (fcRaw & 0x4000_0000) != 0;
+        int fc = (int)(fcRaw & 0x3FFF_FFFF);
+        int byteOffset = isCompressed ? fc / 2 : fc;
+
+        DecodedPiece DecodeCp1252(int start, int end)
+        {
+            if (start >= end) return new DecodedPiece("", Array.Empty<uint>());
+            var sb = new StringBuilder(end - start);
+            var fcEnds = new uint[end - start];
+            for (int k = start; k < end; k++)
+            {
+                sb.Append(OleUtil.Cp1252ToChar(wordDoc[k]));
+                fcEnds[k - start] = (uint)(k + 1);
+            }
+            return new DecodedPiece(sb.ToString(), fcEnds);
+        }
+
+        if (isCompressed)
+        {
+            int end = byteOffset + charCount;
+            return DecodeCp1252(byteOffset, Math.Min(end, wordDoc.Length));
+        }
+
+        int utf16End = byteOffset + charCount * 2;
+        int availableEnd = utf16End <= wordDoc.Length
+            ? utf16End
+            : byteOffset + Math.Max(0, (wordDoc.Length - byteOffset) / 2) * 2;
+
+        DecodedPiece piece;
+        if (byteOffset >= availableEnd)
+        {
+            piece = new DecodedPiece("", Array.Empty<uint>());
+        }
+        else
+        {
+            var sb = new StringBuilder((availableEnd - byteOffset) / 2);
+            var fcEnds = new List<uint>((availableEnd - byteOffset) / 2);
+            for (int k = byteOffset; k + 1 < availableEnd; k += 2)
+            {
                 sb.Append((char)(ushort)(wordDoc[k] | (wordDoc[k + 1] << 8)));
+                fcEnds.Add((uint)(k + 2));
+            }
+            piece = new DecodedPiece(sb.ToString(), fcEnds.ToArray());
+        }
 
         // Heuristic: a mostly-CJK decode means the compression bit was wrong → redo as CP1252.
-        string piece = sb.ToString();
-        int suspicious = piece.Count(c => c >= 0x4E00 && c <= 0x9FFF);
-        if (piece.Length > 4 && suspicious > piece.Length / 4)
-        {
-            sb.Clear();
-            int end2 = utf16Offset + charCount;
-            if (end2 <= wordDoc.Length)
-                for (int k = utf16Offset; k < end2; k++) sb.Append(OleUtil.Cp1252ToChar(wordDoc[k]));
-            return sb.ToString();
-        }
+        int suspicious = piece.Text.Count(c => c >= 0x4E00 && c <= 0x9FFF);
+        if (piece.Text.Length > 4 && suspicious > piece.Text.Length / 4)
+            return DecodeCp1252(byteOffset, Math.Min(byteOffset + charCount, wordDoc.Length));
+
         return piece;
     }
 
-    /// <summary>Append the part of <paramref name="piece"/> that falls inside a CP range.</summary>
-    private static void AppendRangeOverlap(string piece, int cpStart, SubdocRange range, StringBuilder outText)
+    /// <summary>
+    /// Append the part of <paramref name="piece"/> that falls inside a CP range, carrying its
+    /// per-character FCs alongside when the caller wants them.
+    /// </summary>
+    private static void AppendRangeOverlap(
+        DecodedPiece piece, int cpStart, SubdocRange range, StringBuilder outText, List<uint>? outFcEnds)
     {
         if (range.Length == 0) return;
-        int pieceEnd = cpStart + piece.Length;
+        int pieceEnd = cpStart + piece.Text.Length;
         int overlapStart = Math.Max(cpStart, range.Start);
         int overlapEnd = Math.Min(pieceEnd, range.End);
-        if (overlapStart < overlapEnd)
-            outText.Append(piece, overlapStart - cpStart, overlapEnd - overlapStart);
+        if (overlapStart >= overlapEnd) return;
+
+        int from = overlapStart - cpStart;
+        int count = overlapEnd - overlapStart;
+        outText.Append(piece.Text, from, count);
+        if (outFcEnds is null) return;
+        for (int i = from; i < from + count && i < piece.FcEnds.Length; i++) outFcEnds.Add(piece.FcEnds[i]);
+    }
+
+    /// <summary>What a <c>.doc</c>'s text extraction yields: the rendered content, and Word's own
+    /// paragraphs when the document carries the properties that name them.</summary>
+    /// <param name="Content">The whole document as text, main body then labelled sections.</param>
+    /// <param name="Paragraphs">Word's own paragraphs, for the main body only.</param>
+    /// <param name="Sections">
+    /// The labelled subdocument sections — footnotes, headers, comments, text boxes — kept apart
+    /// from <paramref name="Paragraphs"/> because paragraph properties address body text only.
+    /// </param>
+    private readonly record struct DocText(
+        string Content, List<DocParagraph> Paragraphs, List<(string Label, string Text)> Sections)
+    {
+        public DocText(string content, List<DocParagraph> paragraphs)
+            : this(content, paragraphs, new List<(string, string)>()) { }
     }
 
     /// <summary>A half-open CP-space range belonging to one subdocument.</summary>
