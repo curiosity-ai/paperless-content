@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Dump per-node intermediate tensors from an ONNX model as a parity reference.
 
-The C# ONNX runtime under ``Paperless.Content.Internal.Onnx`` is a hand-written
+The C# ONNX runtime under ``XRay.Content.Internal.Onnx`` is a hand-written
 re-implementation: it parses the same ``.onnx`` file and executes the same
 graph with its own SIMD kernels. This script produces the ground truth that
 implementation is checked against, one tensor per graph value, so a divergence

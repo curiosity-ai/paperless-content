@@ -22,6 +22,10 @@
   <a href="https://github.com/xberg-io/alef">
     <img src="https://img.shields.io/badge/built%20with-alef%20%D7%90-007ec6" alt="Built with alef">
   </a>
+  <!-- X-Ray.Content — this repo's native C# extraction engine (not an FFI binding) -->
+  <a href="https://www.nuget.org/packages/X-Ray.Content/">
+    <img src="https://img.shields.io/nuget/v/X-Ray.Content?label=X-Ray.Content&color=5c2d91&logo=nuget&logoColor=white" alt="X-Ray.Content on NuGet">
+  </a>
   <!-- Language Bindings -->
   <a href="https://crates.io/crates/xberg">
     <img src="https://img.shields.io/crates/v/xberg?label=Rust&color=007ec6" alt="Rust">
@@ -206,6 +210,9 @@ dotnet add package XbergIo.Xberg
 
 See [C# README](https://github.com/xberg-io/xberg/tree/main/packages/csharp) for full documentation.
 
+> This is the FFI binding over the Rust core. For the native managed engine, see
+> [X-Ray.Content](#x-raycontent-native-net-engine) below.
+
 </details>
 
 <details>
@@ -287,22 +294,26 @@ Build from source as part of this workspace. See [C (FFI) README](https://github
 
 </details>
 
-### Paperless.Content (native .NET port)
+### X-Ray.Content (native .NET engine)
 
-This fork also carries a **native C# port** of the extraction engine under
-[`dotnet/`](dotnet/), published to NuGet as **`Paperless.Content`** and part of the
-[Paperless](https://github.com/curiosity-ai) family of content-extraction tools. It is not a
-binding over the Rust core: every extractor, type and renderer is reimplemented in managed C#,
-so the package is portable and pulls no native dependencies (the opt-in OCR pass is the one
-documented exception). Content extraction only — no transcription, embeddings, chunking or
-server mode.
+<img src="dotnet/src/XRay.Content/logo.png" alt="X-Ray" width="160" align="right" />
+
+[![X-Ray.Content on NuGet](https://img.shields.io/nuget/v/X-Ray.Content?label=X-Ray.Content&color=5c2d91&logo=nuget&logoColor=white)](https://www.nuget.org/packages/X-Ray.Content/)
+
+This repository also carries a **native C# port** of the extraction engine under
+[`dotnet/`](dotnet/), published to NuGet as
+[**`X-Ray.Content`**](https://www.nuget.org/packages/X-Ray.Content/) — the content-extraction package of the
+**X-Ray** family of .NET libraries. It is not a binding over the Rust core and shares no
+code with it: every extractor, type and renderer is reimplemented in managed C#, so the package
+is portable and pulls no native dependencies — the opt-in OCR pass is the one documented
+exception. Content extraction only, no transcription, embeddings, chunking or server mode.
 
 ```sh
-dotnet add package Paperless.Content
+dotnet add package X-Ray.Content
 ```
 
 ```csharp
-using Paperless.Content.Core;
+using XRay.Content.Core;
 
 var result = new Extractor().Extract(
     ExtractInput.FromUri("report.pdf"),
@@ -311,10 +322,19 @@ var result = new Extractor().Extract(
 Console.WriteLine(result.Results[0].Content);
 ```
 
-See [`dotnet/src/Paperless.Content/README.md`](dotnet/src/Paperless.Content/README.md) for the
-package documentation and [`dotnet/Claude.md`](dotnet/Claude.md) for the port's architecture,
-scope and re-sync process. The `XbergIo.Xberg` package above is upstream's separate FFI
-binding over the Rust core — the two are unrelated.
+| | |
+|---|---|
+| Package | [`X-Ray.Content`](https://www.nuget.org/packages/X-Ray.Content/) on NuGet |
+| Namespace | `XRay.Content` — the package id is hyphenated, a C# identifier cannot be |
+| Package docs | [`dotnet/src/XRay.Content/README.md`](dotnet/src/XRay.Content/README.md) |
+| Architecture & scope | [`dotnet/Claude.md`](dotnet/Claude.md) |
+| Port status | [`dotnet/TODO.md`](dotnet/TODO.md) |
+| Source | [`dotnet/src/XRay.Content/`](dotnet/src/XRay.Content/) |
+| Target framework | `net10.0` |
+| License | `MIT AND Apache-2.0` — see [notices](dotnet/THIRD_PARTY_NOTICES.md) |
+
+> Not to be confused with `XbergIo.Xberg` above: that is upstream's FFI binding over the Rust
+> core, and the two are unrelated packages.
 
 ### CLI & Deployment
 

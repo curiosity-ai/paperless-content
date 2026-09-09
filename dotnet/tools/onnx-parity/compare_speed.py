@@ -73,7 +73,7 @@ def main() -> int:
     sys.stdout.flush()
 
     command = [
-        "dotnet", "run", "--project", "tools/Paperless.Content.OnnxParity", "-c", "Release", "--no-build", "--",
+        "dotnet", "run", "--project", "tools/XRay.Content.OnnxParity", "-c", "Release", "--no-build", "--",
         "--model", str(args.model), "--benchmark", str(args.runs),
     ]
     if args.reference:
