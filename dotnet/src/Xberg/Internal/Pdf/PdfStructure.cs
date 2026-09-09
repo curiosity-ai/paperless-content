@@ -138,7 +138,7 @@ public static class PdfStructure
     private const int SPARSE_PEER_HEADING_MIN_PAGES = 2;
     /// <summary>Font tolerance for the repeated-peer-tier test.</summary>
     private const float SPARSE_PEER_HEADING_FONT_TOLERANCE = 0.5f;
-    private const int MAX_BOLD_HEADING_WORD_COUNT = 12;
+    internal const int MAX_BOLD_HEADING_WORD_COUNT = 12;
 
     /// <summary>Longest a run may be and still be read as a page number (Rust
     /// <c>MAX_PAGE_NUMBER_WORD_COUNT</c>).</summary>
@@ -308,6 +308,7 @@ public static class PdfStructure
         foreach (var page in allPageParagraphs) RetainPageFurnitureSafely(page);
         DeduplicateParagraphs(allPageParagraphs);
         CompactFinalHeadingHierarchy(allPageParagraphs);
+        PdfBodySizeBoldHeadings.Promote(allPageParagraphs, docBodyFontSize);
 
         var doc = AssembleInternalDocument(allPageParagraphs, tablesByPage);
 
@@ -1967,7 +1968,7 @@ public static class PdfStructure
 
     // ── heading refinement (classify.rs) ─────────────────────────────────────────
 
-    private static string ParagraphPlainText(PdfParagraph p) =>
+    internal static string ParagraphPlainText(PdfParagraph p) =>
         string.Join(" ", p.Lines.SelectMany(l => l.Segments).Select(s => s.Text));
 
     private static string EffectiveText(PdfParagraph p) => p.Text.Length > 0 ? p.Text : ParagraphPlainText(p);
@@ -2601,7 +2602,7 @@ public static class PdfStructure
         _ => false,
     };
 
-    private static bool IsSeparatorText(string text)
+    internal static bool IsSeparatorText(string text)
     {
         string trimmed = text.Trim();
         if (trimmed.Length == 0) return false;
@@ -2611,7 +2612,7 @@ public static class PdfStructure
         return total >= 6 && ((double)alnum / total) < 0.15;
     }
 
-    private static bool LooksLikeFigureLabel(string text)
+    internal static bool LooksLikeFigureLabel(string text)
     {
         var words = text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
         if (words.Length >= 3 && words.All(w => w.Length <= 1)) return true;
@@ -2624,13 +2625,13 @@ public static class PdfStructure
         return false;
     }
 
-    private static bool LooksLikeBareUrl(string text)
+    internal static bool LooksLikeBareUrl(string text)
     {
         string t = text.Trim();
         return (t.StartsWith("http://") || t.StartsWith("https://") || t.StartsWith("www.")) && !t.Any(char.IsWhiteSpace);
     }
 
-    private static bool IsSectionPattern(string text)
+    internal static bool IsSectionPattern(string text)
     {
         string t = text.Trim();
         if (t.StartsWith('§')) return true;
@@ -2639,7 +2640,7 @@ public static class PdfStructure
         return StartsWithSectionNumber(t);
     }
 
-    private static bool IsNumberedSectionHeading(string text)
+    internal static bool IsNumberedSectionHeading(string text)
     {
         string t = text.Trim();
         if (t.Length == 0) return false;
