@@ -94,5 +94,7 @@ your behalf: point `OcrOptions.ModelDirectory` at a checkpoint you already have.
 
 ## License
 
-MIT. Some files are derivative works of Apache-2.0 Rust crates — see
-[THIRD_PARTY_NOTICES.md](https://github.com/curiosity-ai/xberg/blob/main/dotnet/THIRD_PARTY_NOTICES.md).
+`MIT AND Apache-2.0`. The package is MIT, except for a handful of files that are derivative
+works of Apache-2.0-only Rust crates and remain under that license — see
+[THIRD_PARTY_NOTICES.md](https://github.com/curiosity-ai/xberg/blob/main/dotnet/THIRD_PARTY_NOTICES.md)
+for exactly which files and which upstreams.

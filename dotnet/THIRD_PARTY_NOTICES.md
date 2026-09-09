@@ -12,12 +12,14 @@ crates ships a `NOTICE` file, so §4(d) does not apply.
 
 > **Note for packagers.** Every other Rust crate the .NET port derives from is
 > MIT or dual `MIT OR Apache-2.0` (where MIT can be taken), so the assembly was
-> previously MIT throughout. These three are Apache-2.0 *only*, so
-> `<Packagelicense>MIT</Packagelicense>` in `src/Paperless.Content/Paperless.Content.csproj` no longer
-> describes the whole assembly. A combined expression such as
-> `MIT AND Apache-2.0` would. That declaration has been left as it is, because
-> changing what a published package tells its consumers is the maintainer's
-> call, not this port's.
+> previously MIT throughout. These three are Apache-2.0 *only*, so plain MIT does
+> not describe the whole assembly. The package therefore declares
+> `<PackageLicenseExpression>MIT AND Apache-2.0</PackageLicenseExpression>` in
+> `src/Paperless.Content/Paperless.Content.csproj`, which is what a consumer of
+> `Paperless.Content` on NuGet now sees. Both halves are satisfied by shipping the
+> repository's [MIT `LICENSE`](../LICENSE) and the Apache-2.0 text in
+> [`third_party/`](third_party/LICENSE-Apache-2.0.txt); removing the last
+> Apache-2.0-derived file is what would let the expression narrow back to MIT.
 
 ## typst-syntax 0.15.1 — Apache-2.0
 
