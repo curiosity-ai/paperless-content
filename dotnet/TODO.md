@@ -6,11 +6,13 @@ Each format is "done" when the `Xberg.TestRunner` output matches the locally gen
 `{filename}-results-rust.json` golden files for its fixtures (documented deviations allowed).
 See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate them.
 
-> **Status — read this before trusting any number below.** Upstream was merged again on
-> **2026-08-27** (413 commits, up to `c09caac0`), and **the goldens have not been regenerated
-> against it**, so every corpus figure in this file describes the *pre-merge* Rust. See
-> "Upstream sync, 2026-08-27" below for what was ported, what was reviewed and skipped, and what
-> is still open; regenerate and re-measure before trusting anything numeric here.
+> **Status — read this before trusting any number below.** Upstream has been merged twice since
+> the last measurement: on **2026-08-27** (413 commits, to `c09caac0`) and again on
+> **2026-09-09** (391 commits, to `5717407b`). **The goldens have not been regenerated against
+> either**, so every corpus figure in this file describes Rust as it stood before both. See
+> "Upstream sync, 2026-09-09" and "Upstream sync, 2026-08-27" below for what was ported, what was
+> reviewed and skipped with the reason, and what is still open; regenerate and re-measure before
+> trusting anything numeric here.
 >
 > The goldens are **not committed**, and a fresh container starts without them. They were last
 > regenerated on 2026-08-24 against the then-current Rust tree: 3165 fixtures, one sorted
@@ -891,6 +893,177 @@ current upstream. Its two remaining spellings are the stale golden traced above,
 `vendored/unstructured/eml/email-replace-mime-encodings-error-5.eml` and
 `vendored/unstructured/msg/fake-email-multiple-attachments.msg` (both traced and closed on every
 hard dimension — see "Every failing fixture, categorized" above).
+
+## Upstream sync, 2026-09-09
+
+Upstream `xberg-io/xberg` was merged at `5717407b` — 391 commits since the last common ancestor,
+`c09caac0`. The Rust tree under `crates/` took the merge cleanly (the fork touches only `dotnet/`
+and `.gitignore`), so everything below is the re-derivation of the port's behaviour against it.
+
+**Goldens have not been regenerated against this merge either.** The corpus is not materialized in
+this container and `tools/xberg-reference-gen` was not run, so every corpus figure elsewhere in
+this file still describes pre-`c09caac0` Rust. The port's own unit tests are green: 2097 passing,
+and the 5 failures are the `OxPageExtractor`/`OxCharXOffsets` fixture reads against the absent
+`test_documents`, exactly as before the merge. Regenerating and re-measuring is still the first
+thing the next session should do — see "Re-syncing after an upstream merge" in `Claude.md`.
+
+Every fix below was landed with a guard proven to fail without it: the fix was reverted, the test
+was watched to fail, and the fix restored. Where a guard did not fail, that is recorded too, and
+the reason is in the entry.
+
+### Ported in this pass
+
+- [x] **`fix(docx): return a merged cell once instead of per covered column and row` (#1549).** A
+      cell with `w:gridSpan` was cloned into every column it covered, and a `w:vMerge` continuation
+      then copied the row above down over all of them, so a cell merged across 4 columns and 3 rows
+      came back 12 times — in the table's cells, its markdown and the rendered content alike. The
+      three grids the port built by hand are now one `ToCellGrid` parameterised over the paragraph
+      renderer.
+- [x] **`fix(doc): read fcClx at FibRgFcLcb97 pair 33, not obsolete pair 66` (#1551).** Pair 66 is
+      `fcBkdFtnOldOld`, which Word writes as zero, so `fcClx == 0` held for every real document: the
+      piece table was never walked and extraction always took the contiguous fallback, reading
+      `reserved5`/`reserved6` at `0x18`/`0x1C` — bytes MS-DOC says a reader must ignore.
+- [x] **`fix(doc)` subdocuments (#77), which the port never had.** With the piece table reachable
+      for the first time, the walk still dropped every piece starting at or after `ccpText` — all
+      footnote, header/footer, comment and text-box content. It now buckets each piece into the
+      subdocument CP range it falls in and emits the labelled sections.
+- [x] **`fix(pdf,mime): … type OLE2 files by path` (#1590).** The compound-file magic names the
+      container, not the format, so `.doc`/`.xls`/`.ppt`/`.msg`/`.hwp` all answered
+      `application/msword` and the extension had to settle it. The root storage's CLSID is the
+      document's own answer, resolved over the whole buffer — a chain built from the 4 KiB sniff
+      prefix references sectors that prefix does not contain, which is why the header path is
+      excepted rather than extended. An unrecognised CLSID still reads as ambiguous.
+- [x] **`fix(pdf): keep lexical hyphens attested elsewhere in the document` (#1543)** and
+      **`fix(pdf,docx): stop welding words …` (#1591).** Two repairs were answering, from a fixed
+      rule, questions only the document can answer. Dehyphenation joined every line-final hyphen,
+      welding authored compounds shut; a hyphen the document writes mid-run elsewhere is its own
+      evidence, and only a mid-run one can witness, since a wrap hyphen is by construction the last
+      character before the break. The ligature-space repair deletes the space in `f` + ` ` +
+      `i|l|f` to undo a decomposed glyph, but that is also an ordinary word boundary — the only
+      guard was 33 short English words tested against the left fragment, so "relief for" and
+      "itself infringes" welded. Both now judge by document-wide witnesses, gathered before any
+      page's segments are consumed. A fragment must not witness itself, so tokens flanking a
+      candidate are skipped when collecting.
+- [x] **`fix(pdf): stop rewriting ':' and 'M' as t-ligatures` (#1556).** Both arms corrupted
+      ordinary text ("aMb" → "attib"); they were introduced behind a per-font broken-CMap signal
+      that no longer exists and left unconditional when it went away.
+- [x] **`fix(pdf): stop welding suspended hyphens …` (#1581).** The assembly layer judged a
+      line-ending hyphen purely by text pattern, at three sites that compare words *within* a line,
+      so Dutch suspended hyphens welded ("onderhouds- en" → "onderhoudsen"). It now also requires a
+      genuine visual line break.
+- [x] **`fix(pdf): stop splitting a word across two touching spans` (#1566).** A word drawn as two
+      spans 0.069 pt apart came back as "pri js". No gap threshold could produce that space: the
+      style comparison returns first, because a mid-word switch between two subset fonts reads as a
+      style change with no geometric signal. Guarded before any style comparison, and again in the
+      table path, where the word type is integer-rounded and cannot represent the gap.
+- [x] **`fix(pdf): normalize table cells only in numeric columns` (#1582).** The dash and exponent
+      rewriting ran on every data cell of every table, so "Functionaliteit—12" lost its em-dash and
+      the part code "HRE - HReco" was welded and lowercased. Gated per column, judged against the
+      dash-normalized preview so "- 3" still resolves to -3.
+- [x] **`fix(docx): map extracted images to the page they appear on` (#1546).** The port set no
+      page at all; upstream's own lookup searched rendered markdown for a per-image placeholder
+      that does not exist. Taken from the parsed element walk instead.
+- [x] **`fix(types): serialize named structs as JSON objects, not tuples`.** Two of the twelve
+      migrated types reach this port's surface — a markdown link and a fenced code block, both on
+      `TextMetadata`. The other ten are types the port does not emit, or already models with named
+      fields (checked one by one).
+- [x] **`fix extraction regressions reported in open issues`, the three parts that apply.** #1558:
+      surplus inferred header rows are demoted to data rather than discarded. #1561: the
+      segment-level dehyphenation pass takes the same visual-line-break test. #1562: text-box
+      character references — the port's XML reader resolves them while parsing, so the added test
+      pins the behaviour rather than fixing it.
+- [x] **`feat(formats): add KML and GeoJSON support`.** Each keeps its own MIME and routes to the
+      extractor for the syntax it is written in; the resolver's specificity rules already handle
+      the rest.
+- [x] **`feat(diagram): extract flat ODF drawings (.fodg)`, the routing half.** Flat ODF drawings
+      advertised no extractor at all. A flat document carries the packaged MIME inside itself as
+      the root's `office:mimetype`, trusted only on a real `office:document` root in the ODF office
+      namespace. The shape/connector recovery is for the custom `dot` output only — see below.
+- [x] **The bold body-size heading chain** — `fix(pdf): classify repeated bold body-size headings`,
+      `… keep subordinate bold text out of headings`, `… preserve agenda heading hierarchy`,
+      `… narrow same-row heading suppression`, `… reject invalid heading geometry`. A document whose
+      titles are set in the body face and distinguished only by weight gives font-size clustering
+      nothing to work with. The decision is made for the document as a whole, and eligibility is
+      where the four follow-ups live: a title must open a block of real body text beneath it and not
+      be indented past it; a block sharing its text row is a run-in label; an explicitly numbered
+      section stands on its own numbering except a bare roman numeral before mixed-case prose; and
+      non-finite geometry supports no measurement.
+- [x] **`fix(mime): reject unsupported vocabulary MIME`.** `.atom` and `.gltf` are vocabularies
+      nothing here extracts, so those files are better served as the XML or JSON they are.
+- [x] **`feat(mime): complete format and extension registry`, the aliases whose formats already
+      have extractors.** `.xhtml` was the worst: the HTML extractor advertises
+      `application/xhtml+xml` and no extension pointed at it. Also `.xht`, `.dj`, `.pps`, `.xltm`,
+      `.hif`, `.heifs`, `.heics`; `.xla` moved to `application/vnd.ms-excel` where it belongs.
+
+Two pieces of test scaffolding were needed and are now available for reuse: `CfbBuilder` assembles
+an OLE2 container in memory (including the mini-stream tier, without which a stream under 4096
+bytes reads back as zeroes), and `ForgeDeclaredSize` rewrites a ZIP member's declared size in both
+the local header and the central directory.
+
+### Reviewed and deliberately not ported
+
+- **`fix(security): bound container reads by declared member size` (GHSA-85w9-wqcq-x48r).** Not
+  portable as a code change. Upstream's ZIP reader puts no bound on the decompressed side, so every
+  call site had to add one; `ZipArchive` here ends a member's stream at the size it declared. I
+  wrote the bound first and found it was a no-op — the guard passed with it reverted — so it is
+  gone, and `ZipDeclaredSizeTests` stands in its place to catch a future hand-rolled reader.
+- **`fix(pdf,mime): resolve UTF-16BE destinations …` (#1589), the PDF half.** Upstream decoded a
+  `/Dest` name-tree key with `from_utf8_lossy` before the lookup, turning a UTF-16BE BOM into two
+  U+FFFD. `PdfBookmarks` keys destinations by a byte-preserving Latin-1 string on both the write
+  and read sides, and says so in a comment, so the defect never existed here.
+- **`fix(pdf): fence a lone multi-line monospace paragraph` (#1557).** The port already fences on
+  the paragraph's own line count and never required a monospace neighbour.
+- **`fix(mime): sniff files with unknown extensions`.** `ResolveWithContent` already falls back to
+  content detection when the extension yields nothing.
+- **`fix(docx)` text-box entity references (#1562)** — kept as a pinning test, not a fix; see above.
+- **`fix(pdf): recover visible annotation-only text`.** The port has no PDF annotation support at
+  all — no annotation type, no `/Annots` reading. This is a feature the port never had rather than
+  behaviour that drifted, so it belongs with annotation support, not with this sync.
+- **`fix(plugins)` registry lifecycle, `fix(url)` HTTP metadata, `fix(config)` nested-field
+  rejection, `fix(image)`/`fix(security)` Rust feature gating, `chore`/`refactor`/`ci`/`docs`/alef
+  regeneration.** No counterpart in the port's surface.
+- **Everything OCR**, and the OCR-only halves of the PDF and image extractors — out of scope per
+  `Claude.md`. That covers `fix(pdf): preserve stronger native page text`, the image-budget series
+  (`fix(security): bound decoded image allocations`, `… account for live image buffers`,
+  `… enforce image peak budgets`, `… close image budget gaps`), and the tesseract/paddle/VLM work.
+
+### Still open from this merge
+
+Reviewed, in scope, not done. Roughly in descending corpus impact.
+
+- [ ] **`feat(extraction): support MyST text notebooks` (#1538).** The largest item by far: ~2000
+      lines across a new `myst` module and the markdown and jupyter extractors, which are woven
+      together (admonition markers, target markers, a preprocessing pass). Markdown is currently at
+      full corpus parity, and a rushed partial port would put that at risk. Do it as its own piece
+      of work, measured against fresh goldens before and after.
+- [ ] **`feat(formats): extract SQLite and GeoPackage`.** Upstream runs real SQL through `rusqlite`.
+      The port forbids P/Invoke, so this needs a pure-managed reader for the SQLite *file* format —
+      header, b-tree pages, records, overflow — plus enough of `sqlite_master`'s DDL to name
+      columns. A contained subproject of its own, not a re-derivation.
+- [ ] **The legacy `.doc` PAPX chain:** `fix(doc): split legacy .doc elements on paragraph marks,
+      not blank lines`, `feat(doc): emit legacy .doc automatic lists as ListItems`, `feat(doc): take
+      legacy .doc headings from styles when the document uses them`. All three sit on the
+      paragraph-property layer (`PlcfBtePapx` → `PapxFkp` → `BxPap` → PAPX grpprl → `sprmPIlfo`/
+      `sprmPIlvl`, plus `PlfLfo`/`PlfLst` and the style sheet). The port still splits elements on
+      blank lines and guesses headings from line length. `CfbBuilder` now makes this testable.
+- [ ] **`fix(pdf): order a table beside a prose column instead of interleaving both` (#1545).** A
+      page whose left half is a two-panel table and whose right half is prose is emitted in
+      full-width Y order, splicing the prose apart mid-sentence. The port has the `DetectSplitX` and
+      `ReorderBandColumns` this attaches to, but the fix is ~10 new geometry functions and reading
+      order is an area the port is currently at parity in — worth measuring against the corpus
+      before and after rather than porting blind.
+- [ ] **`feat(docx): surface the paragraph style of a table cell`.** A heading-styled paragraph in a
+      `w:tc` is returned as anonymous cell text, so a banner-row section title is invisible.
+      Upstream lays per-cell style ids out through the same grid as the text, which the port now has
+      as `ToCellGrid`, so this is a smaller job than it was before this pass.
+- [ ] **`fix(pdf): stop excluding captured engine warnings by message substring`,
+      `fix(pdf): make hierarchy.enabled opt in the page tracking it needs`,
+      `fix(geojson): bound default extraction output`, `fix(extraction): clarify quality and table
+      limits`.** Each needs its own reading against the port's equivalent surface.
+- [ ] **`feat(mime): add detection policies`.** A config surface (`MimeDetectionPolicy`) the port
+      has no counterpart for; port it with whatever needs to select a policy.
+- [ ] Everything carried over from the 2026-08-27 sync's "Still open" list below, none of which this
+      pass touched.
 
 ## Upstream sync, 2026-08-27
 
