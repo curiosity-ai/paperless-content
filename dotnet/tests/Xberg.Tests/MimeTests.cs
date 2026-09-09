@@ -293,4 +293,26 @@ public class MimeTests
 
         Assert.Equal("application/vnd.ms-outlook", Mime.ResolveWithContent("application/vnd.ms-outlook", content));
     }
+
+    // ── geospatial formats (upstream feat(formats): add KML and GeoJSON support) ──
+
+    /// <summary>
+    /// Each keeps its own MIME so a consumer can tell what it is, while routing to the extractor
+    /// for the syntax it is written in. The content sniff sees generic XML or JSON, so the
+    /// specific extension has to win.
+    /// </summary>
+    [Theory]
+    [InlineData("map.kml",
+        "<?xml version=\"1.0\"?><kml xmlns=\"http://www.opengis.net/kml/2.2\"><Placemark><name>Berlin</name></Placemark></kml>",
+        "application/vnd.google-earth.kml+xml")]
+    [InlineData("point.geojson",
+        "{\"type\":\"Point\",\"coordinates\":[13.4,52.5]}",
+        "application/geo+json")]
+    public void AGeospatialFileKeepsItsOwnMimeType(string fileName, string content, string expected)
+    {
+        string? fromExtension = Mime.DetectMimeType(fileName, checkExists: false);
+
+        Assert.Equal(expected, fromExtension);
+        Assert.Equal(expected, Mime.ResolveWithContent(fromExtension, Encoding.UTF8.GetBytes(content)));
+    }
 }

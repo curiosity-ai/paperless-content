@@ -189,9 +189,43 @@ public class DataStructuredTests
     public void SupportedMimeTypes_MatchRust()
     {
         var mimes = new StructuredExtractor().SupportedMimeTypes.ToList();
-        Assert.Equal(12, mimes.Count);
+        Assert.Equal(13, mimes.Count);
         Assert.Contains("application/json", mimes);
         Assert.Contains("application/toml", mimes);
         Assert.Contains("application/x-ndjson", mimes);
+        Assert.Contains(Mime.GeoJsonMimeType, mimes);
+    }
+
+    /// <summary>
+    /// Upstream <c>feat(formats): add KML and GeoJSON support</c>. GeoJSON is JSON, so it takes
+    /// the JSON extraction path and reports <c>json</c> as its data format, while keeping its own
+    /// MIME type.
+    /// </summary>
+    [Fact]
+    public void GeoJsonUsesJsonExtractionAndKeepsItsMimeType()
+    {
+        var doc = Extract("{\"type\":\"Point\",\"coordinates\":[13.4,52.5]}", Mime.GeoJsonMimeType);
+
+        Assert.Equal(Mime.GeoJsonMimeType, doc.MimeType);
+        Assert.Equal("json", doc.Metadata.Additional["data_format"].GetString());
+        Assert.Equal(
+            "type: Point\n\ncoordinates\n13.4\n52.5",
+            Derive.DeriveExtractionResult(doc, includeDocumentStructure: false, OutputFormat.Plain).Content);
+    }
+
+    /// <summary>KML is XML, so it takes the XML extraction path and keeps its own MIME type.</summary>
+    [Fact]
+    public void KmlUsesXmlExtractionAndKeepsItsMimeType()
+    {
+        var doc = new XmlExtractor().Extract(
+            Encoding.UTF8.GetBytes(
+                "<kml xmlns=\"http://www.opengis.net/kml/2.2\"><Placemark><name>Berlin</name></Placemark></kml>"),
+            Mime.KmlMimeType,
+            new ExtractionConfig());
+
+        Assert.Equal(Mime.KmlMimeType, doc.MimeType);
+        Assert.Equal(
+            "kml\n  Placemark\n    name\n    Berlin",
+            Derive.DeriveExtractionResult(doc, includeDocumentStructure: false, OutputFormat.Plain).Content);
     }
 }

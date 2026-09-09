@@ -17,6 +17,7 @@ public sealed class XmlExtractor : IExtractor
     {
         "application/xml",
         "text/xml",
+        Mime.KmlMimeType,
         "image/svg+xml",
         "application/x-endnote+xml",
     };

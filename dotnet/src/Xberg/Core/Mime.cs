@@ -40,6 +40,12 @@ public static class Mime
     /// <summary>The MIME every source file resolves to, whatever language it turns out to be.</summary>
     public const string CodeMimeType = "text/x-source-code";
 
+    /// <summary>GeoJSON — JSON syntax, routed to the structured extractor.</summary>
+    public const string GeoJsonMimeType = "application/geo+json";
+
+    /// <summary>KML — XML syntax, routed to the XML extractor.</summary>
+    public const string KmlMimeType = "application/vnd.google-earth.kml+xml";
+
     /// <summary>The MS-CFB (compound binary file) signature, shared by legacy .doc/.xls/.ppt.</summary>
     private static bool IsOle2(ReadOnlySpan<byte> b) =>
         b.Length >= 8 && b[0] == 0xD0 && b[1] == 0xCF && b[2] == 0x11 && b[3] == 0xE0 &&
@@ -579,10 +585,14 @@ public static class Mime
         Add("text/csv", "csv");
         Add("text/tab-separated-values", "tsv");
         Add("application/json", "json");
+        // Geospatial siblings of JSON and XML: each keeps its own MIME so a consumer can tell
+        // what it is, and routes to the extractor for the syntax it is written in.
+        Add(GeoJsonMimeType, "geojson");
         Add("application/x-ndjson", "jsonl", "ndjson");
         Add("application/x-yaml", "yaml", "yml");
         Add("application/toml", "toml");
         Add("application/xml", "xml");
+        Add(KmlMimeType, "kml");
         Add("image/svg+xml", "svg");
         Add("message/rfc822", "eml");
         Add("application/vnd.ms-outlook", "msg");
