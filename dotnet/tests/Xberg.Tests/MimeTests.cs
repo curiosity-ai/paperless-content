@@ -348,4 +348,31 @@ public class MimeTests
 
         Assert.NotEqual(Mime.OdgFlatMimeType, Mime.DetectMimeTypeFromBytes(content));
     }
+
+    /// <summary>
+    /// Upstream <c>fix(mime): reject unsupported vocabulary MIME</c>. A more specific vocabulary
+    /// only outranks the generic syntax it is written in when this port can actually extract it:
+    /// <c>.atom</c> and <c>.gltf</c> are XML and JSON vocabularies nothing here handles, so those
+    /// files are better served as the XML or JSON the content says they are than as a type no
+    /// extractor claims.
+    /// </summary>
+    [Theory]
+    [InlineData("application/atom+xml", "<?xml version=\"1.0\"?><feed/>", "application/xml")]
+    [InlineData("model/gltf+json", "{\"asset\":{\"version\":\"2.0\"}}", "application/json")]
+    public void AnUnsupportedVocabularyDoesNotOverruleTheSyntaxItIsWrittenIn(
+        string extensionMime, string content, string expected)
+    {
+        Assert.Equal(expected, Mime.ResolveWithContent(extensionMime, Encoding.UTF8.GetBytes(content)));
+    }
+
+    /// <summary>A vocabulary the port does extract still wins, as it must.</summary>
+    [Fact]
+    public void ASupportedVocabularyStillOverrulesGenericContent()
+    {
+        Assert.Equal(
+            "application/x-fictionbook+xml",
+            Mime.ResolveWithContent(
+                "application/x-fictionbook+xml",
+                Encoding.UTF8.GetBytes("<?xml version=\"1.0\"?><FictionBook/>")));
+    }
 }

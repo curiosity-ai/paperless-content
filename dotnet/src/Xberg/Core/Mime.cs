@@ -202,8 +202,15 @@ public static class Mime
         if (fromMagic is null || fromMagic == extensionMime) return extensionMime;
 
         if (fromMagic == "text/plain") return extensionMime;
-        if (IsGenericXmlMime(fromMagic) && IsSpecificXmlMime(extensionMime)) return extensionMime;
-        if (fromMagic == "application/json" && IsSpecificJsonMime(extensionMime)) return extensionMime;
+        // A more specific vocabulary only outranks the generic syntax it is written in when this
+        // port can actually extract it: `.atom` and `.gltf` are XML and JSON vocabularies nothing
+        // here handles, so a file with one of those extensions is better served as the XML or
+        // JSON the content says it is than as a type no extractor claims (upstream
+        // `fix(mime): reject unsupported vocabulary MIME`).
+        if (IsGenericXmlMime(fromMagic) && IsSpecificXmlMime(extensionMime)
+            && SupportedMimeTypes.Contains(extensionMime)) return extensionMime;
+        if (fromMagic == "application/json" && IsSpecificJsonMime(extensionMime)
+            && SupportedMimeTypes.Contains(extensionMime)) return extensionMime;
         if (IsAmbiguousContainer(fromMagic)) return extensionMime;
 
         return SupportedMimeTypes.Contains(fromMagic) || fromMagic.StartsWith("image/", StringComparison.Ordinal)
