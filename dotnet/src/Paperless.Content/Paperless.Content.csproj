@@ -15,9 +15,9 @@
     <PackageLicenseExpression>MIT AND Apache-2.0</PackageLicenseExpression>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageTags>document;extraction;pdf;docx;xlsx;pptx;text;markdown;html</PackageTags>
-    <RepositoryUrl>https://github.com/curiosity-ai/xberg</RepositoryUrl>
+    <RepositoryUrl>https://github.com/curiosity-ai/paperless-content</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
-    <PackageProjectUrl>https://github.com/curiosity-ai/xberg/tree/main/dotnet</PackageProjectUrl>
+    <PackageProjectUrl>https://github.com/curiosity-ai/paperless-content/tree/main/dotnet</PackageProjectUrl>
     <IsPackable>true</IsPackable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>

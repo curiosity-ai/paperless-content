@@ -2,7 +2,7 @@
 
 [![NuGet](https://img.shields.io/nuget/v/Paperless.Content?label=NuGet&color=5c2d91&logo=nuget&logoColor=white)](https://www.nuget.org/packages/Paperless.Content/)
 [![Downloads](https://img.shields.io/nuget/dt/Paperless.Content?label=downloads&color=5c2d91)](https://www.nuget.org/packages/Paperless.Content/)
-[![License](https://img.shields.io/badge/license-MIT%20AND%20Apache--2.0-007ec6)](https://github.com/curiosity-ai/xberg/blob/main/dotnet/THIRD_PARTY_NOTICES.md)
+[![License](https://img.shields.io/badge/license-MIT%20AND%20Apache--2.0-007ec6)](https://github.com/curiosity-ai/paperless-content/blob/main/dotnet/THIRD_PARTY_NOTICES.md)
 
 Content extraction for .NET. Point it at a document — Office, PDF, HTML, email, an archive —
 and get back the text, metadata, tables, images and a structured element tree, in whichever
@@ -98,14 +98,14 @@ your behalf: point `OcrOptions.ModelDirectory` at a checkpoint you already have.
 
 ## Links
 
-- [Source](https://github.com/curiosity-ai/xberg/tree/main/dotnet) — the port lives under `dotnet/` in the Xberg repository
-- [Architecture, scope and conventions](https://github.com/curiosity-ai/xberg/blob/main/dotnet/Claude.md)
-- [Port status and work breakdown](https://github.com/curiosity-ai/xberg/blob/main/dotnet/TODO.md)
-- [Issues](https://github.com/curiosity-ai/xberg/issues)
+- [Source](https://github.com/curiosity-ai/paperless-content/tree/main/dotnet) — the port lives under `dotnet/` in the `curiosity-ai/paperless-content` repository
+- [Architecture, scope and conventions](https://github.com/curiosity-ai/paperless-content/blob/main/dotnet/Claude.md)
+- [Port status and work breakdown](https://github.com/curiosity-ai/paperless-content/blob/main/dotnet/TODO.md)
+- [Issues](https://github.com/curiosity-ai/paperless-content/issues)
 
 ## License
 
 `MIT AND Apache-2.0`. The package is MIT, except for a handful of files that are derivative
 works of Apache-2.0-only Rust crates and remain under that license — see
-[THIRD_PARTY_NOTICES.md](https://github.com/curiosity-ai/xberg/blob/main/dotnet/THIRD_PARTY_NOTICES.md)
+[THIRD_PARTY_NOTICES.md](https://github.com/curiosity-ai/paperless-content/blob/main/dotnet/THIRD_PARTY_NOTICES.md)
 for exactly which files and which upstreams.
