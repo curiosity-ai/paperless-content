@@ -21,14 +21,18 @@ Rust work can be merged and the C# port re-synchronized.
 
 **Out of scope (explicitly excluded):**
 
-- OCR (Tesseract / PaddleOCR / candle VLMs), audio/video transcription.
+- Audio/video transcription.
 - Embeddings, GLiNER/NER, LLM/structured-extraction, reranking.
 - Server mode (REST API, MCP), chunking-for-RAG, keyword extraction.
 - Code intelligence (tree-sitter, 306 languages) — **low priority**, only after
   every other format is ported and validated.
 
-When a Rust code path branches into an excluded feature (e.g. `if config.ocr … `),
-the C# port takes the "native extraction only" branch and drops the OCR path.
+When a Rust code path branches into an excluded feature, the C# port takes the
+"native extraction only" branch and drops the excluded one.
+
+**OCR is the one exception, and a deliberate deviation from upstream** rather than a
+port of it — off by default, opt-in, and a different engine. See
+[Deviation: optional OCR](#deviation-optional-ocr).
 
 ---
 
@@ -73,8 +77,8 @@ Rust: `crates/xberg/src/types/internal.rs`. This is the spine of the whole syste
   `DefinitionTerm`, `DefinitionDescription`, `Admonition`, `RawBlock`, `MetadataBlock`,
   `ListStart{ordered:bool}`, `ListEnd`, `QuoteStart`, `QuoteEnd`, `GroupStart`,
   `GroupEnd`, `Table{tableIndex:uint}`, `Image{imageIndex:uint}`, `PageBreak`,
-  `OcrText{level}` (OcrText only appears from excluded OCR paths — keep the variant
-  for completeness but no extractor emits it).
+  `OcrText{level}` (emitted only by the port's own optional OCR pass — see
+  [Deviation: optional OCR](#deviation-optional-ocr) — never by an extractor).
 
   Each variant has a stable string `Discriminant()` (see Rust `discriminant()`), used
   for the deterministic element ID.
@@ -86,8 +90,8 @@ Rust: `crates/xberg/src/types/internal.rs`. This is the spine of the whole syste
 ### The public result — `ExtractedDocument`
 
 Rust: `crates/xberg/src/types/extraction.rs`. This is the public output type. Fields we
-keep: `Content`, `MimeType`, `Metadata`, `ExtractionMethod` (Native/Ocr/Mixed — always
-`Native` in the port), `Tables`, `DetectedLanguages`, `Images`, `Pages`, `Elements`
+keep: `Content`, `MimeType`, `Metadata`, `ExtractionMethod` (Native/Ocr/Mixed — `Native`
+in the port unless the optional OCR pass contributed, which makes it `Mixed`), `Tables`, `DetectedLanguages`, `Images`, `Pages`, `Elements`
 (element-based format), `DjotContent`, `Document` (DocumentStructure tree), `Uris`,
 `Revisions`, `Annotations`, `Children`, `ProcessingWarnings`. Drop: chunks, embeddings,
 ocr_elements, keywords, quality_score, llm_usage.
@@ -116,7 +120,9 @@ renderers depend on it.
 Rust: `crates/xberg/src/core/config/`. Port a trimmed `ExtractionConfig` with the fields
 content extraction actually reads: `OutputFormat`, format-specific options (PDF, HTML,
 Excel, email), `IncludeDocumentStructure`, image-extraction toggles, `ResultFormat`
-(Unified vs ElementBased). Drop OCR/embedding/chunking/LLM config sections.
+(Unified vs ElementBased). Drop the embedding/chunking/LLM config sections. `Ocr` is
+**not** upstream's OCR config — it is the port's own `OcrOptions`, see
+[Deviation: optional OCR](#deviation-optional-ocr).
 
 `OutputFormat`: `Plain` (default), `Markdown`, `Djot`, `Html`, `Json`, `Structured`,
 `Custom(name)`.
@@ -265,7 +271,8 @@ clean and the whole job is re-deriving the C# port's behaviour. The loop that wo
 2. **Office (priority):** docx, xlsx, pptx, odt, doc, ppt, rtf, epub.
 3. **Structured & markup:** html, xml, json/yaml/toml, csv, ods, jats, docbook, opml.
 4. **Email & archives:** eml, msg, pst; zip, tar, 7z, gzip.
-5. **Remaining:** pdf, images (metadata/exif only, no OCR), hwp/hwpx, iwork, latex, rst,
+5. **Remaining:** pdf, images (metadata/exif only; pixels are read only by the opt-in
+   OCR pass), hwp/hwpx, iwork, latex, rst,
    org, typst, bibtex, fictionbook, jupyter, dbf, mdx.
 6. **Code files (lowest priority):** tree-sitter equivalent — only after everything above
    is ported and green.
@@ -281,3 +288,83 @@ clean and the whole job is re-deriving the C# port's behaviour. The loop that wo
   rather than a binding to ONNX Runtime: the Rust build links `ort` natively, which a
   portable package cannot. See `tools/onnx-parity/README.md` for how that runtime is
   validated against ONNX Runtime layer by layer.
+  The optional OCR pass is the single documented exception — it pulls native code in
+  transitively, which is why it is off by default. See
+  [Deviation: optional OCR](#deviation-optional-ocr).
+
+---
+
+## Deviation: optional OCR
+
+This is the port's **largest intentional divergence from upstream `xberg`**. Everything else
+in this directory aims at parity; this does not. It is recorded here because a future
+re-sync will otherwise read it as drift and try to "fix" it.
+
+### What changed, and why it is a deviation
+
+The charter above excluded OCR outright. It is now available as an **opt-in extraction
+pass**, `Xberg.Core.Ocr`, driven by `ExtractionConfig.Ocr`. Three things make this a
+deviation rather than a port:
+
+1. **Different engine family.** Upstream reaches for Tesseract, or candle-hosted VLMs
+   through `ort`. The port uses [PaddleOCR-VL](https://github.com/theolivenbaum/PaddleOCR/)
+   (`PaddleOCR` on NuGet, `PaddleOcrSharp` assembly). Two OCR engines never agree
+   character-for-character, so **no golden fixture can compare OCR output across the two
+   implementations.** Do not write one. The tests guard the *flow* — gating, placement,
+   budgets, failure handling — not the recognition.
+2. **It breaks the "pure managed" convention.** `PaddleOCR` brings SkiaSharp for image
+   decoding, and `PaddleOCR.Pdf` brings PDFium (via `PDFtoImage`) for page rasterisation.
+   Both are native. This is exactly what the Conventions section forbids, and the reason
+   the feature is **off by default**: a consumer that never sets `Ocr` never loads either.
+   PDFium is not optional-in-principle — the port's PDF reader extracts text and geometry
+   but does not rasterise, and a scanned page's text exists *only* as pixels, so `ScanOnly`
+   could not work at all without a rasteriser.
+3. **Upstream's config shape is not mirrored.** `OcrOptions` is designed for this pass, not
+   ported from `crates/xberg/src/core/config/`. Do not try to reconcile the two.
+
+### The three modes
+
+`OcrOptions.Mode`, default `Disabled`:
+
+| Mode | What it recognises |
+|---|---|
+| `Disabled` | Nothing. No model is resolved, no native library is touched. |
+| `ScanOnly` | Pages a PDF's scan detector flagged (`PdfMetadata.ScannedPages`, from the existing `PdfScanDetect`). The pages are rasterised at `Dpi` and recognised whole; the text is **appended** as a page-level `OcrText` element carrying its `Page`, because a whole page's recognition has no single element to sit after. |
+| `AllImages` | Every embedded image that carries bytes and clears `MinImagePixels`, plus the `ScanOnly` behaviour for PDFs. Each image's text is **inserted immediately after the `Image` element that references it**, so every renderer places it inline for free. An image no element references is appended rather than dropped. |
+
+### Where it runs, and why there
+
+`OcrProcessor.Process` runs in `Extractor` **between extraction and
+`Derive.DeriveExtractionResult`** — on the element stream, not the rendered string:
+
+```
+extractor.Extract(…) ─▶ InternalDocument ─▶ OcrProcessor.Process ─▶ Derive… ─▶ ExtractedDocument
+```
+
+That ordering is what makes "inline" literal. A pass over rendered text could only append.
+Note this differs from `QrPostProcessor`, which runs after rendering.
+
+### Invariants worth not breaking
+
+- **Additive only.** Native text is never replaced. A page that already has text keeps it.
+- **Never fatal.** A missing checkpoint, an undecodable image, or a recognition that
+  outruns `PerImageTimeout` becomes a `ProcessingWarning` with source `"ocr"`; the document
+  comes back intact. A document is not a failure for lacking OCR.
+- **No work, no weights.** What there is to recognise is computed before the engine is
+  constructed, so a mode with nothing to do costs nothing.
+- **Nothing downloads.** `OcrOptions.ModelDirectory` (and `LayoutModelDirectory`) name where
+  the checkpoint already is; absent those, PaddleOCR's own cache root is consulted so a
+  cache warmed out of band works unconfigured. A missing checkpoint raises
+  `OcrUnavailableException` — the pass will not pull gigabytes as a side effect of an
+  extraction call.
+- **`ExtractionMethod` becomes `Mixed`, not `Ocr`**, when the pass contributes. The native
+  text is still there, and a consumer treating the whole document as machine-read would be
+  wrong about most of it.
+
+### Testing
+
+`IOcrEngine` exists so the flow is testable: the shipped recognizer needs a multi-gigabyte
+checkpoint, so `OcrProcessorTests` drives everything through a fake. Recognition quality is
+PaddleOCR's own business and is not re-tested here. Every assertion in that file has been
+mutation-proved — each of the thirteen behaviours above was reverted in turn and the
+corresponding test watched to fail.
