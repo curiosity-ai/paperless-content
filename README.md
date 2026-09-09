@@ -287,6 +287,35 @@ Build from source as part of this workspace. See [C (FFI) README](https://github
 
 </details>
 
+### Paperless.Content (native .NET port)
+
+This fork also carries a **native C# port** of the extraction engine under
+[`dotnet/`](dotnet/), published to NuGet as **`Paperless.Content`** and part of the
+[Paperless](https://github.com/curiosity-ai) family of content-extraction tools. It is not a
+binding over the Rust core: every extractor, type and renderer is reimplemented in managed C#,
+so the package is portable and pulls no native dependencies (the opt-in OCR pass is the one
+documented exception). Content extraction only — no transcription, embeddings, chunking or
+server mode.
+
+```sh
+dotnet add package Paperless.Content
+```
+
+```csharp
+using Paperless.Content.Core;
+
+var result = new Extractor().Extract(
+    ExtractInput.FromUri("report.pdf"),
+    new ExtractionConfig { OutputFormat = OutputFormat.Markdown });
+
+Console.WriteLine(result.Results[0].Content);
+```
+
+See [`dotnet/src/Paperless.Content/README.md`](dotnet/src/Paperless.Content/README.md) for the
+package documentation and [`dotnet/Claude.md`](dotnet/Claude.md) for the port's architecture,
+scope and re-sync process. The `XbergIo.Xberg` package above is upstream's separate FFI
+binding over the Rust core — the two are unrelated.
+
 ### CLI & Deployment
 
 <details>
