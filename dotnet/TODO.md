@@ -900,12 +900,18 @@ Upstream `xberg-io/xberg` was merged at `5717407b` — 391 commits since the las
 `c09caac0`. The Rust tree under `crates/` took the merge cleanly (the fork touches only `dotnet/`
 and `.gitignore`), so everything below is the re-derivation of the port's behaviour against it.
 
-**Goldens have not been regenerated against this merge either.** The corpus is not materialized in
-this container and `tools/xberg-reference-gen` was not run, so every corpus figure elsewhere in
-this file still describes pre-`c09caac0` Rust. The port's own unit tests are green: 2097 passing,
-and the 5 failures are the `OxPageExtractor`/`OxCharXOffsets` fixture reads against the absent
-`test_documents`, exactly as before the merge. Regenerating and re-measuring is still the first
-thing the next session should do — see "Re-syncing after an upstream merge" in `Claude.md`.
+**The corpus is materialized again** — `test_documents` at its pinned commit plus the 693 bucket
+objects (589 MiB), fetched with the two commands in `Claude.md`. **The goldens have still not been
+regenerated against this merge**, so every corpus figure elsewhere in this file describes
+pre-`c09caac0` Rust; regenerating them is still the next session's first job.
+
+Fetching the corpus was itself informative. The suite had been running against a corpus-less
+checkout for the whole sync, reporting 2097 passing, because roughly thirty fixture-backed tests
+open with `if (path is null) return;`. With the fixtures present, one of them fails:
+`OxStructureOrderTests.ATaggedRtlFormYieldsNoSpatialTable`. It is **not** a regression from this
+work — the identical failure reproduces on `1b1097ad`, the branch point — and it had never once
+run. `CorpusPresenceTests` now says so in one place rather than leaving thirty tests to decide
+quietly. See "The RTL spatial-table gap" below.
 
 Every fix below was landed with a guard proven to fail without it: the fix was reverted, the test
 was watched to fail, and the fix restored. Where a guard did not fail, that is recorded too, and
@@ -990,6 +996,19 @@ the reason is in the entry.
       non-finite geometry supports no measurement.
 - [x] **`fix(mime): reject unsupported vocabulary MIME`.** `.atom` and `.gltf` are vocabularies
       nothing here extracts, so those files are better served as the XML or JSON they are.
+- [x] **The legacy `.doc` PAPX chain** — `fix(doc): split legacy .doc elements on paragraph marks,
+      not blank lines`, `feat(doc): emit legacy .doc automatic lists as ListItems`, `feat(doc): take
+      legacy .doc headings from styles when the document uses them` (#1550, #1553). `DocPapx` reads
+      `PlcfBtePapx` → `PapxFkp` → `BxPap` → PAPX grpprl for `sprmPIlfo`/`sprmPIlvl`, `PlfLfo` →
+      `PlfLst` → `LVL` for each level's `nfc`, and the style sheet for whether an `istd` denotes a
+      heading. Three traps upstream documents, each with a guard proven against the corpus:
+      `lcbPlfLst` covers only the count and the `LSTF` array, so slicing to it cuts every `LVL`
+      off and the fixture returns 12 ordered lists and 0 bulleted; heading resolution follows
+      `istdBase`, which no `.doc` fixture exercises and which is therefore covered against a
+      synthesized sheet; and the styled-heading switch is per document and asks whether headings
+      are *emitted*, since `simple.doc`'s only heading-styled paragraph is list-bound. Reverting
+      the paragraph-mark split reproduces upstream's reported numbers exactly — one element for
+      `vendor_renewal_letter.doc`'s ten paragraphs, two for `duplicate-paragraphs.doc`.
 - [x] **`feat(mime): complete format and extension registry`, the aliases whose formats already
       have extractors.** `.xhtml` was the worst: the HTML extractor advertises
       `application/xhtml+xml` and no extension pointed at it. Also `.xht`, `.dj`, `.pps`, `.xltm`,
@@ -1027,6 +1046,29 @@ the local header and the central directory.
   (`fix(security): bound decoded image allocations`, `… account for live image buffers`,
   `… enforce image peak budgets`, `… close image budget gaps`), and the tesseract/paddle/VLM work.
 
+### Genuine upstream defects this port does not reproduce
+
+- **`.doc` subdocuments vanish once paragraph properties exist.** Upstream assembles the labelled
+  footnote, header/footer, comment and text-box sections into its `content` string, but builds its
+  element stream from the main paragraphs alone and never marks the content pre-rendered. So
+  `#1550` silently undoes `#77` for every document carrying a `PAPX` layer — which is every real
+  one. This port keeps emitting those sections after the body; see `PushSubdocumentSections`.
+
+### The RTL spatial-table gap
+
+`OxStructureOrderTests.ATaggedRtlFormYieldsNoSpatialTable` fails on
+`vendored/docling/pdf/right_to_left_03.pdf`: the port emits one spatial table where the test says
+upstream emits none. The test's own docstring explains the mechanism it expects — read in
+structure order the label and value cells are reading-order-adjacent, so merging adjacent words
+fuses each label with its value into one word spanning the row, leaving three of four columns
+empty, which the validity check rejects.
+
+Two things are worth stating plainly. It is not a regression: the same failure reproduces on
+`1b1097ad`. And the expectation itself is **unverified** — the test was written while the corpus
+was absent, so its author could not have run it, and nothing here has yet checked what the Rust
+reference actually produces for this fixture. Settle that against the reference before treating
+the port as wrong; the test may be asserting a behaviour upstream does not have.
+
 ### Still open from this merge
 
 Reviewed, in scope, not done. Roughly in descending corpus impact.
@@ -1040,12 +1082,6 @@ Reviewed, in scope, not done. Roughly in descending corpus impact.
       The port forbids P/Invoke, so this needs a pure-managed reader for the SQLite *file* format —
       header, b-tree pages, records, overflow — plus enough of `sqlite_master`'s DDL to name
       columns. A contained subproject of its own, not a re-derivation.
-- [ ] **The legacy `.doc` PAPX chain:** `fix(doc): split legacy .doc elements on paragraph marks,
-      not blank lines`, `feat(doc): emit legacy .doc automatic lists as ListItems`, `feat(doc): take
-      legacy .doc headings from styles when the document uses them`. All three sit on the
-      paragraph-property layer (`PlcfBtePapx` → `PapxFkp` → `BxPap` → PAPX grpprl → `sprmPIlfo`/
-      `sprmPIlvl`, plus `PlfLfo`/`PlfLst` and the style sheet). The port still splits elements on
-      blank lines and guesses headings from line length. `CfbBuilder` now makes this testable.
 - [ ] **`fix(pdf): order a table beside a prose column instead of interleaving both` (#1545).** A
       page whose left half is a two-panel table and whose right half is prose is emitted in
       full-width Y order, splicing the prose apart mid-sentence. The port has the `DetectSplitX` and
