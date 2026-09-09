@@ -558,4 +558,42 @@ public class OoxmlTests
             Assert.Equal(1, occurrences);
         }
     }
+
+    /// <summary>
+    /// Upstream <c>fix(docx): map extracted images to the page they appear on</c>
+    /// (xberg-io/xberg#1546). Every image was reported as page 1, because the page was looked up
+    /// by searching rendered markdown for a per-image placeholder that does not exist — every
+    /// drawing renders to the same target. The page comes from the parsed element walk instead.
+    /// </summary>
+    [Fact]
+    public void Docx_ImagesCarryThePageTheyAppearOn()
+    {
+        const string Drawing =
+            "<w:r><w:drawing><wp:inline><wp:docPr id=\"1\" name=\"p\"/><a:graphic><a:graphicData>" +
+            "<pic:pic><pic:blipFill><a:blip r:embed=\"rId1\"/></pic:blipFill></pic:pic>" +
+            "</a:graphicData></a:graphic></wp:inline></w:drawing></w:r>";
+
+        byte[] docx = Zip(
+            ("word/document.xml",
+                "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" " +
+                "xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" " +
+                "xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" " +
+                "xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\" " +
+                "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><w:body>" +
+                $"<w:p>{Drawing}</w:p>" +
+                "<w:p><w:r><w:br w:type=\"page\"/></w:r></w:p>" +
+                $"<w:p>{Drawing}</w:p>" +
+                "<w:p><w:r><w:br w:type=\"page\"/></w:r></w:p>" +
+                $"<w:p>{Drawing}</w:p>" +
+                "</w:body></w:document>"),
+            ("word/_rels/document.xml.rels",
+                "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" +
+                "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" " +
+                "Target=\"media/image1.png\"/></Relationships>"));
+
+        var doc = new DocxExtractor().Extract(docx, DocxMime, new ExtractionConfig());
+
+        Assert.Equal(3, doc.Images.Count);
+        Assert.Equal(new uint?[] { 1u, 2u, 3u }, doc.Images.Select(i => i.PageNumber).ToArray());
+    }
 }

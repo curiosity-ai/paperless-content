@@ -237,6 +237,7 @@ public sealed class DocxExtractor : IExtractor
     /// renderers can resolve alt text / source path. Mirrors the Rust extractor's placeholder images.</summary>
     private static void PopulateImages(DocxDocument doc, InternalDocument internalDoc)
     {
+        var pageNumbers = DrawingPageNumbers(doc);
         for (int i = 0; i < doc.Drawings.Count; i++)
         {
             var d = doc.Drawings[i];
@@ -250,8 +251,41 @@ public sealed class DocxExtractor : IExtractor
                 Description = d.Description,
                 Format = format,
                 SourcePath = sourcePath,
+                PageNumber = pageNumbers[i],
             });
         }
+    }
+
+    /// <summary>
+    /// The 1-based page each drawing appears on, in drawing order.
+    /// </summary>
+    /// <remarks>
+    /// Derived by walking the parsed element list, the way table page numbers are. Upstream used
+    /// to search the rendered markdown for an <c>![alt](image_N)</c> placeholder, but every
+    /// drawing renders to the same target, so the per-image key it asked for never existed and
+    /// every image was reported as page 1 (xberg-io/xberg#1546). Walking the elements is also
+    /// independent of whether placeholders were rendered at all.
+    /// </remarks>
+    private static uint[] DrawingPageNumbers(DocxDocument doc)
+    {
+        var pages = new uint[doc.Drawings.Count];
+        Array.Fill(pages, 1u);
+        uint currentPage = 1;
+        int drawingIndex = 0;
+        foreach (var el in doc.Elements)
+        {
+            switch (el.Kind)
+            {
+                case DocElementKind.PageBreak:
+                    currentPage++;
+                    break;
+                case DocElementKind.Drawing:
+                    if (drawingIndex < pages.Length) pages[drawingIndex] = currentPage;
+                    drawingIndex++;
+                    break;
+            }
+        }
+        return pages;
     }
 
     // ── page structure (metadata.pages) via to_plain_text form-feed boundaries ──
