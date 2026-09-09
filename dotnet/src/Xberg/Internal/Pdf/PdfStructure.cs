@@ -220,6 +220,11 @@ public static class PdfStructure
             catch { }
         }
 
+        // Text-repair evidence is document-scoped and must be gathered before any page's
+        // segments are consumed: a witness on one page can be the sole evidence for a repair
+        // decision on another.
+        var witnesses = PdfTextRepairWitnesses.Collect(allPageSegments);
+
         var headingMap = BuildHeadingMap(allPageSegments, kClusters);
         float? docBodyFontSize = null;
         foreach (var (fs, lvl) in headingMap) { if (lvl is null) { docBodyFontSize = fs; break; } }
@@ -276,8 +281,8 @@ public static class PdfStructure
             // continuation and dehyphenation rules read the last and first characters of
             // neighbouring segments — a trailing soft hyphen or control character left in place
             // would be read as ordinary text and change the decision.
-            ApplyToAllSegments(paras, PdfTextRepair.RepairSegment);
-            DehyphenateParagraphs(paras);
+            ApplyToAllSegments(paras, text => PdfTextRepair.RepairSegment(text, witnesses));
+            DehyphenateParagraphs(paras, witnesses);
             SplitEmbeddedListItems(paras);
             SynchronizeParagraphTextMetadata(paras);
             MergeContinuationParagraphs(paras);
@@ -1250,7 +1255,8 @@ public static class PdfStructure
         ("user", "defined"), ("well", "known"),
     };
 
-    private static bool ShouldPreserveLexicalHyphen(string trailingWord, string leadingWord)
+    private static bool ShouldPreserveLexicalHyphen(
+        string trailingWord, string leadingWord, PdfTextRepairWitnesses witnesses)
     {
         static string Trim(string s)
         {
@@ -1264,7 +1270,10 @@ public static class PdfStructure
             if (string.Equals(left, expectedLeft, StringComparison.OrdinalIgnoreCase)
                 && string.Equals(right, expectedRight, StringComparison.OrdinalIgnoreCase))
                 return true;
-        return false;
+        // The static list covers common English compounds; a hyphen the document itself writes
+        // mid-run elsewhere is the document's own evidence that this one is authored rather than
+        // a line-wrap artefact (xberg-io/xberg#1543).
+        return witnesses.Hyphens.Contains((left.ToLowerInvariant(), right.ToLowerInvariant()));
     }
 
     /// <summary>
@@ -1278,16 +1287,16 @@ public static class PdfStructure
     /// word onto the first. Here the halves are actually spliced: the trailing segment absorbs
     /// the leading word and the following segment gives it up.
     /// </remarks>
-    private static void DehyphenateParagraphs(List<PdfParagraph> paragraphs)
+    private static void DehyphenateParagraphs(List<PdfParagraph> paragraphs, PdfTextRepairWitnesses witnesses)
     {
         foreach (var para in paragraphs)
         {
             if (para.IsCodeBlock || para.Lines.Count < 2) continue;
-            DehyphenateParagraphLines(para);
+            DehyphenateParagraphLines(para, witnesses);
         }
     }
 
-    private static void DehyphenateParagraphLines(PdfParagraph para)
+    private static void DehyphenateParagraphLines(PdfParagraph para, PdfTextRepairWitnesses witnesses)
     {
         float maxRightEdge = 0f;
         foreach (var line in para.Lines)
@@ -1317,7 +1326,7 @@ public static class PdfStructure
             string trailingWord = LastWhitespaceSeparatedWord(trailingText.TrimEnd('-'));
             if (trailingWord.Length > 0 && IsCjkChar(trailingWord[^1])) continue;
 
-            string preservedHyphen = ShouldPreserveLexicalHyphen(trailingWord, leadingWord) ? "-" : "";
+            string preservedHyphen = ShouldPreserveLexicalHyphen(trailingWord, leadingWord, witnesses) ? "-" : "";
             string joinedWord = trailingWord + preservedHyphen + leadingWord;
 
             // The characters dropped off the trailing segment are counted in UTF-8 bytes, as
