@@ -78,10 +78,66 @@ internal static partial class PdfTableReconstruct
     /// <summary>Port of `segments_to_words`.</summary>
     public static List<HocrWord> SegmentsToWords(List<SegmentData> segments, float pageHeight)
     {
-        var words = new List<HocrWord>();
+        var perSegment = new List<List<HocrWord>>(segments.Count);
         foreach (var seg in segments)
+        {
+            var words = new List<HocrWord>();
             SplitSegmentToWords(seg, pageHeight, words);
-        return words;
+            perSegment.Add(words);
+        }
+        return MergeTouchingSegmentBoundaries(segments, perSegment);
+    }
+
+    /// <summary>
+    /// Rejoin a word split across two adjacent segments before cells are assigned, so the
+    /// cell-text join never re-inserts a space the word split dropped by construction.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="HocrWord"/> is integer-rounded and carries neither font size nor baseline, so a
+    /// sub-point gap like the reported 0.069 pt is not representable once words exist: the test
+    /// has to run here, on the segments, one boundary at a time. Only the last word of one
+    /// segment's group and the first of the next can be a split-word boundary, since a segment's
+    /// own words came from whitespace-splitting its own text (xberg-io/xberg#1566).
+    /// </remarks>
+    private static List<HocrWord> MergeTouchingSegmentBoundaries(
+        List<SegmentData> segments, List<List<HocrWord>> perSegment)
+    {
+        for (int boundary = 0; boundary + 1 < perSegment.Count; boundary++)
+        {
+            var left = perSegment[boundary];
+            var right = perSegment[boundary + 1];
+            if (left.Count == 0 || right.Count == 0) continue;
+            if (!PdfStructure.SegmentsAreTouching(
+                    segments[boundary], left[^1].Text, segments[boundary + 1], right[0].Text))
+                continue;
+
+            var prevWord = left[^1];
+            left.RemoveAt(left.Count - 1);
+            right[0] = MergeHocrWords(prevWord, right[0]);
+        }
+
+        var merged = new List<HocrWord>();
+        foreach (var group in perSegment) merged.AddRange(group);
+        return merged;
+    }
+
+    /// <summary>Combine two words that are one split word: text concatenated with no separator,
+    /// bounding box the union of both, confidence the lower of the two.</summary>
+    private static HocrWord MergeHocrWords(HocrWord prev, HocrWord next)
+    {
+        uint left = Math.Min(prev.Left, next.Left);
+        uint top = Math.Min(prev.Top, next.Top);
+        uint right = Math.Max(prev.Right, next.Right);
+        uint bottom = Math.Max(prev.Bottom, next.Bottom);
+        return new HocrWord
+        {
+            Text = prev.Text + next.Text,
+            Left = left,
+            Top = top,
+            Width = right - left,
+            Height = bottom - top,
+            Confidence = Math.Min(prev.Confidence, next.Confidence),
+        };
     }
 
     private static void SplitSegmentToWords(SegmentData seg, float pageHeight, List<HocrWord> outWords)

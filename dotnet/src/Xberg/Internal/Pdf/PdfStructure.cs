@@ -3098,9 +3098,75 @@ public static class PdfStructure
     /// lines, in different styles, or with an explicit space at the boundary always take one.
     /// Ports Rust <c>segments_need_space</c>.
     /// </remarks>
+    /// <summary>
+    /// Maximum horizontal gap between two same-line, same-font-size segments, as a fraction of
+    /// the larger font size, that identifies them as one word split across a font-resource
+    /// change rather than a genuine inter-word space.
+    /// </summary>
+    /// <remarks>
+    /// Chosen for headroom on both sides rather than to sit at either bound: the reported defect
+    /// measures 0.008 em, and a gap the rest of the pipeline treats as a real word boundary sits
+    /// at 0.05 em. At 0.05 the outcome would be decided by how <c>fontSize * ratio</c> rounds,
+    /// which flips with the font size — and a threshold that flips on font size is not a
+    /// threshold. 0.025 em sits about 3x above the defect and 2x below the word-boundary bound
+    /// at every font size (xberg-io/xberg#1566).
+    /// </remarks>
+    private const float TOUCHING_SPAN_GAP_EM_RATIO = 0.025f;
+
+    /// <summary>Maximum baseline difference, in points, for two spans to count as touching.
+    /// Tighter than the same-line test, which must tolerate wrapped-line reflow noise.</summary>
+    private const float TOUCHING_SPAN_BASELINE_TOLERANCE = 0.05f;
+
+    /// <summary>Maximum font-size difference for two spans to count as touching, as a fraction
+    /// of the larger of the two.</summary>
+    private const float TOUCHING_SPAN_FONT_SIZE_TOLERANCE_RATIO = 0.01f;
+
+    /// <summary>
+    /// Whether two segments are the two halves of one word split across a mid-word font-resource
+    /// change: same rotation frame, same baseline, same font size, a gap far below a genuine word
+    /// space, and a word character immediately on each side of the boundary.
+    /// </summary>
+    /// <remarks>
+    /// A word drawn as two spans 0.069 pt apart — 0.008 em at 9 pt, against a 2.5 pt space glyph
+    /// — came back as "pri js" instead of "prijs". No gap threshold could produce that space,
+    /// because the style comparison returns first: a mid-word switch between two embedded subset
+    /// fonts whose descriptors disagree reads as a style change with no geometric signal. So this
+    /// is checked <em>before</em> any bold/italic/monospace comparison. It can only ever join two
+    /// spans, never split them, so it cannot regress a document that already reads correctly
+    /// (xberg-io/xberg#1566).
+    /// </remarks>
+    internal static bool SegmentsAreTouching(
+        SegmentData prevSeg, string prevWord, SegmentData nextSeg, string nextWord)
+    {
+        if (prevWord.Length == 0 || nextWord.Length == 0) return false;
+        if (!char.IsLetterOrDigit(prevWord[^1]) || !char.IsLetterOrDigit(nextWord[0])) return false;
+
+        // An explicitly drawn space at the boundary outranks any geometry: the producer emitted a
+        // space glyph, and its advance is already inside the previous segment's extent, so the
+        // measured gap collapses to ~0 and reads as "touching" — exactly the shape this fires on.
+        // Words are whitespace-split, so neither word can reveal it; only the segment text can.
+        if ((prevSeg.Text.Length > 0 && char.IsWhiteSpace(prevSeg.Text[^1]))
+            || (nextSeg.Text.Length > 0 && char.IsWhiteSpace(nextSeg.Text[0])))
+            return false;
+
+        if (!prevSeg.HasSameRotation(nextSeg)) return false;
+
+        if (Math.Abs(prevSeg.UprightBaseline() - nextSeg.UprightBaseline()) > TOUCHING_SPAN_BASELINE_TOLERANCE)
+            return false;
+
+        float maxFontSize = Math.Max(Math.Max(prevSeg.FontSize, nextSeg.FontSize), 1.0f);
+        if (Math.Abs(prevSeg.FontSize - nextSeg.FontSize) > maxFontSize * TOUCHING_SPAN_FONT_SIZE_TOLERANCE_RATIO)
+            return false;
+
+        float gap = nextSeg.UprightAdvanceExtent().Start - prevSeg.UprightAdvanceExtent().End;
+        return Math.Abs(gap) < maxFontSize * TOUCHING_SPAN_GAP_EM_RATIO;
+    }
+
     private static bool SegmentsNeedSpace(SegmentData prevSeg, string prevWord, SegmentData nextSeg, string nextWord)
     {
         if (!NeedsSpaceBetween(prevWord, nextWord)) return false;
+
+        if (SegmentsAreTouching(prevSeg, prevWord, nextSeg, nextWord)) return false;
 
         bool explicitBoundarySpace =
             (prevSeg.Text.Length > 0 && char.IsWhiteSpace(prevSeg.Text[^1]))
