@@ -114,6 +114,21 @@ Rust: `.reference/crates/xberg/src/rendering/`. One function per output format, 
 | Djot | `djot.rs` | Djot markup. |
 | JSON tree | `json.rs` | Heading-driven section tree (`JsonDocument`/`JsonNode`). Port verbatim — it is simple and self-contained. |
 
+#### Rendering a page on its own
+
+A `PageContent.Content` is the concatenation of that page's element texts, which is what upstream
+produces and what the goldens pin — and it is *not* the document's markup: a heading loses its
+hashes, and a table, whose element carries no text at all, disappears entirely. So a caller who
+wanted the document as markdown **and** wanted to know which page each part came from could have
+one or the other, and the only way to have both was to re-extract a page at a time.
+
+`ExtractionConfig.RenderPagesInOutputFormat` fills `PageContent.FormattedContent` with the page
+rendered by the same renderer the document used, from a slice carrying only that page's elements
+(and the whole document's tables and images, because an element addresses those by index). It is
+opt-in and `[JsonIgnore]`, like `ExtractedDocument.FormattedContent`, so nothing about the wire
+format or the goldens changes. A page whose elements are not marked with its number — a workbook,
+whose extractor supplies `PrebuiltPages` already rendered — keeps the content it came with.
+
 `common.rs` holds shared walking state (container nesting, `is_body_element`,
 `is_container_end`, `get_language`, `handle_container_end`) — port it first; all
 renderers depend on it.
