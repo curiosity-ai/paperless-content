@@ -5464,10 +5464,10 @@ output_pattern = "packages/{language}/README.md"
 discord_url = "https://discord.gg/xt9WY3GnKR"
 banner_url = "https://github.com/user-attachments/assets/419fc06c-8313-4324-b159-4b4d3cfce5c0"
 
-[crates.readme.targets.root]
-template = "root.md"
-name = "Xberg"
-output_path = "README.md"
+# No `targets.root` here on purpose: the root README is hand-maintained and documents
+# X-Ray.Content, this repository's own project, rather than the upstream polyglot Xberg tree
+# that `templates/readme/root.md` renders. Re-adding the target would regenerate README.md and
+# discard it. The template itself is left in place, unrendered, so upstream merges stay clean.
 
 [crates.readme.targets.cli]
 template = "cli.md"
