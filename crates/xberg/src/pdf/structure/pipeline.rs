@@ -1,5 +1,10 @@
 //! Main PDF-to-Markdown pipeline orchestrator (native backend).
 
+// TODO(xberg-io/xberg#1567): 4 cyclomatic-complexity and 25 size/complexity findings
+// in this file, currently excluded via the quality-debt baseline in alef.toml. Splitting
+// these needs compiler-in-the-loop verification, not a mechanical pass. Delete this
+// note and the file's baseline entry together once it goes green. Help wanted.
+
 use std::borrow::Cow;
 
 use crate::pdf::bookmarks::PdfOutlineEntry;
@@ -11,20 +16,26 @@ use rayon::prelude::*;
 use super::assembly::assemble_internal_document;
 use super::classify::{
     classify_paragraphs, demote_heading_runs, demote_structure_annotation_headings, demote_unnumbered_subsections,
-    mark_arxiv_noise, mark_cross_page_repeating_short_text, mark_cross_page_repeating_text, refine_heading_hierarchy,
+    is_body_size_bold_heading_candidate, is_body_size_bold_signal, is_numbered_section_heading, mark_arxiv_noise,
+    mark_cross_page_repeating_short_text, mark_cross_page_repeating_text, refine_heading_hierarchy,
 };
 use super::constants::{FULL_LINE_FRACTION, MIN_BLOCKS_FOR_FONT_HEADING, MIN_HEADING_FONT_GAP, MIN_HEADING_FONT_RATIO};
 use super::lines::{is_cjk_char, segments_need_space};
 use super::paragraphs::{merge_continuation_paragraphs, split_embedded_list_items};
 use super::text_repair::{
-    apply_to_all_segments, clean_duplicate_punctuation, collapse_spaced_hyphens,
-    expand_ligatures_with_space_absorption, normalize_text_encoding, normalize_unicode_text,
+    MIN_LIGATURE_WITNESS_WORD_LEN, WordWitnesses, apply_to_all_segments, clean_duplicate_punctuation,
+    collapse_spaced_hyphens, expand_ligatures_with_space_absorption, normalize_text_encoding, normalize_unicode_text,
     repair_contextual_ligatures, repair_ligature_spaces,
 };
 use super::types::{LayoutHint, PdfParagraph};
 
 const SPARSE_REPEATED_TIER_MIN_PAGES: usize = 2;
 const SPARSE_FONT_TIER_CLUSTER_COUNT: usize = 2;
+const MIN_BODY_SIZE_BOLD_SIGNALS: usize = 3;
+const MAX_OTHER_HEADING_RATIO: usize = 2;
+const BODY_SIZE_BOLD_ALIGNMENT_TOLERANCE_EM: f32 = 1.5;
+const MIN_OPENED_BODY_WORDS: usize = 4;
+const SAME_ROW_MIN_VERTICAL_OVERLAP_RATIO: f32 = 0.5;
 /// Font-size "same tier" tolerance (absolute, in the unit `font_size` happens to carry —
 /// points for native PDFs, a render-DPI-dependent pixel measurement for OCR segments).
 ///
@@ -48,6 +59,20 @@ const SPARSE_FONT_TIER_TOLERANCE: f32 = 0.5;
 const SPARSE_REPEATED_TIER_HEADING_LEVEL: u8 = 2;
 
 type HeadingMap = Vec<(f32, Option<u8>)>;
+
+/// Lowercased `(left, right)` word pairs the document itself writes as a single
+/// hyphenated token elsewhere in the text, gathered once per document (#1543).
+/// Threaded alongside [`HeadingMap`] as a document-scoped shared reference. ~keep
+type HyphenWitnesses = ahash::AHashSet<(String, String)>;
+
+/// Document-scoped text-repair evidence, collected once per document by
+/// [`collect_hyphen_witnesses`] and [`collect_word_witnesses`] and threaded through
+/// paragraph assembly as a single shared reference, alongside [`HeadingMap`]. ~keep
+#[derive(Default)]
+struct TextRepairWitnesses {
+    hyphens: HyphenWitnesses,
+    words: WordWitnesses,
+}
 
 fn sparse_multi_page_heading_map(
     all_page_segments: &[Vec<SegmentData>],
@@ -128,7 +153,10 @@ fn build_heading_map(
         .filter_map(|(i, result)| {
             result.as_ref().and_then(|paragraphs| {
                 let has_headings = paragraphs.iter().any(|p| p.heading_level.is_some());
-                if !has_headings && has_font_size_variation(paragraphs) {
+                let has_untagged_bold = paragraphs
+                    .iter()
+                    .any(|p| p.heading_level.is_none() && p.is_bold && !p.is_list_item);
+                if (!has_headings && has_font_size_variation(paragraphs)) || has_untagged_bold {
                     Some(i)
                 } else {
                     None
@@ -249,6 +277,160 @@ fn build_heading_map(
     };
 
     Ok((heading_map, struct_tree_needs_classify))
+}
+
+fn bbox_coordinates_are_finite(bbox: (f32, f32, f32, f32)) -> bool {
+    let (left, bottom, right, top) = bbox;
+    left.is_finite() && bottom.is_finite() && right.is_finite() && top.is_finite()
+}
+
+fn shares_same_text_row(candidate: &PdfParagraph, following: &PdfParagraph, is_same_page: bool) -> bool {
+    if !is_same_page {
+        return false;
+    }
+    let (Some(candidate_bbox), Some(following_bbox)) = (candidate.block_bbox, following.block_bbox) else {
+        return false;
+    };
+    if !bbox_coordinates_are_finite(candidate_bbox) || !bbox_coordinates_are_finite(following_bbox) {
+        return false;
+    }
+
+    let candidate_bottom = candidate_bbox.1.min(candidate_bbox.3);
+    let candidate_top = candidate_bbox.1.max(candidate_bbox.3);
+    let following_bottom = following_bbox.1.min(following_bbox.3);
+    let following_top = following_bbox.1.max(following_bbox.3);
+    let minimum_height = (candidate_top - candidate_bottom).min(following_top - following_bottom);
+    let overlap = candidate_top.min(following_top) - candidate_bottom.max(following_bottom);
+    minimum_height > 0.0 && overlap.max(0.0) / minimum_height >= SAME_ROW_MIN_VERTICAL_OVERLAP_RATIO
+}
+
+fn opens_aligned_body_block(
+    candidate: &PdfParagraph,
+    following: &PdfParagraph,
+    body_font_size: f32,
+    is_same_page: bool,
+) -> bool {
+    if following.word_count < MIN_OPENED_BODY_WORDS
+        || following.heading_level.is_some()
+        || is_body_size_bold_signal(following, body_font_size)
+    {
+        return false;
+    }
+
+    if candidate
+        .block_bbox
+        .is_some_and(|bbox| !bbox_coordinates_are_finite(bbox))
+        || following
+            .block_bbox
+            .is_some_and(|bbox| !bbox_coordinates_are_finite(bbox))
+    {
+        return false;
+    }
+    let (Some(candidate_bbox), Some(following_bbox)) = (candidate.block_bbox, following.block_bbox) else {
+        return true;
+    };
+
+    if shares_same_text_row(candidate, following, is_same_page) {
+        return false;
+    }
+
+    let candidate_left = candidate_bbox.0.min(candidate_bbox.2);
+    let following_left = following_bbox.0.min(following_bbox.2);
+    candidate_left <= following_left + body_font_size * BODY_SIZE_BOLD_ALIGNMENT_TOLERANCE_EM
+}
+
+fn is_explicit_numbered_body_size_section(text: &str) -> bool {
+    let trimmed = text.trim();
+    if !is_numbered_section_heading(trimmed) {
+        return false;
+    }
+
+    let bytes = trimmed.as_bytes();
+    let roman_prefix_length = bytes
+        .iter()
+        .position(|byte| !b"IVXLCDM".contains(byte))
+        .unwrap_or(bytes.len());
+    if roman_prefix_length == 0 || bytes.get(roman_prefix_length) != Some(&b' ') {
+        return true;
+    }
+
+    let remainder = trimmed[roman_prefix_length..].trim_start();
+    remainder.chars().any(char::is_alphabetic)
+        && remainder
+            .chars()
+            .filter(|character| character.is_alphabetic())
+            .all(char::is_uppercase)
+}
+
+fn body_size_heading_eligibility(all_pages: &[Vec<PdfParagraph>], body_font_size: f32) -> Vec<Vec<bool>> {
+    let mut next_content: Option<(usize, &PdfParagraph)> = None;
+    let mut eligibility = Vec::with_capacity(all_pages.len());
+    for (page_index, page) in all_pages.iter().enumerate().rev() {
+        let mut page_eligibility = Vec::with_capacity(page.len());
+        for paragraph in page.iter().rev() {
+            let is_candidate = is_body_size_bold_heading_candidate(paragraph, body_font_size);
+            let is_explicit_section = is_explicit_numbered_body_size_section(paragraph_text_raw(paragraph).trim());
+            let has_non_finite_geometry = paragraph
+                .block_bbox
+                .is_some_and(|bbox| !bbox_coordinates_are_finite(bbox))
+                || next_content.is_some_and(|(_, following)| {
+                    following
+                        .block_bbox
+                        .is_some_and(|bbox| !bbox_coordinates_are_finite(bbox))
+                });
+            page_eligibility.push(
+                is_candidate
+                    && !has_non_finite_geometry
+                    && if is_explicit_section {
+                        !next_content.is_some_and(|(following_page_index, following)| {
+                            shares_same_text_row(paragraph, following, page_index == following_page_index)
+                        })
+                    } else {
+                        next_content.is_some_and(|(following_page_index, following)| {
+                            opens_aligned_body_block(
+                                paragraph,
+                                following,
+                                body_font_size,
+                                page_index == following_page_index,
+                            )
+                        })
+                    },
+            );
+            if paragraph.word_count > 0 && !paragraph.is_page_furniture {
+                next_content = Some((page_index, paragraph));
+            }
+        }
+        page_eligibility.reverse();
+        eligibility.push(page_eligibility);
+    }
+    eligibility.reverse();
+    eligibility
+}
+
+fn promote_repeated_body_size_bold_headings(all_pages: &mut [Vec<PdfParagraph>], body_font_size: Option<f32>) {
+    let Some(body_font_size) = body_font_size else {
+        return;
+    };
+    let eligible = body_size_heading_eligibility(all_pages, body_font_size);
+    let signal_count = eligible.iter().flatten().filter(|&&is_eligible| is_eligible).count();
+    let other_heading_count = all_pages
+        .iter()
+        .flatten()
+        .filter(|paragraph| paragraph.heading_level.is_some())
+        .count();
+    if signal_count < MIN_BODY_SIZE_BOLD_SIGNALS
+        || signal_count <= other_heading_count.saturating_mul(MAX_OTHER_HEADING_RATIO)
+    {
+        return;
+    }
+
+    for (page, page_eligibility) in all_pages.iter_mut().zip(eligible) {
+        for (paragraph, is_eligible) in page.iter_mut().zip(page_eligibility) {
+            if is_eligible {
+                paragraph.heading_level = Some(3);
+            }
+        }
+    }
 }
 
 /// Build a heading map from structure-tree-assigned roles on segments.
@@ -531,6 +713,7 @@ fn process_single_page(
     input: PageInput,
     heading_map: &[(f32, Option<u8>)],
     doc_body_font_size: Option<f32>,
+    witnesses: &TextRepairWitnesses,
 ) -> Vec<PdfParagraph> {
     let PageInput {
         page_index: i,
@@ -555,7 +738,7 @@ fn process_single_page(
     #[cfg(not(feature = "layout-detection"))]
     let _ = use_layout_reading_order;
     if let Some(mut paragraphs) = struct_paragraphs {
-        apply_text_repair_to_structure_tree_paragraphs(&mut paragraphs, true);
+        apply_text_repair_to_structure_tree_paragraphs(&mut paragraphs, true, witnesses);
         if needs_classify {
             tracing::debug!(
                 page = i,
@@ -615,19 +798,20 @@ fn process_single_page(
                         include_footnotes,
                         page_width_pts,
                         apply_layout_overrides: !preserve_native_semantics,
+                        witnesses,
                     },
                 )
             } else {
-                let mut paragraphs = segments_to_paragraphs(page_segments, heading_map, &paragraph_gap_ys);
+                let mut paragraphs = segments_to_paragraphs(page_segments, heading_map, &paragraph_gap_ys, witnesses);
                 let classification_hints = regular_layout_hints(hints);
                 super::layout_classify::annotate_layout_classes(&mut paragraphs, &classification_hints, 0.5, 0.2);
                 paragraphs
             }
         } else {
-            segments_to_paragraphs(page_segments, heading_map, &paragraph_gap_ys)
+            segments_to_paragraphs(page_segments, heading_map, &paragraph_gap_ys, witnesses)
         };
         #[cfg(not(feature = "layout-detection"))]
-        let mut paragraphs = segments_to_paragraphs(page_segments, heading_map, &paragraph_gap_ys);
+        let mut paragraphs = segments_to_paragraphs(page_segments, heading_map, &paragraph_gap_ys, witnesses);
         tracing::debug!(
             page = i,
             paragraphs = paragraphs.len(),
@@ -825,10 +1009,11 @@ fn segments_to_paragraphs(
     segments: Vec<SegmentData>,
     heading_map: &[(f32, Option<u8>)],
     paragraph_gap_ys: &[f32],
+    witnesses: &TextRepairWitnesses,
 ) -> Vec<PdfParagraph> {
     let segments = order_segments_in_reading_frames(segments);
     let mut paragraphs = blocks_to_paragraphs(segments, heading_map, paragraph_gap_ys);
-    apply_text_repair_to_structure_tree_paragraphs(&mut paragraphs, true);
+    apply_text_repair_to_structure_tree_paragraphs(&mut paragraphs, true, witnesses);
     reattach_detached_list_markers(&mut paragraphs, DetachedMarkerFrame::Native);
     merge_continuation_paragraphs(&mut paragraphs);
     synchronize_paragraph_text_metadata(&mut paragraphs);
@@ -1315,6 +1500,7 @@ struct LayoutParagraphContext<'a> {
     include_footnotes: bool,
     page_width_pts: Option<f32>,
     apply_layout_overrides: bool,
+    witnesses: &'a TextRepairWitnesses,
 }
 
 #[cfg(feature = "layout-detection")]
@@ -1340,11 +1526,21 @@ fn process_layout_segment_groups(
         context.page_width_pts,
     );
     if matches!(groups.as_slice(), [group] if group.hint_indices.is_empty() && group.region_path.is_none()) {
-        return segments_to_paragraphs(segments, context.heading_map, context.paragraph_gap_ys);
+        return segments_to_paragraphs(
+            segments,
+            context.heading_map,
+            context.paragraph_gap_ys,
+            context.witnesses,
+        );
     }
     if !context.apply_layout_overrides {
         let group_bounds = layout_group_bounds(&groups, &segments);
-        let mut paragraphs = segments_to_paragraphs(segments, context.heading_map, context.paragraph_gap_ys);
+        let mut paragraphs = segments_to_paragraphs(
+            segments,
+            context.heading_map,
+            context.paragraph_gap_ys,
+            context.witnesses,
+        );
         assign_native_paragraph_layout(&mut paragraphs, &groups, &group_bounds);
         let classification_hints = regular_layout_hints(hints);
         super::layout_classify::annotate_layout_classes(&mut paragraphs, &classification_hints, 0.5, 0.2);
@@ -1364,7 +1560,8 @@ fn process_layout_segment_groups(
             continue;
         }
         let gap_ys = compute_paragraph_gap_ys(&group_segments);
-        let mut group_paragraphs = segments_to_paragraphs(group_segments, context.heading_map, &gap_ys);
+        let mut group_paragraphs =
+            segments_to_paragraphs(group_segments, context.heading_map, &gap_ys, context.witnesses);
         let group_hints = group
             .hint_indices
             .into_iter()
@@ -1400,7 +1597,12 @@ fn process_layout_segment_groups(
             "layout region plan omitted segments; appending an unsorted fallback group"
         );
         let gap_ys = compute_paragraph_gap_ys(&leftovers);
-        paragraphs.extend(segments_to_paragraphs(leftovers, context.heading_map, &gap_ys));
+        paragraphs.extend(segments_to_paragraphs(
+            leftovers,
+            context.heading_map,
+            &gap_ys,
+            context.witnesses,
+        ));
     }
     paragraphs
 }
@@ -1905,6 +2107,38 @@ pub(super) fn heading_wraps_onto(prev: &SegmentData, line: &SegmentData) -> bool
 /// at the segment level so that the assembly layer can emit properly annotated markdown
 /// with bold/italic emphasis.
 fn reconstruct_pdf_lines(segments: &[&SegmentData]) -> Vec<super::types::PdfLine> {
+    const MAX_LINE_TOLERANCE_PT: f32 = 3.0;
+    const LINE_TOLERANCE_SCALE_FACTOR: f32 = 0.25;
+
+    fn finish_line(mut segments: Vec<SegmentData>, baseline_y: f32) -> super::types::PdfLine {
+        let contains_rtl = segments.iter().any(|segment| {
+            segment
+                .text
+                .chars()
+                .any(|character| xberg_native_pdf::text::is_rtl_text(character as u32))
+        });
+        if !contains_rtl {
+            segments.sort_by(|a, b| a.upright_advance_extent().0.total_cmp(&b.upright_advance_extent().0));
+        }
+
+        let dominant_font_size = segments.iter().map(|s| s.font_size).fold(0.0, |a, b| {
+            if a > 0.0 && b > a / 2.0 && b < a * 2.0 {
+                (a + b) / 2.0
+            } else {
+                a.max(b)
+            }
+        });
+        let is_bold = segments.iter().filter(|s| s.is_bold).count() > segments.len() / 2;
+        let is_monospace = segments.iter().all(|s| s.is_monospace);
+        super::types::PdfLine {
+            segments,
+            baseline_y,
+            dominant_font_size,
+            is_bold,
+            is_monospace,
+        }
+    }
+
     if segments.is_empty() {
         return Vec::new();
     }
@@ -1912,54 +2146,30 @@ fn reconstruct_pdf_lines(segments: &[&SegmentData]) -> Vec<super::types::PdfLine
     let mut lines: Vec<super::types::PdfLine> = Vec::new();
     let mut current_baseline = segments[0].upright_baseline();
     let mut current_rotation = segments[0].rotation_degrees;
+    let mut current_scale = segments[0].font_size.max(segments[0].height).abs();
     let mut current_segments: Vec<SegmentData> = Vec::new();
 
     for seg in segments {
         let same_rotation = (seg.rotation_degrees - current_rotation).abs() <= f32::EPSILON;
         let segment_baseline = seg.upright_baseline();
-        if !same_rotation || (segment_baseline - current_baseline).abs() > 0.5 {
+        let segment_scale = seg.font_size.max(seg.height).abs();
+        let baseline_tolerance =
+            (current_scale.max(segment_scale) * LINE_TOLERANCE_SCALE_FACTOR).min(MAX_LINE_TOLERANCE_PT);
+        if !same_rotation || (segment_baseline - current_baseline).abs() > baseline_tolerance {
             if !current_segments.is_empty() {
-                let dominant_font_size = current_segments.iter().map(|s| s.font_size).fold(0.0, |a, b| {
-                    if a > 0.0 && b > a / 2.0 && b < a * 2.0 {
-                        (a + b) / 2.0
-                    } else {
-                        a.max(b)
-                    }
-                });
-                let is_bold = current_segments.iter().filter(|s| s.is_bold).count() > current_segments.len() / 2;
-                let is_monospace = current_segments.iter().all(|s| s.is_monospace);
-                lines.push(super::types::PdfLine {
-                    segments: current_segments.clone(),
-                    baseline_y: current_baseline,
-                    dominant_font_size,
-                    is_bold,
-                    is_monospace,
-                });
+                lines.push(finish_line(std::mem::take(&mut current_segments), current_baseline));
             }
             current_baseline = segment_baseline;
             current_rotation = seg.rotation_degrees;
-            current_segments.clear();
+            current_scale = segment_scale;
+        } else {
+            current_scale = current_scale.max(segment_scale);
         }
         current_segments.push((*seg).clone());
     }
 
     if !current_segments.is_empty() {
-        let dominant_font_size = current_segments.iter().map(|s| s.font_size).fold(0.0, |a, b| {
-            if a > 0.0 && b > a / 2.0 && b < a * 2.0 {
-                (a + b) / 2.0
-            } else {
-                a.max(b)
-            }
-        });
-        let is_bold = current_segments.iter().filter(|s| s.is_bold).count() > current_segments.len() / 2;
-        let is_monospace = current_segments.iter().all(|s| s.is_monospace);
-        lines.push(super::types::PdfLine {
-            segments: current_segments,
-            baseline_y: current_baseline,
-            dominant_font_size,
-            is_bold,
-            is_monospace,
-        });
+        lines.push(finish_line(current_segments, current_baseline));
     }
 
     lines
@@ -2932,6 +3142,10 @@ pub(crate) fn extract_document_structure_from_segments(
             })
         })
         .collect();
+    let witnesses = TextRepairWitnesses {
+        hyphens: collect_hyphen_witnesses(&all_page_segments),
+        words: collect_word_witnesses(&all_page_segments),
+    };
     let page_inputs: Vec<PageInput> = (0..page_count)
         .map(|i| {
             let heuristic_segments = std::mem::take(&mut all_page_segments[i]);
@@ -2970,12 +3184,12 @@ pub(crate) fn extract_document_structure_from_segments(
     #[cfg(not(target_arch = "wasm32"))]
     let mut all_page_paragraphs: Vec<Vec<PdfParagraph>> = page_inputs
         .into_par_iter()
-        .map(|input| process_single_page(input, &heading_map, doc_body_font_size))
+        .map(|input| process_single_page(input, &heading_map, doc_body_font_size, &witnesses))
         .collect();
     #[cfg(target_arch = "wasm32")]
     let mut all_page_paragraphs: Vec<Vec<PdfParagraph>> = page_inputs
         .into_iter()
-        .map(|input| process_single_page(input, &heading_map, doc_body_font_size))
+        .map(|input| process_single_page(input, &heading_map, doc_body_font_size, &witnesses))
         .collect();
 
     refine_heading_hierarchy(&mut all_page_paragraphs);
@@ -3002,6 +3216,7 @@ pub(crate) fn extract_document_structure_from_segments(
         deduplicate_paragraphs(&mut all_page_paragraphs);
     }
     compact_final_heading_hierarchy(&mut all_page_paragraphs);
+    promote_repeated_body_size_bold_headings(&mut all_page_paragraphs, doc_body_font_size);
     #[cfg(feature = "layout-detection")]
     for (page, projection) in all_page_paragraphs.iter_mut().zip(native_layout_projections) {
         let Some(projection) = projection else {
@@ -3747,9 +3962,9 @@ fn filter_segments_by_table_bboxes(
 /// Apply all 5 text repair passes in a single traversal over a segment's text.
 ///
 /// Returns `Cow::Borrowed` if nothing changed, `Cow::Owned` otherwise.
-fn fused_text_repairs(text: &str) -> Cow<'_, str> {
+fn fused_text_repairs<'a>(text: &'a str, word_witnesses: &WordWitnesses) -> Cow<'a, str> {
     let t1 = normalize_text_encoding(text);
-    let t2 = repair_ligature_spaces(&t1);
+    let t2 = repair_ligature_spaces(&t1, word_witnesses);
     let t3 = expand_ligatures_with_space_absorption(&t2);
     let t3b = collapse_spaced_hyphens(&t3);
     let t4 = normalize_unicode_text(&t3b);
@@ -4752,15 +4967,15 @@ fn paragraph_alphanum_len(para: &PdfParagraph) -> usize {
 /// trailing hyphens and implicit breaks (no hyphen, full line) are handled.
 /// When false (structure tree path with x=0, width=0), only explicit trailing
 /// hyphens are rejoined to avoid false positives.
-fn dehyphenate_paragraphs(paragraphs: &mut [PdfParagraph], has_positions: bool) {
+fn dehyphenate_paragraphs(paragraphs: &mut [PdfParagraph], has_positions: bool, hyphen_witnesses: &HyphenWitnesses) {
     for para in paragraphs.iter_mut() {
         if para.is_code_block || para.lines.len() < 2 {
             continue;
         }
         if has_positions {
-            dehyphenate_paragraph_lines(para);
+            dehyphenate_paragraph_lines(para, hyphen_witnesses);
         } else {
-            dehyphenate_hyphen_only(para);
+            dehyphenate_hyphen_only(para, hyphen_witnesses);
         }
     }
 }
@@ -4784,16 +4999,130 @@ const PRESERVED_LEXICAL_COMPOUNDS: &[(&str, &str)] = &[
     ("well", "known"),
 ];
 
-fn should_preserve_lexical_hyphen(trailing_word: &str, leading_word: &str) -> bool {
+/// Minimum letters required on each side of a mid-run hyphen before
+/// [`collect_hyphen_witnesses`] records it, to avoid single-letter noise
+/// (initials, bullet dashes) minting spurious witness pairs.
+const MIN_HYPHEN_WITNESS_WORD_LEN: usize = 2;
+
+/// Collect `(left, right)` word pairs the document itself writes as a single
+/// hyphenated token, so a genuine authored hyphen at a line break can be told
+/// apart from a hyphen that merely happens to fall at a line-wrap boundary (#1543).
+///
+/// Only a hyphen that is NOT the last character of its segment's text can witness a
+/// real compound: a line-wrap hyphen is, by construction, the final character before
+/// the break, so restricting the scan to strictly mid-run hyphens avoids witnessing
+/// the very artifact this collector exists to judge. Must run before any page's
+/// segments are moved out of `all_page_segments` (see call site in
+/// `extract_document_structure_from_segments`), since a witness on one page can be
+/// the sole evidence for a break on another. ~keep
+fn collect_hyphen_witnesses(all_page_segments: &[Vec<SegmentData>]) -> HyphenWitnesses {
+    let mut witnesses = HyphenWitnesses::default();
+    for segment in all_page_segments.iter().flatten() {
+        let characters: Vec<char> = segment.text.chars().collect();
+        if characters.len() < 3 {
+            continue;
+        }
+        for position in 1..characters.len() - 1 {
+            if characters[position] != '-' {
+                continue;
+            }
+            let left: String = characters[..position]
+                .iter()
+                .rev()
+                .take_while(|character| character.is_alphabetic())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            let right: String = characters[position + 1..]
+                .iter()
+                .take_while(|character| character.is_alphabetic())
+                .collect();
+            let left_len = left.chars().count();
+            let right_len = right.chars().count();
+            if left_len < MIN_HYPHEN_WITNESS_WORD_LEN || right_len < MIN_HYPHEN_WITNESS_WORD_LEN {
+                continue;
+            }
+            witnesses.insert((left.to_ascii_lowercase(), right.to_ascii_lowercase()));
+        }
+    }
+    witnesses
+}
+
+/// Collect standalone alphabetic words the document itself writes elsewhere, so
+/// [`repair_ligature_spaces`] can tell a genuine word boundary apart from a
+/// decomposed-ligature gap that looks identical at the string layer (#1591).
+///
+/// A token that is itself one half of a ligature-space candidate pattern (ends in
+/// `f` right before whitespace, or starts with `i`/`l`/`f` right after it) is not
+/// independent evidence for that occurrence: the very space under judgment put it
+/// there, so counting it would make every candidate witness itself and disable the
+/// repair (see the `f irst` false-negative this guards against). The same word
+/// witnessed elsewhere in the document, in a position that is not itself a
+/// candidate, is unaffected and still counts. Must run before any page's segments
+/// are moved out of `all_page_segments` (see call site in
+/// `extract_document_structure_from_segments`), mirroring
+/// [`collect_hyphen_witnesses`]. ~keep
+fn collect_word_witnesses(all_page_segments: &[Vec<SegmentData>]) -> WordWitnesses {
+    let mut witnesses = WordWitnesses::default();
+    for segment in all_page_segments.iter().flatten() {
+        let cores: Vec<&str> = segment
+            .text
+            .split_whitespace()
+            .map(|token| token.trim_matches(|c: char| !c.is_alphabetic()))
+            .collect();
+        for index in 0..cores.len() {
+            let core = cores[index];
+            if core.chars().count() < MIN_LIGATURE_WITNESS_WORD_LEN {
+                continue;
+            }
+            let is_left_of_candidate = core.ends_with('f')
+                && cores
+                    .get(index + 1)
+                    .and_then(|next| next.chars().next())
+                    .is_some_and(|c| matches!(c, 'i' | 'l' | 'f'));
+            let is_right_of_candidate = index > 0
+                && cores[index - 1].ends_with('f')
+                && core.chars().next().is_some_and(|c| matches!(c, 'i' | 'l' | 'f'));
+            if is_left_of_candidate || is_right_of_candidate {
+                continue;
+            }
+            witnesses.insert(core.to_ascii_lowercase());
+        }
+    }
+    witnesses
+}
+
+fn should_preserve_lexical_hyphen(trailing_word: &str, leading_word: &str, hyphen_witnesses: &HyphenWitnesses) -> bool {
     let trim_non_lexical = |ch: char| !ch.is_alphanumeric() && ch != '-';
     let left = trailing_word.trim_matches(trim_non_lexical);
     let right = leading_word.trim_matches(trim_non_lexical);
 
-    PRESERVED_LEXICAL_COMPOUNDS
+    let matches_static_compound = PRESERVED_LEXICAL_COMPOUNDS
         .iter()
         .any(|&(expected_left, expected_right)| {
             left.eq_ignore_ascii_case(expected_left) && right.eq_ignore_ascii_case(expected_right)
-        })
+        });
+    matches_static_compound || hyphen_witnesses.contains(&(left.to_ascii_lowercase(), right.to_ascii_lowercase()))
+}
+
+/// Whether adjacent extraction runs actually cross a visual line boundary.
+///
+/// `PdfLine` boundaries can also be introduced by inline style/run splitting. A
+/// suspended hyphen such as `vracht- en` may therefore appear at the end of one
+/// logical line and the start of the next while both runs still share a baseline.
+/// Dehyphenation is only licensed when the runs use the same reading frame and
+/// their upright baselines differ by more than the inline-style tolerance.
+fn spans_visual_line_break(trailing: &SegmentData, leading: &SegmentData) -> bool {
+    if !trailing.has_same_rotation(leading) {
+        return false;
+    }
+
+    let trailing_baseline = trailing.upright_baseline();
+    let leading_baseline = leading.upright_baseline();
+    trailing_baseline.is_finite()
+        && leading_baseline.is_finite()
+        && (trailing_baseline - leading_baseline).abs() > INLINE_STYLE_BASELINE_TOLERANCE
 }
 
 /// Core dehyphenation with position-based full-line detection.
@@ -4801,7 +5130,7 @@ fn should_preserve_lexical_hyphen(trailing_word: &str, leading_word: &str) -> bo
 /// For each line boundary, checks whether the line extends close to the right
 /// margin. If so, attempts to rejoin the trailing word of one line with the
 /// leading word of the next.
-fn dehyphenate_paragraph_lines(para: &mut PdfParagraph) {
+fn dehyphenate_paragraph_lines(para: &mut PdfParagraph, hyphen_witnesses: &HyphenWitnesses) {
     let max_right_edge = para
         .lines
         .iter()
@@ -4810,7 +5139,7 @@ fn dehyphenate_paragraph_lines(para: &mut PdfParagraph) {
         .fold(0.0_f32, f32::max);
 
     if max_right_edge <= 0.0 {
-        dehyphenate_hyphen_only(para);
+        dehyphenate_hyphen_only(para, hyphen_witnesses);
         return;
     }
 
@@ -4820,6 +5149,14 @@ fn dehyphenate_paragraph_lines(para: &mut PdfParagraph) {
     for i in 0..(n - 1) {
         let trailing_right = para.lines[i].segments.last().map(|s| s.x + s.width).unwrap_or(0.0);
         if trailing_right < threshold {
+            continue;
+        }
+
+        let crosses_visual_line = match (para.lines[i].segments.last(), para.lines[i + 1].segments.first()) {
+            (Some(trailing), Some(leading)) => spans_visual_line_break(trailing, leading),
+            _ => false,
+        };
+        if !crosses_visual_line {
             continue;
         }
 
@@ -4851,7 +5188,7 @@ fn dehyphenate_paragraph_lines(para: &mut PdfParagraph) {
             continue;
         }
 
-        let preserved_hyphen = if should_preserve_lexical_hyphen(trailing_word, leading_word) {
+        let preserved_hyphen = if should_preserve_lexical_hyphen(trailing_word, leading_word, hyphen_witnesses) {
             "-"
         } else {
             ""
@@ -4882,9 +5219,17 @@ fn dehyphenate_paragraph_lines(para: &mut PdfParagraph) {
 ///
 /// Only joins lines when the trailing segment ends with an explicit hyphen.
 /// Used for structure tree pages where x/width may be zero.
-fn dehyphenate_hyphen_only(para: &mut PdfParagraph) {
+fn dehyphenate_hyphen_only(para: &mut PdfParagraph, hyphen_witnesses: &HyphenWitnesses) {
     let n = para.lines.len();
     for i in 0..(n - 1) {
+        let crosses_visual_line = match (para.lines[i].segments.last(), para.lines[i + 1].segments.first()) {
+            (Some(trailing), Some(leading)) => spans_visual_line_break(trailing, leading),
+            _ => false,
+        };
+        if !crosses_visual_line {
+            continue;
+        }
+
         let trailing_text = match para.lines[i].segments.last() {
             Some(s) if s.text.ends_with('-') => s.text.clone(),
             _ => continue,
@@ -4908,7 +5253,7 @@ fn dehyphenate_hyphen_only(para: &mut PdfParagraph) {
             continue;
         }
 
-        let preserved_hyphen = if should_preserve_lexical_hyphen(trailing_word, leading_word) {
+        let preserved_hyphen = if should_preserve_lexical_hyphen(trailing_word, leading_word, hyphen_witnesses) {
             "-"
         } else {
             ""
@@ -5325,9 +5670,13 @@ fn run_in_list_fragment(source: &PdfParagraph, text: String, is_list_item: bool)
     }
 }
 
-fn apply_text_repair_to_structure_tree_paragraphs(paragraphs: &mut Vec<PdfParagraph>, has_positions: bool) {
-    apply_to_all_segments(paragraphs, fused_text_repairs);
-    dehyphenate_paragraphs(paragraphs, has_positions);
+fn apply_text_repair_to_structure_tree_paragraphs(
+    paragraphs: &mut Vec<PdfParagraph>,
+    has_positions: bool,
+    witnesses: &TextRepairWitnesses,
+) {
+    apply_to_all_segments(paragraphs, |text| fused_text_repairs(text, &witnesses.words));
+    dehyphenate_paragraphs(paragraphs, has_positions, &witnesses.hyphens);
     split_embedded_list_items(paragraphs);
     synchronize_paragraph_text_metadata(paragraphs);
 }
@@ -6826,7 +7175,7 @@ mod tests {
             body_line_seg("1.6 Ventilatie", 658.0),
         ];
 
-        let paragraphs = segments_to_paragraphs(segments, &[(11.0, None)], &[]);
+        let paragraphs = segments_to_paragraphs(segments, &[(11.0, None)], &[], &TextRepairWitnesses::default());
 
         assert_eq!(
             paragraphs.len(),
@@ -6846,7 +7195,7 @@ mod tests {
             body_line_seg("2024 was een druk jaar", 686.0),
         ];
 
-        let paragraphs = segments_to_paragraphs(segments, &[(11.0, None)], &[]);
+        let paragraphs = segments_to_paragraphs(segments, &[(11.0, None)], &[], &TextRepairWitnesses::default());
 
         assert_eq!(
             paragraphs.len(),
@@ -6907,7 +7256,12 @@ mod tests {
             ..column_seg("gebruiker van het toestel indien genegeerd", 72.0, 190.0, 636.0)
         };
 
-        let paragraphs = segments_to_paragraphs(vec![heading, callout, body1, body2, body3], &[(12.0, None)], &[]);
+        let paragraphs = segments_to_paragraphs(
+            vec![heading, callout, body1, body2, body3],
+            &[(12.0, None)],
+            &[],
+            &TextRepairWitnesses::default(),
+        );
 
         assert_eq!(
             paragraphs.len(),
@@ -6946,7 +7300,12 @@ mod tests {
         );
         let heading_continuation = column_seg("Rechterkantlijn Van Deze Kolom", 72.0, 450.0, 684.0);
 
-        let paragraphs = segments_to_paragraphs(vec![heading_start, heading_continuation], &[(11.0, None)], &[]);
+        let paragraphs = segments_to_paragraphs(
+            vec![heading_start, heading_continuation],
+            &[(11.0, None)],
+            &[],
+            &TextRepairWitnesses::default(),
+        );
 
         assert_eq!(
             paragraphs.len(),
@@ -6967,7 +7326,7 @@ mod tests {
             body_line_seg("before adjourning the meeting for the day", 672.0),
         ];
 
-        let paragraphs = segments_to_paragraphs(segments, &[(11.0, None)], &[]);
+        let paragraphs = segments_to_paragraphs(segments, &[(11.0, None)], &[], &TextRepairWitnesses::default());
 
         assert_eq!(
             paragraphs.len(),
@@ -7025,7 +7384,7 @@ mod tests {
         ];
         let gap_ys = compute_paragraph_gap_ys(&segments);
 
-        let paragraphs = segments_to_paragraphs(segments, &[(11.0, None)], &gap_ys);
+        let paragraphs = segments_to_paragraphs(segments, &[(11.0, None)], &gap_ys, &TextRepairWitnesses::default());
 
         assert_eq!(
             paragraphs.len(),
@@ -7070,7 +7429,7 @@ mod tests {
         ];
         let gap_ys = compute_paragraph_gap_ys(&segments);
 
-        let paragraphs = segments_to_paragraphs(segments, &[(11.0, None)], &gap_ys);
+        let paragraphs = segments_to_paragraphs(segments, &[(11.0, None)], &gap_ys, &TextRepairWitnesses::default());
 
         assert_eq!(
             paragraphs.iter().filter(|paragraph| paragraph.is_list_item).count(),
@@ -7125,7 +7484,7 @@ mod tests {
         ];
         let gap_ys = compute_paragraph_gap_ys(&segments);
 
-        let paragraphs = segments_to_paragraphs(segments, &[(11.0, None)], &gap_ys);
+        let paragraphs = segments_to_paragraphs(segments, &[(11.0, None)], &gap_ys, &TextRepairWitnesses::default());
 
         assert_eq!(
             paragraphs.len(),
@@ -7272,7 +7631,7 @@ mod tests {
         ];
         let gap_ys = compute_paragraph_gap_ys(&segments);
 
-        let paragraphs = segments_to_paragraphs(segments, &[(11.0, None)], &gap_ys);
+        let paragraphs = segments_to_paragraphs(segments, &[(11.0, None)], &gap_ys, &TextRepairWitnesses::default());
 
         assert_eq!(paragraphs.len(), 2, "baseline agreement is what licenses reattachment");
         assert!(
@@ -7305,6 +7664,39 @@ mod tests {
         segment.y = baseline_y - segment.height;
         segment.is_bold = is_bold;
         segment
+    }
+
+    #[test]
+    fn issue_1560_reconstructs_jittered_table_fragments_as_one_x_ordered_line() {
+        let mut article = inline_seg("700004", 68.279, 623.481, false);
+        article.font_size = 8.6;
+        article.height = 8.6;
+        article.width = 35.0;
+        let mut position = inline_seg("2", 50.0, 622.401, false);
+        position.font_size = 8.6;
+        position.height = 8.6;
+        position.width = 5.0;
+        let mut description = inline_seg("Fastening screw", 124.9, 622.401, false);
+        description.font_size = 8.6;
+        description.height = 8.6;
+        description.width = 60.0;
+        let mut next_row = inline_seg("3", 50.0, 610.0, false);
+        next_row.font_size = 8.6;
+        next_row.height = 8.6;
+
+        let segments = [&article, &position, &description, &next_row];
+        let lines = reconstruct_pdf_lines(&segments);
+
+        assert_eq!(lines.len(), 2, "ordinary row leading must still split lines");
+        assert_eq!(
+            lines[0]
+                .segments
+                .iter()
+                .map(|segment| segment.text.as_str())
+                .collect::<Vec<_>>(),
+            ["2", "700004", "Fastening screw"]
+        );
+        assert_eq!(lines[1].segments[0].text, "3");
     }
 
     #[test]
@@ -7600,6 +7992,95 @@ mod tests {
         let mut paragraph = outline_para(text);
         paragraph.heading_level = Some(level);
         paragraph
+    }
+
+    fn body_size_paragraph(text: &str, is_bold: bool, heading_level: Option<u8>) -> PdfParagraph {
+        let mut paragraph = outline_para(text);
+        paragraph.dominant_font_size = 12.0;
+        paragraph.is_bold = is_bold;
+        paragraph.heading_level = heading_level;
+        for line in &mut paragraph.lines {
+            line.dominant_font_size = 12.0;
+            line.is_bold = is_bold;
+            for segment in &mut line.segments {
+                segment.font_size = 12.0;
+                segment.is_bold = is_bold;
+            }
+        }
+        paragraph
+    }
+
+    fn body_size_paragraph_at(text: &str, is_bold: bool, heading_level: Option<u8>, left: f32) -> PdfParagraph {
+        let mut paragraph = body_size_paragraph(text, is_bold, heading_level);
+        paragraph.block_bbox = Some((left, 0.0, left + 200.0, 12.0));
+        paragraph
+    }
+
+    fn body_size_paragraph_with_bbox(
+        text: &str,
+        is_bold: bool,
+        heading_level: Option<u8>,
+        bbox: (f32, f32, f32, f32),
+    ) -> PdfParagraph {
+        let mut paragraph = body_size_paragraph(text, is_bold, heading_level);
+        paragraph.block_bbox = Some(bbox);
+        paragraph
+    }
+
+    fn heading_page(heading: &str, heading_size: f32, body: &str) -> Vec<SegmentData> {
+        let mut heading_segment = seg_heuristic(heading, heading_size, 700.0);
+        heading_segment.is_bold = true;
+        vec![heading_segment, seg_heuristic(body, 12.0, 650.0)]
+    }
+
+    fn extract_heading_test_document(
+        pages: Vec<Vec<SegmentData>>,
+        used_structure_tree: bool,
+    ) -> crate::types::internal::InternalDocument {
+        extract_document_structure_from_segments(
+            pages,
+            SegmentStructureConfig {
+                k_clusters: 4,
+                tables: &[],
+                outline_entries: &[],
+                strip_repeating_text: false,
+                include_headers: true,
+                include_footers: true,
+                include_footnotes: true,
+                include_watermarks: true,
+                used_structure_tree,
+                image_positions: &[],
+                images: None,
+                inject_placeholders: false,
+                layout_hints: None,
+                allow_single_column: true,
+                cancel_token: None,
+                #[cfg(feature = "layout-detection")]
+                layout_images: None,
+                #[cfg(feature = "layout-detection")]
+                layout_results: None,
+                #[cfg(feature = "layout-detection")]
+                table_model: crate::core::config::layout::TableModel::Disabled,
+                #[cfg(feature = "layout-detection")]
+                table_overlap_preference: crate::core::config::layout::TableOverlapPreference::Content,
+                #[cfg(feature = "layout-detection")]
+                acceleration: None,
+                #[cfg(feature = "layout-detection")]
+                session_thread_budget: 0,
+            },
+        )
+        .expect("document structure extraction must succeed")
+    }
+
+    fn element_kind_for(
+        document: &crate::types::internal::InternalDocument,
+        text: &str,
+    ) -> Option<crate::types::internal::ElementKind> {
+        document
+            .elements
+            .iter()
+            .find(|element| element.text == text)
+            .map(|element| element.kind)
     }
 
     fn table_with_body_rows(body_rows: usize, cell: &str) -> crate::types::Table {
@@ -7973,6 +8454,7 @@ where new shares are issued;";
             },
             &[],
             None,
+            &TextRepairWitnesses::default(),
         )
     }
 
@@ -8004,6 +8486,7 @@ where new shares are issued;";
                 },
                 &[],
                 None,
+                &TextRepairWitnesses::default(),
             )
         };
 
@@ -8084,6 +8567,7 @@ where new shares are issued;";
                 },
                 &[],
                 None,
+                &TextRepairWitnesses::default(),
             )];
             reorder_pages_by_layout_region(&mut pages);
             pages[0].iter().map(paragraph_text).collect::<Vec<_>>()
@@ -8158,6 +8642,7 @@ where new shares are issued;";
             },
             &[],
             None,
+            &TextRepairWitnesses::default(),
         );
 
         assert_eq!(output.len(), 1);
@@ -8195,6 +8680,7 @@ where new shares are issued;";
             },
             &[],
             None,
+            &TextRepairWitnesses::default(),
         );
 
         assert_eq!(output.len(), 1);
@@ -8233,6 +8719,7 @@ where new shares are issued;";
             },
             &[],
             None,
+            &TextRepairWitnesses::default(),
         );
 
         assert_eq!(output.len(), 1);
@@ -8324,6 +8811,7 @@ where new shares are issued;";
             },
             &[],
             None,
+            &TextRepairWitnesses::default(),
         );
 
         assert_eq!(output.len(), 3);
@@ -8371,6 +8859,7 @@ where new shares are issued;";
             },
             &[],
             Some(12.0),
+            &TextRepairWitnesses::default(),
         );
 
         assert_eq!(output.len(), 2);
@@ -8381,7 +8870,9 @@ where new shares are issued;";
 
     /// Full-width line at x=10, width=490 → right edge 500.
     fn full_line_seg(text: &str) -> SegmentData {
-        seg(text, 10.0, 490.0)
+        let mut segment = seg(text, 10.0, 490.0);
+        segment.baseline_y = 20.0;
+        segment
     }
 
     /// Short line at x=10, width=100 → right edge 110 (well below 500*0.85=425).
@@ -8395,7 +8886,7 @@ where new shares are issued;";
             line(vec![full_line_seg("some soft-")]),
             line(vec![seg("ware is great", 10.0, 200.0)]),
         ]);
-        dehyphenate_paragraph_lines(&mut p);
+        dehyphenate_paragraph_lines(&mut p, &HyphenWitnesses::default());
         assert_eq!(p.lines[0].segments[0].text, "some software");
         assert_eq!(p.lines[1].segments[0].text, "is great");
     }
@@ -8406,7 +8897,7 @@ where new shares are issued;";
             line(vec![full_line_seg("the soft")]),
             line(vec![seg("ware is great", 10.0, 200.0)]),
         ]);
-        dehyphenate_paragraph_lines(&mut p);
+        dehyphenate_paragraph_lines(&mut p, &HyphenWitnesses::default());
         assert_eq!(p.lines[0].segments[0].text, "the soft");
         assert_eq!(p.lines[1].segments[0].text, "ware is great");
     }
@@ -8419,7 +8910,7 @@ where new shares are issued;";
         ]);
         let original_trailing = p.lines[0].segments[0].text.clone();
         let original_leading = p.lines[1].segments[0].text.clone();
-        dehyphenate_paragraph_lines(&mut p);
+        dehyphenate_paragraph_lines(&mut p, &HyphenWitnesses::default());
         assert_eq!(p.lines[0].segments[0].text, original_trailing);
         assert_eq!(p.lines[1].segments[0].text, original_leading);
     }
@@ -8432,7 +8923,7 @@ where new shares are issued;";
         ]);
         p.is_code_block = true;
         let mut paragraphs = vec![p];
-        dehyphenate_paragraphs(&mut paragraphs, true);
+        dehyphenate_paragraphs(&mut paragraphs, true, &HyphenWitnesses::default());
         assert_eq!(paragraphs[0].lines[0].segments[0].text, "some soft-");
     }
 
@@ -8442,7 +8933,7 @@ where new shares are issued;";
             line(vec![full_line_seg("some text")]),
             line(vec![seg("Next sentence here", 10.0, 200.0)]),
         ]);
-        dehyphenate_paragraph_lines(&mut p);
+        dehyphenate_paragraph_lines(&mut p, &HyphenWitnesses::default());
         assert_eq!(p.lines[0].segments[0].text, "some text");
         assert_eq!(p.lines[1].segments[0].text, "Next sentence here");
     }
@@ -8453,7 +8944,7 @@ where new shares are issued;";
             line(vec![full_line_seg("some \u{4E00}-")]),
             line(vec![seg("text here", 10.0, 200.0)]),
         ]);
-        dehyphenate_paragraph_lines(&mut p);
+        dehyphenate_paragraph_lines(&mut p, &HyphenWitnesses::default());
         assert_eq!(p.lines[0].segments[0].text, "some \u{4E00}-");
     }
 
@@ -8463,7 +8954,7 @@ where new shares are issued;";
             line(vec![full_line_seg("advanced soft")]),
             line(vec![seg("ware development", 10.0, 200.0)]),
         ]);
-        dehyphenate_paragraph_lines(&mut p);
+        dehyphenate_paragraph_lines(&mut p, &HyphenWitnesses::default());
         assert_eq!(p.lines[0].segments[0].text, "advanced soft");
         assert_eq!(p.lines[1].segments[0].text, "ware development");
     }
@@ -8474,7 +8965,7 @@ where new shares are issued;";
             line(vec![full_line_seg("modern hard")]),
             line(vec![seg("ware components", 10.0, 200.0)]),
         ]);
-        dehyphenate_paragraph_lines(&mut p);
+        dehyphenate_paragraph_lines(&mut p, &HyphenWitnesses::default());
         assert_eq!(p.lines[0].segments[0].text, "modern hard");
         assert_eq!(p.lines[1].segments[0].text, "ware components");
     }
@@ -8485,20 +8976,78 @@ where new shares are issued;";
             line(vec![full_line_seg("the soft")]),
             line(vec![seg("ware, which is great", 10.0, 200.0)]),
         ]);
-        dehyphenate_paragraph_lines(&mut p);
+        dehyphenate_paragraph_lines(&mut p, &HyphenWitnesses::default());
         assert_eq!(p.lines[0].segments[0].text, "the soft");
         assert_eq!(p.lines[1].segments[0].text, "ware, which is great");
     }
 
     #[test]
     fn test_hyphen_only_fallback() {
-        let mut p = para(vec![
-            line(vec![seg("some soft-", 0.0, 0.0)]),
-            line(vec![seg("ware is great", 0.0, 0.0)]),
-        ]);
-        dehyphenate_hyphen_only(&mut p);
+        let mut trailing = seg("some soft-", 0.0, 0.0);
+        trailing.baseline_y = 20.0;
+        let mut p = para(vec![line(vec![trailing]), line(vec![seg("ware is great", 0.0, 0.0)])]);
+        dehyphenate_hyphen_only(&mut p, &HyphenWitnesses::default());
         assert_eq!(p.lines[0].segments[0].text, "some software");
         assert_eq!(p.lines[1].segments[0].text, "is great");
+    }
+
+    #[test]
+    fn suspended_hyphens_on_one_baseline_are_preserved() {
+        for (left, right) in [
+            ("vracht-", "en verzendkosten"),
+            ("In-", "en uitvoer"),
+            ("onderhouds-", "en installatiewerkzaamheden"),
+            ("Verkoop-", "en Leveringvoorwaarden"),
+        ] {
+            let mut trailing = full_line_seg(left);
+            trailing.baseline_y = 100.0;
+            let mut leading = seg(right, 480.0, 80.0);
+            leading.baseline_y = 100.0;
+            let mut paragraph = para(vec![line(vec![trailing]), line(vec![leading])]);
+
+            dehyphenate_paragraph_lines(&mut paragraph, &HyphenWitnesses::default());
+
+            assert_eq!(paragraph_text(&paragraph), format!("{left} {right}"));
+        }
+    }
+
+    #[test]
+    fn suspended_and_wrapped_hyphens_in_one_paragraph_are_distinguished() {
+        let mut suspended = full_line_seg("De bijbehorende montage-");
+        suspended.baseline_y = 100.0;
+        let mut wrapped = full_line_seg("en installatie-");
+        wrapped.baseline_y = 100.0;
+        let mut continuation = seg("handleiding wordt op aanvraag toegezonden.", 10.0, 220.0);
+        continuation.baseline_y = 80.0;
+        let mut paragraph = para(vec![
+            line(vec![suspended]),
+            line(vec![wrapped]),
+            line(vec![continuation]),
+        ]);
+
+        dehyphenate_paragraph_lines(&mut paragraph, &HyphenWitnesses::default());
+
+        assert_eq!(
+            paragraph_text(&paragraph),
+            "De bijbehorende montage- en installatiehandleiding wordt op aanvraag toegezonden."
+        );
+    }
+
+    #[test]
+    fn dehyphenation_requires_finite_baselines_in_the_same_reading_frame() {
+        let cases = [(f32::NAN, 0.0, 0.0), (20.0, 0.0, 90.0)];
+        for (trailing_baseline, leading_baseline, leading_rotation) in cases {
+            let mut trailing = full_line_seg("some soft-");
+            trailing.baseline_y = trailing_baseline;
+            let mut leading = seg("ware remains", 10.0, 100.0);
+            leading.baseline_y = leading_baseline;
+            leading.rotation_degrees = leading_rotation;
+            let mut paragraph = para(vec![line(vec![trailing]), line(vec![leading])]);
+
+            dehyphenate_paragraph_lines(&mut paragraph, &HyphenWitnesses::default());
+
+            assert_eq!(paragraph_text(&paragraph), "some soft- ware remains");
+        }
     }
 
     #[test]
@@ -8507,14 +9056,14 @@ where new shares are issued;";
             line(vec![seg("some well-", 0.0, 0.0)]),
             line(vec![seg("Known thing", 0.0, 0.0)]),
         ]);
-        dehyphenate_hyphen_only(&mut p);
+        dehyphenate_hyphen_only(&mut p, &HyphenWitnesses::default());
         assert_eq!(p.lines[0].segments[0].text, "some well-");
     }
 
     #[test]
     fn test_single_line_paragraph_skipped() {
         let mut paragraphs = vec![para(vec![line(vec![full_line_seg("single line")])])];
-        dehyphenate_paragraphs(&mut paragraphs, true);
+        dehyphenate_paragraphs(&mut paragraphs, true, &HyphenWitnesses::default());
         assert_eq!(paragraphs[0].lines[0].segments[0].text, "single line");
     }
 
@@ -8524,9 +9073,190 @@ where new shares are issued;";
             line(vec![seg("first part", 10.0, 200.0), seg("soft", 220.0, 280.0)]),
             line(vec![seg("ware next words", 10.0, 200.0)]),
         ]);
-        dehyphenate_paragraph_lines(&mut p);
+        dehyphenate_paragraph_lines(&mut p, &HyphenWitnesses::default());
         assert_eq!(p.lines[0].segments[1].text, "soft");
         assert_eq!(p.lines[1].segments[0].text, "ware next words");
+    }
+
+    /// Regression for #1543: a hyphen appearing mid-run (not at the end of a segment's
+    /// text) witnesses a genuine authored compound, because a line-wrap hyphen is by
+    /// construction the LAST character of its segment.
+    ///
+    /// Neutralisation that must break this test: stop scanning for interior hyphens (e.g.
+    /// only ever inspect the final character of each segment) in `collect_hyphen_witnesses`.
+    #[test]
+    fn collect_hyphen_witnesses_finds_a_mid_run_compound() {
+        let pages = vec![vec![seg("the price-determining factors apply", 0.0, 0.0)]];
+
+        let witnesses = collect_hyphen_witnesses(&pages);
+
+        assert!(
+            witnesses.contains(&("price".to_string(), "determining".to_string())),
+            "a mid-run hyphen must witness its own compound: got {witnesses:?}"
+        );
+    }
+
+    /// The load-bearing negative for #1543: a hyphen at the END of a segment's text is,
+    /// by construction, a line-wrap candidate rather than evidence of an authored
+    /// compound. If this hyphen were witnessed, the collector would preserve every
+    /// trailing hyphen it exists to judge, defeating the whole mechanism.
+    ///
+    /// Neutralisation that must break this test: delete the end-of-run guard (the
+    /// `1..characters.len() - 1` range excluding the last index) in
+    /// `collect_hyphen_witnesses`.
+    #[test]
+    fn collect_hyphen_witnesses_ignores_a_hyphen_at_the_end_of_a_run() {
+        let pages = vec![vec![seg("are based on the price-", 0.0, 0.0)]];
+
+        let witnesses = collect_hyphen_witnesses(&pages);
+
+        assert!(
+            witnesses.is_empty(),
+            "a trailing hyphen must never become a witness: got {witnesses:?}"
+        );
+    }
+
+    /// A pair witnessed only by the document's own mid-line usage -- absent from the
+    /// static `PRESERVED_LEXICAL_COMPOUNDS` list -- must still license preservation.
+    ///
+    /// Neutralisation that must break this test: make `should_preserve_lexical_hyphen`
+    /// ignore its `hyphen_witnesses` argument and consult only the static list.
+    #[test]
+    fn should_preserve_lexical_hyphen_true_for_a_witnessed_pair_not_in_the_static_list() {
+        let mut witnesses = HyphenWitnesses::default();
+        witnesses.insert(("price".to_string(), "determining".to_string()));
+
+        assert!(should_preserve_lexical_hyphen("price", "determining", &witnesses));
+    }
+
+    /// The soft-hyphenation control: `auto` + `matic` (from a line broken as `auto-` /
+    /// `matic`) is a genuine mid-word wrap with no witness and no static-list entry, so
+    /// the hyphen must still be dropped on rejoin.
+    ///
+    /// Neutralisation that must break this test: widen the static list or witness lookup
+    /// to a prefix/suffix match instead of the exact-pair comparison.
+    #[test]
+    fn should_preserve_lexical_hyphen_false_for_genuine_soft_hyphenation() {
+        let witnesses = HyphenWitnesses::default();
+
+        assert!(!should_preserve_lexical_hyphen("auto", "matic", &witnesses));
+    }
+
+    /// Char-boundary regression: a non-ASCII word sitting next to a mid-run hyphen must
+    /// not panic. This repo has a documented history of char-boundary panics from byte
+    /// slicing a `&str`; `collect_hyphen_witnesses` must only ever slice by `char`.
+    ///
+    /// Neutralisation that must break this test: rewrite the left/right run extraction
+    /// with byte-offset string slicing (e.g. `&text[..byte_index]`) instead of the
+    /// char-safe `Vec<char>` scan.
+    #[test]
+    fn collect_hyphen_witnesses_does_not_panic_on_non_ascii_word_boundaries() {
+        let pages = vec![vec![seg("café-terrasse is open déjà-vu style", 0.0, 0.0)]];
+
+        let witnesses = collect_hyphen_witnesses(&pages);
+
+        assert!(
+            witnesses.contains(&("café".to_string(), "terrasse".to_string())),
+            "a non-ASCII word must still be witnessed: got {witnesses:?}"
+        );
+    }
+
+    /// GH#1591: a word attested standalone elsewhere in the document is collected as
+    /// a witness, even though its OTHER occurrence sits directly in front of a
+    /// ligature-space candidate pattern ("bedrijf is") that must not weld it.
+    #[test]
+    fn collect_word_witnesses_finds_a_standalone_occurrence_elsewhere() {
+        let pages = vec![vec![
+            seg("bedrijf is gesloten", 0.0, 0.0),
+            seg("het bedrijf verkocht apparatuur", 0.0, 0.0),
+        ]];
+
+        let witnesses = collect_word_witnesses(&pages);
+
+        assert!(
+            witnesses.contains("bedrijf"),
+            "bedrijf must be witnessed by its ordinary-prose occurrence: got {witnesses:?}"
+        );
+    }
+
+    /// The load-bearing negative for #1591: a fragment that appears ONLY as one half
+    /// of a ligature-space candidate pattern must never witness itself, or every
+    /// genuine decomposed ligature (e.g. `f irst`) would become unrepairable the
+    /// moment its own halves are long enough to pass the length guard.
+    ///
+    /// Neutralisation that must break this test: collect witnesses via a naive
+    /// `split_whitespace()` over every segment with no candidate-pattern exclusion.
+    #[test]
+    fn collect_word_witnesses_does_not_witness_its_own_candidate_halves() {
+        let pages = vec![vec![seg("f irst eff iciently", 0.0, 0.0)]];
+
+        let witnesses = collect_word_witnesses(&pages);
+
+        assert!(
+            !witnesses.contains("irst") && !witnesses.contains("eff") && !witnesses.contains("iciently"),
+            "a candidate pattern's own fragments must not self-witness: got {witnesses:?}"
+        );
+    }
+
+    /// A word used twice, once as a candidate's left half and once in an ordinary
+    /// position, is still witnessed via its non-candidate occurrence -- the exclusion
+    /// applies per-occurrence, not to the word everywhere it appears in the document.
+    #[test]
+    fn collect_word_witnesses_witnesses_a_word_used_twice_once_as_a_candidate() {
+        let pages = vec![vec![seg("relief for relief workers arrived", 0.0, 0.0)]];
+
+        let witnesses = collect_word_witnesses(&pages);
+
+        assert!(
+            witnesses.contains("relief"),
+            "the second, non-candidate occurrence of relief must still witness it: got {witnesses:?}"
+        );
+    }
+
+    /// Length guard mirroring `MIN_HYPHEN_WITNESS_WORD_LEN`: a single-letter fragment
+    /// must never count as its own witness.
+    #[test]
+    fn collect_word_witnesses_ignores_single_letter_fragments() {
+        let pages = vec![vec![seg("a b c", 0.0, 0.0)]];
+
+        let witnesses = collect_word_witnesses(&pages);
+
+        assert!(
+            witnesses.is_empty(),
+            "single-letter tokens must never be witnesses: got {witnesses:?}"
+        );
+    }
+
+    /// End-to-end (#1591): `apply_text_repair_to_structure_tree_paragraphs` must
+    /// forward the document's word witnesses into `repair_ligature_spaces`, not just
+    /// its hyphen witnesses.
+    ///
+    /// Neutralisation that must break this test: pass `WordWitnesses::default()` to
+    /// `fused_text_repairs` instead of `witnesses.words` in
+    /// `apply_text_repair_to_structure_tree_paragraphs`.
+    #[test]
+    fn segments_to_paragraphs_preserves_a_witnessed_ligature_space_boundary() {
+        let segments = vec![seg("bedrijf is gesloten", 0.0, 200.0)];
+        let witnesses = TextRepairWitnesses {
+            hyphens: HyphenWitnesses::default(),
+            words: ["bedrijf".to_string()].into_iter().collect(),
+        };
+
+        let paragraphs = segments_to_paragraphs(segments, &[(11.0, None)], &[], &witnesses);
+
+        assert_eq!(paragraph_segment_text(&paragraphs[0]), "bedrijf is gesloten");
+    }
+
+    /// The same end-to-end path with no witnesses at all welds the real word
+    /// boundary, documenting the fix's known false positive at the pipeline level
+    /// (not just in the pure `repair_ligature_spaces` unit tests).
+    #[test]
+    fn segments_to_paragraphs_welds_an_unwitnessed_ligature_space_boundary() {
+        let segments = vec![seg("bedrijf is gesloten", 0.0, 200.0)];
+
+        let paragraphs = segments_to_paragraphs(segments, &[(11.0, None)], &[], &TextRepairWitnesses::default());
+
+        assert_eq!(paragraph_segment_text(&paragraphs[0]), "bedrijfis gesloten");
     }
 
     fn para_with_font_size(font_size: f32) -> PdfParagraph {
@@ -9420,6 +10150,670 @@ where new shares are issued;";
         );
     }
 
+    #[test]
+    fn should_classify_untagged_bold_body_size_paragraphs_on_tagged_pages() {
+        let paragraphs = vec![
+            body_size_paragraph("Existing tagged section", true, Some(2)),
+            body_size_paragraph("Overige en specifieke bepalingen", true, None),
+            body_size_paragraph("Datalekprotocol", true, None),
+            body_size_paragraph("First body paragraph ends here.", false, None),
+            body_size_paragraph("Second body paragraph ends here.", false, None),
+        ];
+        let all_page_segments = vec![Vec::new()];
+        let struct_tree_results = vec![Some(paragraphs.clone())];
+
+        let (heading_map, pages_needing_classification) =
+            build_heading_map(&all_page_segments, &struct_tree_results, &[], 4)
+                .expect("build_heading_map must succeed");
+
+        assert_eq!(
+            pages_needing_classification.into_iter().collect::<Vec<_>>(),
+            [0],
+            "a uniform-font tagged page with an untagged bold paragraph must reach classification"
+        );
+
+        let classified = process_single_page(
+            PageInput {
+                page_index: 0,
+                struct_paragraphs: Some(paragraphs),
+                heuristic_segments: Vec::new(),
+                page_hints: None,
+                table_bboxes: Vec::new(),
+                preserve_native_semantics: true,
+                use_layout_reading_order: false,
+                #[cfg(feature = "layout-detection")]
+                hint_validations: Vec::new(),
+                #[cfg(feature = "layout-detection")]
+                page_width_pts: None,
+                needs_classify: true,
+                paragraph_gap_ys: Vec::new(),
+                include_headers: true,
+                include_footers: true,
+                include_footnotes: true,
+            },
+            &heading_map,
+            Some(12.0),
+            &TextRepairWitnesses::default(),
+        );
+        let level_for = |text: &str| {
+            classified
+                .iter()
+                .find(|paragraph| paragraph_segment_text(paragraph) == text)
+                .and_then(|paragraph| paragraph.heading_level)
+        };
+
+        assert_eq!(level_for("Existing tagged section"), Some(2));
+        assert_eq!(level_for("Overige en specifieke bepalingen"), Some(3));
+        assert_eq!(level_for("Datalekprotocol"), None);
+    }
+
+    #[test]
+    fn should_promote_repeated_untagged_body_size_bold_sections_document_wide() {
+        let mut tagged_control = heading_page(
+            "Existing tagged heading",
+            18.0,
+            "The control page ordinary body paragraph ends here.",
+        );
+        tagged_control[0].assigned_role = Some(1);
+        let pages = vec![
+            tagged_control,
+            heading_page(
+                "Overige en specifieke bepalingen",
+                12.0,
+                "The first ordinary body paragraph ends here.",
+            ),
+            heading_page(
+                "Beveiligingsbeleid en toezicht",
+                12.0,
+                "The second ordinary body paragraph ends here.",
+            ),
+            heading_page(
+                "Aanvullende technische bepalingen",
+                12.0,
+                "The third ordinary body paragraph ends here.",
+            ),
+            heading_page(
+                "Datalekprotocol",
+                12.0,
+                "The short-title control remains ordinary text.",
+            ),
+        ];
+
+        for used_structure_tree in [false, true] {
+            let document = extract_heading_test_document(pages.clone(), used_structure_tree);
+            assert_eq!(
+                element_kind_for(&document, "Existing tagged heading"),
+                Some(crate::types::internal::ElementKind::Heading { level: 1 })
+            );
+            for heading in [
+                "Overige en specifieke bepalingen",
+                "Beveiligingsbeleid en toezicht",
+                "Aanvullende technische bepalingen",
+            ] {
+                assert_eq!(
+                    element_kind_for(&document, heading),
+                    Some(crate::types::internal::ElementKind::Heading { level: 3 }),
+                    "a repeated whole-line bold body-size convention must classify {heading:?} as H3"
+                );
+            }
+            assert_eq!(
+                element_kind_for(&document, "Datalekprotocol"),
+                Some(crate::types::internal::ElementKind::Paragraph),
+                "the existing one-word body-size ambiguity guard must remain intact"
+            );
+        }
+    }
+
+    #[test]
+    fn should_not_promote_indented_attributions_as_repeated_body_size_headings() {
+        let mut attribution_pages = vec![vec![
+            body_size_paragraph_at("Existing document title", true, Some(1), 74.0),
+            body_size_paragraph_at("Existing section heading", true, Some(2), 74.0),
+        ]];
+        attribution_pages.extend((0..16).map(|index| {
+            vec![
+                body_size_paragraph_at(
+                    &format!("Presenter Name {index}, Department Director"),
+                    true,
+                    None,
+                    126.0,
+                ),
+                body_size_paragraph_at(
+                    &format!("Agenda item {index} discussion continues in ordinary body text."),
+                    false,
+                    None,
+                    74.0,
+                ),
+            ]
+        }));
+
+        promote_repeated_body_size_bold_headings(&mut attribution_pages, Some(12.0));
+
+        let promoted_attribution_count = attribution_pages
+            .iter()
+            .skip(1)
+            .filter(|page| page[0].heading_level == Some(3))
+            .count();
+        assert_eq!(
+            promoted_attribution_count, 0,
+            "indented presenter attributions must remain subordinate to the following content block"
+        );
+        assert_eq!(attribution_pages[0][0].heading_level, Some(1));
+        assert_eq!(attribution_pages[0][1].heading_level, Some(2));
+
+        let mut aligned_section_pages = vec![vec![
+            body_size_paragraph_at("Existing document title", true, Some(1), 74.0),
+            body_size_paragraph_at("Existing section heading", true, Some(2), 74.0),
+        ]];
+        aligned_section_pages.push(vec![body_size_paragraph_at(
+            "Genuine repeated section heading 0",
+            true,
+            None,
+            74.0,
+        )]);
+        aligned_section_pages.push(vec![body_size_paragraph_at(
+            "Section 0 opens a block of ordinary body text on the next page.",
+            false,
+            None,
+            74.0,
+        )]);
+        aligned_section_pages.extend((1..9).map(|index| {
+            vec![
+                body_size_paragraph_with_bbox(
+                    &format!("Genuine repeated section heading {index}"),
+                    true,
+                    None,
+                    (74.0, 700.0, 274.0, 712.0),
+                ),
+                body_size_paragraph_with_bbox(
+                    &format!("Section {index} opens a block of ordinary body text."),
+                    false,
+                    None,
+                    (74.0, 660.0, 274.0, 690.0),
+                ),
+            ]
+        }));
+
+        promote_repeated_body_size_bold_headings(&mut aligned_section_pages, Some(12.0));
+
+        assert_eq!(
+            aligned_section_pages
+                .iter()
+                .skip(1)
+                .filter(|page| page[0].heading_level == Some(3))
+                .count(),
+            9,
+            "aligned repeated section headings must retain the document-wide promotion"
+        );
+        assert_eq!(aligned_section_pages[0][0].heading_level, Some(1));
+        assert_eq!(aligned_section_pages[0][1].heading_level, Some(2));
+
+        let mut missing_geometry_pages = vec![vec![body_size_paragraph_at(
+            "Existing document title",
+            true,
+            Some(1),
+            74.0,
+        )]];
+        missing_geometry_pages.push(vec![
+            body_size_paragraph("Candidate without geometry opens body content", true, None),
+            body_size_paragraph_at(
+                "Following ordinary body content retains valid geometry.",
+                false,
+                None,
+                74.0,
+            ),
+        ]);
+        missing_geometry_pages.push(vec![
+            body_size_paragraph_at("Candidate with geometry opens body content", true, None, 74.0),
+            body_size_paragraph("Following ordinary body content lacks geometry.", false, None),
+        ]);
+        missing_geometry_pages.push(vec![
+            body_size_paragraph("Candidate and body both lack geometry", true, None),
+            body_size_paragraph("Following ordinary body content also lacks geometry.", false, None),
+        ]);
+
+        promote_repeated_body_size_bold_headings(&mut missing_geometry_pages, Some(12.0));
+
+        assert_eq!(
+            missing_geometry_pages
+                .iter()
+                .skip(1)
+                .filter(|page| page[0].heading_level == Some(3))
+                .count(),
+            3,
+            "missing geometry on either side must retain the documented promotion fallback"
+        );
+
+        let mut numbered_section_pages = vec![vec![body_size_paragraph_at(
+            "Existing meeting title",
+            true,
+            Some(1),
+            74.0,
+        )]];
+        numbered_section_pages.extend(["I.", "II.", "III."].into_iter().enumerate().map(|(index, marker)| {
+            vec![
+                body_size_paragraph_with_bbox(
+                    &format!("{marker} CENTERED MEETING AGENDA SECTION"),
+                    true,
+                    None,
+                    (220.0, 700.0, 430.0, 714.0),
+                ),
+                body_size_paragraph_with_bbox(
+                    &format!("Agenda section {} contains ordinary list or body content.", index + 1),
+                    false,
+                    None,
+                    (74.0, 660.0, 430.0, 690.0),
+                ),
+            ]
+        }));
+        numbered_section_pages.push(vec![
+            body_size_paragraph_at("I am the program presenter", true, None, 126.0),
+            body_size_paragraph_at(
+                "The presenter attribution is followed by substantive ordinary body text.",
+                false,
+                None,
+                74.0,
+            ),
+        ]);
+        let mut non_finite_candidate =
+            body_size_paragraph_at("Indented presenter with invalid geometry", true, None, 126.0);
+        non_finite_candidate.block_bbox = Some((f32::NAN, 0.0, 326.0, 12.0));
+        numbered_section_pages.push(vec![
+            non_finite_candidate,
+            body_size_paragraph_at(
+                "Invalid candidate geometry must not bypass structural alignment checks.",
+                false,
+                None,
+                74.0,
+            ),
+        ]);
+        numbered_section_pages.push(vec![
+            body_size_paragraph_at("Meeting Executive Name", true, None, 74.0),
+            body_size_paragraph_at("Executive Secretary", false, None, 74.0),
+        ]);
+
+        promote_repeated_body_size_bold_headings(&mut numbered_section_pages, Some(12.0));
+
+        assert_eq!(
+            numbered_section_pages
+                .iter()
+                .skip(1)
+                .take(3)
+                .filter(|page| page[0].heading_level == Some(3))
+                .count(),
+            3,
+            "explicitly numbered centered sections must not depend on body alignment"
+        );
+        assert_eq!(
+            numbered_section_pages[4][0].heading_level, None,
+            "bare Roman-prefix prose must not bypass attribution alignment"
+        );
+        assert_eq!(
+            numbered_section_pages[5][0].heading_level, None,
+            "present but non-finite geometry must fail closed"
+        );
+        assert_eq!(
+            numbered_section_pages.last().and_then(|page| page[0].heading_level),
+            None,
+            "an attribution followed only by a short role label must remain a paragraph"
+        );
+    }
+
+    #[test]
+    fn should_not_promote_same_row_presenter_labels_as_repeated_body_size_headings() {
+        let mut pages = vec![vec![body_size_paragraph_with_bbox(
+            "Existing document title",
+            true,
+            Some(1),
+            (74.0, 740.0, 274.0, 752.0),
+        )]];
+        pages.extend((0..3).map(|index| {
+            vec![
+                body_size_paragraph_with_bbox(
+                    &format!("Presenter Role Label {index}"),
+                    true,
+                    None,
+                    (74.0, 700.0, 190.0, 712.0),
+                ),
+                body_size_paragraph_with_bbox(
+                    &format!("Named participant {index} and their professional affiliation"),
+                    false,
+                    None,
+                    (210.0, 700.0, 430.0, 712.0),
+                ),
+            ]
+        }));
+        pages.extend((0..3).map(|index| {
+            vec![
+                body_size_paragraph_with_bbox(
+                    &format!("Genuine repeated section heading {index}"),
+                    true,
+                    None,
+                    (74.0, 700.0, 300.0, 712.0),
+                ),
+                body_size_paragraph_with_bbox(
+                    &format!("Section {index} opens a substantive ordinary body paragraph."),
+                    false,
+                    None,
+                    (74.0, 660.0, 430.0, 690.0),
+                ),
+            ]
+        }));
+
+        assert_eq!(
+            pages
+                .iter()
+                .skip(1)
+                .filter(|page| is_body_size_bold_heading_candidate(&page[0], 12.0))
+                .count(),
+            6,
+            "all controls must reach the repeated body-size heading promotion predicate"
+        );
+        assert_eq!(
+            pages
+                .iter()
+                .skip(1)
+                .take(3)
+                .filter(|page| page[0]
+                    .block_bbox
+                    .zip(page[1].block_bbox)
+                    .is_some_and(|(candidate, following)| { candidate.1 < following.3 && following.1 < candidate.3 }))
+                .count(),
+            MIN_BODY_SIZE_BOLD_SIGNALS,
+            "the negative controls must overlap vertically and meet the document-wide promotion threshold"
+        );
+
+        promote_repeated_body_size_bold_headings(&mut pages, Some(12.0));
+
+        assert_eq!(
+            pages
+                .iter()
+                .skip(1)
+                .take(3)
+                .filter(|page| page[0].heading_level == Some(3))
+                .count(),
+            0,
+            "same-row presenter labels must remain subordinate text"
+        );
+        assert_eq!(
+            pages
+                .iter()
+                .skip(4)
+                .filter(|page| page[0].heading_level == Some(3))
+                .count(),
+            3,
+            "vertically ordered headings must retain repeated body-size promotion"
+        );
+    }
+
+    #[test]
+    fn should_preserve_structural_headings_and_reject_same_row_table_cells() {
+        let mut pages = vec![vec![body_size_paragraph_with_bbox(
+            "Existing document title",
+            true,
+            Some(1),
+            (74.0, 740.0, 274.0, 752.0),
+        )]];
+        for heading in [
+            "3. NUMBERED SECTION HEADING",
+            "IV. ROMAN SECTION HEADING",
+            "ARTICLE I GENERAL PROVISIONS",
+            "PART IV ADMINISTRATIVE RULES",
+            "Policy Administration and Review",
+        ] {
+            pages.push(vec![
+                body_size_paragraph_with_bbox(heading, true, None, (74.0, 700.0, 300.0, 714.0)),
+                body_size_paragraph_with_bbox(
+                    "The outdented heading opens this substantive ordinary body paragraph.",
+                    false,
+                    None,
+                    (110.0, 680.0, 430.0, 702.0),
+                ),
+            ]);
+        }
+        pages.push(vec![
+            body_size_paragraph_with_bbox(
+                "Policy Heading With Inverted Bounds",
+                true,
+                None,
+                (300.0, 700.0, 74.0, 714.0),
+            ),
+            body_size_paragraph_with_bbox(
+                "The normalized outdented heading opens this ordinary body paragraph.",
+                false,
+                None,
+                (110.0, 680.0, 430.0, 702.0),
+            ),
+        ]);
+        pages.push(vec![
+            body_size_paragraph_with_bbox("1. TABLE CELL LABEL", true, None, (74.0, 600.0, 190.0, 612.0)),
+            body_size_paragraph_with_bbox(
+                "Adjacent table value with enough words",
+                false,
+                None,
+                (210.0, 600.0, 430.0, 612.0),
+            ),
+        ]);
+        let mut invalid_candidate =
+            body_size_paragraph_with_bbox("2. INVALID CANDIDATE GEOMETRY", true, None, (74.0, 560.0, 190.0, 572.0));
+        invalid_candidate.block_bbox = Some((f32::NAN, 560.0, 190.0, 572.0));
+        pages.push(vec![
+            invalid_candidate,
+            body_size_paragraph_with_bbox(
+                "A valid adjacent value must not excuse invalid candidate geometry.",
+                false,
+                None,
+                (210.0, 560.0, 430.0, 572.0),
+            ),
+        ]);
+        let mut invalid_following = body_size_paragraph_with_bbox(
+            "An invalid adjacent value must not excuse valid candidate geometry.",
+            false,
+            None,
+            (210.0, 520.0, 430.0, 532.0),
+        );
+        invalid_following.block_bbox = Some((210.0, 520.0, f32::INFINITY, 532.0));
+        pages.push(vec![
+            body_size_paragraph_with_bbox("3. INVALID FOLLOWING GEOMETRY", true, None, (74.0, 520.0, 190.0, 532.0)),
+            invalid_following,
+        ]);
+
+        promote_repeated_body_size_bold_headings(&mut pages, Some(12.0));
+
+        for page in pages.iter().skip(1).take(6) {
+            assert_eq!(
+                page[0].heading_level,
+                Some(3),
+                "a vertically ordered, outdented structural heading must survive slight bbox overlap: {:?}",
+                paragraph_text_raw(&page[0])
+            );
+        }
+        assert_eq!(
+            pages[7][0].heading_level, None,
+            "an explicitly numbered table cell must not bypass the same-row guard"
+        );
+        assert_eq!(
+            (pages[8][0].heading_level, pages[9][0].heading_level),
+            (None, None),
+            "explicit numbering must not turn non-finite candidate or following geometry into a heading exemption"
+        );
+    }
+
+    #[test]
+    fn should_reject_non_finite_geometry_when_the_other_bbox_is_missing() {
+        let mut missing_candidate_pages = vec![vec![body_size_paragraph_at(
+            "Existing document title",
+            true,
+            Some(1),
+            74.0,
+        )]];
+        missing_candidate_pages.extend((0..MIN_BODY_SIZE_BOLD_SIGNALS).map(|index| {
+            let mut following = body_size_paragraph_at(
+                &format!("Following ordinary body content {index} has invalid geometry."),
+                false,
+                None,
+                74.0,
+            );
+            following.block_bbox = Some((74.0, f32::NAN, 274.0, 12.0));
+            vec![
+                body_size_paragraph(
+                    &format!("Candidate without geometry {index} opens body content"),
+                    true,
+                    None,
+                ),
+                following,
+            ]
+        }));
+
+        assert_eq!(
+            missing_candidate_pages
+                .iter()
+                .skip(1)
+                .filter(|page| is_body_size_bold_heading_candidate(&page[0], 12.0))
+                .count(),
+            MIN_BODY_SIZE_BOLD_SIGNALS,
+            "candidate-missing controls must reach the document-wide promotion threshold"
+        );
+        promote_repeated_body_size_bold_headings(&mut missing_candidate_pages, Some(12.0));
+
+        let mut missing_following_pages = vec![vec![body_size_paragraph_at(
+            "Existing document title",
+            true,
+            Some(1),
+            74.0,
+        )]];
+        missing_following_pages.extend((0..MIN_BODY_SIZE_BOLD_SIGNALS).map(|index| {
+            let mut candidate = body_size_paragraph_at(
+                &format!("Candidate with invalid geometry {index} opens body content"),
+                true,
+                None,
+                74.0,
+            );
+            candidate.block_bbox = Some((f32::INFINITY, 0.0, 274.0, 12.0));
+            vec![
+                candidate,
+                body_size_paragraph(
+                    &format!("Following ordinary body content {index} lacks geometry."),
+                    false,
+                    None,
+                ),
+            ]
+        }));
+
+        assert_eq!(
+            missing_following_pages
+                .iter()
+                .skip(1)
+                .filter(|page| is_body_size_bold_heading_candidate(&page[0], 12.0))
+                .count(),
+            MIN_BODY_SIZE_BOLD_SIGNALS,
+            "following-missing controls must reach the document-wide promotion threshold"
+        );
+        promote_repeated_body_size_bold_headings(&mut missing_following_pages, Some(12.0));
+
+        let promoted_with_non_finite_following = missing_candidate_pages
+            .iter()
+            .skip(1)
+            .filter(|page| page[0].heading_level == Some(3))
+            .count();
+        let promoted_with_non_finite_candidate = missing_following_pages
+            .iter()
+            .skip(1)
+            .filter(|page| page[0].heading_level == Some(3))
+            .count();
+        assert_eq!(
+            (promoted_with_non_finite_following, promoted_with_non_finite_candidate),
+            (0, 0),
+            "a present non-finite bbox must fail closed regardless of which side lacks geometry"
+        );
+    }
+
+    #[test]
+    fn should_not_promote_fewer_than_three_body_size_bold_sections() {
+        let candidates = ["First repeated body size section", "Second repeated body size section"];
+        for candidate_count in 1..=2 {
+            let mut pages: Vec<Vec<SegmentData>> = candidates[..candidate_count]
+                .iter()
+                .enumerate()
+                .map(|(index, candidate)| {
+                    heading_page(
+                        candidate,
+                        12.0,
+                        &format!("Ordinary body paragraph number {} ends here.", index + 1),
+                    )
+                })
+                .collect();
+            pages.extend((0..3).map(|index| {
+                vec![seg_heuristic(
+                    &format!("Filler paragraph number {} ends here.", index + 1),
+                    12.0,
+                    700.0,
+                )]
+            }));
+            let document = extract_heading_test_document(pages, false);
+
+            for candidate in &candidates[..candidate_count] {
+                assert_eq!(
+                    element_kind_for(&document, candidate),
+                    Some(crate::types::internal::ElementKind::Paragraph),
+                    "one or two body-size bold occurrences are emphasis, not a document convention"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn should_require_body_size_candidates_to_outnumber_other_headings_two_to_one() {
+        let document = extract_heading_test_document(
+            vec![
+                heading_page(
+                    "First existing larger heading",
+                    18.0,
+                    "The first ordinary body paragraph ends here.",
+                ),
+                heading_page(
+                    "Second existing larger heading",
+                    18.0,
+                    "The second ordinary body paragraph ends here.",
+                ),
+                heading_page(
+                    "First body size candidate section",
+                    12.0,
+                    "The third ordinary body paragraph ends here.",
+                ),
+                heading_page(
+                    "Second body size candidate section",
+                    12.0,
+                    "The fourth ordinary body paragraph ends here.",
+                ),
+                heading_page(
+                    "Third body size candidate section",
+                    12.0,
+                    "The fifth ordinary body paragraph ends here.",
+                ),
+            ],
+            false,
+        );
+
+        for heading in ["First existing larger heading", "Second existing larger heading"] {
+            assert!(matches!(
+                element_kind_for(&document, heading),
+                Some(crate::types::internal::ElementKind::Heading { .. })
+            ));
+        }
+        for candidate in [
+            "First body size candidate section",
+            "Second body size candidate section",
+            "Third body size candidate section",
+        ] {
+            assert_eq!(
+                element_kind_for(&document, candidate),
+                Some(crate::types::internal::ElementKind::Paragraph),
+                "three candidates are not more than twice two independently detected headings"
+            );
+        }
+    }
+
     /// Fallback title detection: 5-paragraph doc where first segment is 14pt,
     /// others are 11pt. Ratio 14/11 ≈ 1.27 ≥ 1.2 — fallback must fire only when
     /// k-means would fail to assign a heading.  This exercises the same fixture as
@@ -9634,6 +11028,7 @@ where new shares are issued;";
             },
             &[],
             None,
+            &TextRepairWitnesses::default(),
         );
         assert_eq!(
             output.len(),
@@ -9689,6 +11084,7 @@ where new shares are issued;";
             },
             &[],
             None,
+            &TextRepairWitnesses::default(),
         );
         assert_eq!(
             output.len(),

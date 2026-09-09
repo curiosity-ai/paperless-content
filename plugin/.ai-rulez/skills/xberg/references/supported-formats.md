@@ -1,6 +1,6 @@
 # Supported Formats Reference
 
-Xberg supports 100 formats across 120 file extensions. The tables below summarize the current extension families; `xberg formats` and the [generated format reference](https://docs.xberg.io/reference/formats/) are authoritative for individual MIME mappings and feature-gated availability.
+Xberg supports 107 formats across 140 unique file extensions and accepts 53 compatibility MIME aliases. The tables below summarize the current extension families; `xberg formats` and the [generated format reference](https://docs.xberg.io/reference/formats/) are authoritative for individual MIME mappings and feature-gated availability.
 
 ## Office Documents
 
@@ -35,7 +35,7 @@ Xberg supports 100 formats across 120 file extensions. The tables below summariz
 | Format                  | Extensions               | MIME Type                                                                   | Capabilities                                         |
 | ----------------------- | ------------------------ | --------------------------------------------------------------------------- | ---------------------------------------------------- |
 | PowerPoint Presentation | `.pptx`, `.pptm`         | OOXML presentation MIME types                                             | Slide text, speaker notes, embedded images, metadata |
-| PowerPoint Legacy       | `.ppt`                   | `application/vnd.ms-powerpoint`                                             | Legacy slide text extraction, metadata               |
+| PowerPoint Legacy       | `.ppt`, `.pps`           | `application/vnd.ms-powerpoint`                                             | Legacy slide text extraction, metadata               |
 | PowerPoint Slideshow    | `.ppsx`                  | `application/vnd.openxmlformats-officedocument.presentationml.slideshow`    | Slideshow content, speaker notes, metadata           |
 | PowerPoint Template     | `.potx`, `.potm`, `.pot` | Various PowerPoint template MIME types                                      | Template slide extraction, metadata                  |
 | OpenDocument Presentation | `.odp`                 | `application/vnd.oasis.opendocument.presentation`                           | Slides, notes, images, and metadata                   |
@@ -58,7 +58,9 @@ Xberg supports 100 formats across 120 file extensions. The tables below summariz
 
 | Format | Extensions | MIME Type           | Capabilities                                          |
 | ------ | ---------- | ------------------- | ----------------------------------------------------- |
-| dBASE  | `.dbf`     | `application/x-dbf` | Table data extraction as markdown, field type support |
+| dBASE  | `.dbf`     | `application/vnd.dbf` | Table data extraction as markdown, field type support |
+| SQLite | `.sqlite`, `.sqlite3`, `.db` | `application/vnd.sqlite3` | Bounded table extraction and schema metadata |
+| GeoPackage | `.gpkg`, `.gpkx` | `application/geopackage+sqlite3` | SQLite table extraction with application-ID detection |
 
 ### Hangul
 
@@ -78,16 +80,14 @@ Xberg supports 100 formats across 120 file extensions. The tables below summariz
 | WebP   | `.webp`         | `image/webp` | OCR text extraction, metadata, lossy/lossless detection                      |
 | Bitmap | `.bmp`          | `image/bmp`  | OCR text extraction, dimensions, color depth                                 |
 | TIFF   | `.tiff`, `.tif` | `image/tiff` | OCR text extraction, multi-page support, EXIF metadata, compression info     |
-| HEIC family | `.heic`, `.heics`, `.heif`, `.avif`, `.avcs` | HEIF/AVIF MIME types | Metadata extraction and optional pixel decoding |
+| HEIC family | `.heic`, `.heics`, `.heif`, `.heifs`, `.hif`, `.avif`, `.avcs` | HEIF/AVIF MIME types | Metadata extraction and optional pixel decoding |
 
 ### Advanced Image Formats
 
 | Format             | Extensions                     | MIME Type                 | Capabilities                                                                     |
 | ------------------ | ------------------------------ | ------------------------- | -------------------------------------------------------------------------------- |
-| JPEG 2000          | `.jp2`                         | `image/jp2`               | OCR via pure Rust decoder (hayro-jpeg2000), table detection, resolution metadata |
-| JPEG 2000 Extended | `.jpx`                         | `image/jpx`               | Advanced JPEG 2000 features, high-resolution content, metadata                   |
-| JPEG 2000 Compound | `.jpm`                         | `image/jpm`               | Compound image support, mixed content                                            |
-| Motion JPEG 2000   | `.mj2`                         | `image/mj2`               | JPEG 2000 video/sequence metadata                                                |
+| JPEG 2000 container | `.jp2`, `.jpg2`               | `image/jp2`               | OCR via pure Rust decoder (hayro-jpeg2000), table detection, resolution metadata |
+| JPEG 2000 codestream | `.j2c`, `.j2k`, `.jpc`        | `image/j2c`               | OCR for raw JPEG 2000 codestreams                                                |
 | JBIG2              | `.jbig2`, `.jb2`               | `image/x-jbig2`           | Bi-level image OCR, high compression, technical documents                        |
 | Portable PixMap    | `.pnm`, `.pbm`, `.pgm`, `.ppm` | `.pnm`=`image/x-portable-anymap`, `.pbm`=`image/x-portable-bitmap`, `.pgm`=`image/x-portable-graymap`, `.ppm`=`image/x-portable-pixmap` | OCR for plain image formats, raw pixel data                                      |
 
@@ -103,15 +103,19 @@ Xberg supports 100 formats across 120 file extensions. The tables below summariz
 
 | Format           | Extensions      | MIME Type               | Capabilities                                                                       |
 | ---------------- | --------------- | ----------------------- | ---------------------------------------------------------------------------------- |
-| HyperText Markup | `.html`, `.htm` | `text/html` (alias `application/xhtml+xml`) | DOM parsing, text extraction, metadata (Open Graph, Twitter Card), link extraction |
+| HyperText Markup | `.html`, `.htm` | `text/html` | DOM parsing, text extraction, metadata (Open Graph, Twitter Card), link extraction |
+| XHTML | `.xhtml`, `.xht` | `application/xhtml+xml` | XML-serialized HTML extraction and metadata |
 | XML              | `.xml`          | `application/xml`       | DOM parsing, namespace handling, text extraction, structure analysis               |
+| KML              | `.kml`          | `application/vnd.google-earth.kml+xml` | Geographic features through structural XML extraction                |
 
 ### Structured Data Formats
 
 | Format | Extensions      | MIME Type                   | Capabilities                                               |
 | ------ | --------------- | --------------------------- | ---------------------------------------------------------- |
 | JSON   | `.json`         | `application/json`          | Schema detection, nested structure parsing, validation     |
-| YAML   | `.yaml`, `.yml` | `application/x-yaml`        | Hierarchical data parsing, custom tags, nested structures  |
+| GeoJSON | `.geojson`     | `application/geo+json`      | Geographic objects and coordinates through structured JSON extraction |
+| JSON Lines | `.jsonl`, `.ndjson` | `application/x-ndjson` | Newline-delimited JSON record extraction          |
+| YAML   | `.yaml`, `.yml` | `application/yaml`          | Hierarchical data parsing, custom tags, nested structures  |
 | TOML   | `.toml`         | `application/toml`          | Configuration parsing, table structures, type preservation |
 | CSV    | `.csv`          | `text/csv`                  | Delimiter detection, header inference, type detection      |
 | TSV    | `.tsv`          | `text/tab-separated-values` | Tab-separated value parsing, header detection              |
@@ -121,9 +125,15 @@ Xberg supports 100 formats across 120 file extensions. The tables below summariz
 | Format           | Extensions         | MIME Type         | Capabilities                                      |
 | ---------------- | ------------------ | ----------------- | ------------------------------------------------- |
 | Plain Text       | `.txt`             | `text/plain`      | Raw text extraction, encoding detection           |
+| AsciiDoc         | `.adoc`, `.asciidoc` | `text/asciidoc` | AsciiDoc structure and text extraction             |
+| WebVTT           | `.vtt`             | `text/vtt`        | Timed cue and transcript extraction                |
 | Markdown         | `.md`, `.markdown` | `text/markdown`   | CommonMark parsing, GFM extensions, front matter  |
-| Djot             | `.djot`            | `text/djot`       | Djot format parsing, semantic structure           |
-| reStructuredText | `.rst`             | `text/x-rst`      | RST parsing, directive handling, role extraction  |
+| CommonMark       | `.commonmark`      | `text/x-commonmark` | Standard CommonMark parsing                      |
+| Quarto           | `.qmd`             | `text/x-quarto`   | Quarto Markdown extraction                          |
+| R Markdown       | `.rmd`             | `text/x-r-markdown` | R Markdown extraction                            |
+| Djot             | `.djot`, `.dj`     | `text/x-djot`     | Djot format parsing, semantic structure           |
+| Docling DocTags  | `.doctags`         | `text/vnd.docling.doctags` | DocTags representation extraction          |
+| reStructuredText | `.rst`             | `text/prs.fallenstein.rst` | RST parsing, directive handling, role extraction  |
 | Org Mode         | `.org`             | `text/org`        | Org mode structure, outline parsing, metadata     |
 | Rich Text Format | `.rtf`             | `application/rtf` | Text with formatting extraction, font information |
 | MDX              | `.mdx`             | `text/mdx`        | Markdown and embedded JSX content                  |
@@ -133,7 +143,9 @@ Xberg supports 100 formats across 120 file extensions. The tables below summariz
 | Category | Extensions | Capabilities |
 | -------- | ---------- | ------------ |
 | Audio | `.mp3`, `.mpga`, `.m4a`, `.wav`, `.webm` | Whisper transcription |
-| Video audio track | `.mp4`, `.mpeg`, `.webm` | Audio-track transcription |
+| MP4 audio track | `.mp4`, `.mpg4`, `.mp4v`, `.m4v` | Audio-track transcription |
+| MPEG audio track | `.mpeg`, `.mpg`, `.mpe`, `.m1v`, `.m2v` | Audio-track transcription |
+| WebM audio track | `.webm` | Audio-track transcription |
 
 ## Email & Archives
 
@@ -173,8 +185,8 @@ Xberg supports 100 formats across 120 file extensions. The tables below summariz
 | Format           | Extensions       | MIME Type                  | Capabilities                                                |
 | ---------------- | ---------------- | -------------------------- | ----------------------------------------------------------- |
 | LaTeX            | `.tex`, `.latex` | `application/x-latex`      | LaTeX source parsing, commands, document structure          |
-| Typst            | `.typ`, `.typst` | `application/x-typst`      | Typst markup parsing, document structure                    |
-| JATS XML         | `.jats`          | `application/x-jats+xml`   | PubMed JATS parsing, article structure, metadata            |
+| Typst            | `.typ`, `.typst` | `text/vnd.typst`           | Typst markup parsing, document structure                    |
+| JATS XML         | `.jats`, `.nxml` | `application/x-jats+xml`   | PubMed JATS parsing, article structure, metadata            |
 | Jupyter Notebook | `.ipynb`         | `application/x-ipynb+json` | Cell extraction (code + markdown), output parsing, metadata |
 | DocBook          | `.docbook`, `.dbk`, `.docbook4`, `.docbook5` | `application/docbook+xml` | DocBook XML parsing, semantic structure |
 
@@ -182,10 +194,7 @@ Xberg supports 100 formats across 120 file extensions. The tables below summariz
 
 | Format      | Extensions | MIME Type                | Capabilities                                    |
 | ----------- | ---------- | ------------------------ | ----------------------------------------------- |
-| OPML        | `.opml`    | `application/x-opml+xml` | Outline parsing, hierarchy extraction, metadata |
-| Perl POD    | —          | `text/x-pod`             | Perl documentation parsing, section extraction  |
-| Manual Page | —          | `text/x-mdoc`            | UNIX manual page parsing, section structure     |
-| Troff/Groff | —          | `text/troff`             | Typesetting markup parsing, document structure  |
+| OPML        | `.opml`    | `application/xml+opml`   | Outline parsing, hierarchy extraction, metadata |
 
 ## Format Capabilities Summary
 

@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 /// model = "tiny"
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TranscriptionConfig {
     /// Master switch. When `false`, the transcription pipeline is not run.
     ///

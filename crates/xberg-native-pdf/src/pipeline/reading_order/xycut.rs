@@ -22,6 +22,11 @@
 //! Typical newspaper page: ~100 spans, < 5ms processing time
 //! Recursive depth: O(log n) for balanced columns
 
+// TODO(xberg-io/xberg#1567): 4 cyclomatic-complexity and 13 size/complexity findings
+// in this file, currently excluded via the quality-debt baseline in alef.toml. Splitting
+// these needs compiler-in-the-loop verification, not a mechanical pass. Delete this
+// note and the file's baseline entry together once it goes green. Help wanted.
+
 use super::{ReadingOrderContext, ReadingOrderStrategy};
 use crate::error::Result;
 use crate::geometry::Rect;
@@ -2348,7 +2353,7 @@ mod tests {
     /// whole block as ONE group so the title line stays intact.
     #[test]
     fn test_issue1_centered_title_block_not_split_into_columns() {
-        let strat = XYCutStrategy::new();
+        let strategy = XYCutStrategy::new();
         // Centered title (y=612, fs=28), subtitle (y=572), byline (y=532).
         // Leftmost edges scattered: 145 / 185 / 210 (centered, not columnar). ~keep
         let spans = vec![
@@ -2361,7 +2366,7 @@ mod tests {
             make_span_text(210.0, 532.0, 45.0, 10.0, "Northwind", 10.0),
             make_span_text(290.0, 532.0, 34.0, 10.0, "Traders", 10.0),
         ];
-        let groups = strat.partition_region(&spans);
+        let groups = strategy.partition_region(&spans);
         assert_eq!(
             groups.len(),
             1,

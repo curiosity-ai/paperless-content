@@ -11,6 +11,9 @@ use crate::fonts::TrueTypeCMap;
 use crate::fonts::cmap::LazyCMap;
 use crate::layout::text_block::FontWeight;
 use crate::object::Object;
+use skrifa::instance::{LocationRef, Size};
+use skrifa::metrics::{GlyphMetrics, Metrics};
+use skrifa::{FontRef, GlyphId, MetadataProvider};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -371,8 +374,13 @@ impl FontInfo {
                         Some(cmap)
                     }
                     Ok(_) => None,
-                    Err(e) => {
-                        tracing::warn!("Font '{}': TrueType cmap extraction failed: {}", self.base_font, e);
+                    Err(_) => {
+                        tracing::warn!(
+                            target: crate::LOG_TARGET_ROOT,
+                            operation = "extract_truetype_cmap",
+                            error_code = "invalid_font_data",
+                            "using fallback font encoding"
+                        );
                         None
                     }
                 }
@@ -604,7 +612,12 @@ impl FontInfo {
                 "Font '{}' is Type 3 - may require special glyph name mapping",
                 base_font
             );
-            tracing::warn!("{}", msg);
+            tracing::warn!(
+                target: crate::LOG_TARGET_ROOT,
+                operation = "load_font",
+                error_code = "type3_font",
+                "using Type 3 glyph-name fallback"
+            );
             // push into the structured warning
             // sink. PDF Spec §9.6.4 "Type 3 Fonts" describes the
             // user-defined CharProcs glyph-program model; the
@@ -655,218 +668,12 @@ impl FontInfo {
             raw_ascent,
             raw_descent,
             mut has_font_program,
-        ) = if let Some(descriptor_ref) = font_dict.get("FontDescriptor").and_then(|obj| obj.as_reference()) {
-            match doc.load_object(descriptor_ref) {
-                Ok(descriptor_obj) => {
-                    if let Some(descriptor_dict) = descriptor_obj.as_dict() {
-                        let weight = descriptor_dict
-                            .get("FontWeight")
-                            .and_then(|weight_obj| weight_obj.as_integer())
-                            .map(|w| w as i32);
-
-                        let descriptor_flags = descriptor_dict
-                            .get("Flags")
-                            .and_then(|flags_obj| flags_obj.as_integer())
-                            .map(|f| f as i32);
-
-                        let stem_v_value = descriptor_dict.get("StemV").and_then(|sv_obj| {
-                            sv_obj
-                                .as_real()
-                                .map(|r| r as f32)
-                                .or_else(|| sv_obj.as_integer().map(|i| i as f32))
-                        });
-
-                        let ascent_value = descriptor_dict.get("Ascent").and_then(|obj| {
-                            obj.as_real()
-                                .map(|r| r as f32)
-                                .or_else(|| obj.as_integer().map(|i| i as f32))
-                        });
-
-                        let descent_value = descriptor_dict.get("Descent").and_then(|obj| {
-                            obj.as_real()
-                                .map(|r| r as f32)
-                                .or_else(|| obj.as_integer().map(|i| i as f32))
-                        });
-
-                        // Load embedded font data from FontFile2 (TrueType), FontFile (Type 1), or FontFile3 (CFF/OpenType)
-                        // IMPORTANT: Track whether font is TrueType or CFF - only TrueType fonts have cmaps!
-                        // ~keep
-                        //
-                        // Key presence is recorded separately from extraction
-                        // success: a present-but-undecodable font program means
-                        // the document intended to be self-contained, which
-                        // downstream gates (CJK predefined-CIDFont substitution)
-                        // must distinguish from "no program at all". ~keep
-                        let has_font_program = descriptor_dict.contains_key("FontFile2")
-                            || descriptor_dict.contains_key("FontFile3")
-                            || descriptor_dict.contains_key("FontFile");
-                        let (embedded_font, is_truetype_font) = if let Some(ff2_obj) = descriptor_dict.get("FontFile2")
-                        {
-                            tracing::debug!("Font '{}' has FontFile2 entry (TrueType)", base_font);
-                            let font_data = ff2_obj
-                                .as_reference()
-                                .and_then(|ff2_ref| {
-                                    doc.load_object(ff2_ref)
-                                        .inspect_err(|e| {
-                                            tracing::warn!(
-                                                "Font '{}': failed to load FontFile2 object {}: {}",
-                                                base_font,
-                                                ff2_ref,
-                                                e
-                                            )
-                                        })
-                                        .ok()
-                                        .map(|obj| (obj, ff2_ref))
-                                })
-                                .and_then(|(ff2_stream, ff2_ref)| {
-                                    doc.decode_stream_with_encryption(&ff2_stream, ff2_ref)
-                                        .inspect_err(|e| {
-                                            tracing::warn!(
-                                                "Font '{}': failed to decode FontFile2 stream {}: {}",
-                                                base_font,
-                                                ff2_ref,
-                                                e
-                                            )
-                                        })
-                                        .ok()
-                                })
-                                .map(|data| {
-                                    tracing::debug!(
-                                        "Font '{}' loaded embedded TrueType font ({} bytes)",
-                                        base_font,
-                                        data.len()
-                                    );
-                                    Arc::new(data)
-                                });
-                            (font_data, true)
-                        } else if let Some(ff3_obj) = descriptor_dict.get("FontFile3") {
-                            tracing::debug!(
-                                "Font '{}' has FontFile3 entry (CFF/OpenType - no TrueType cmap)",
-                                base_font
-                            );
-                            let font_data = ff3_obj
-                                .as_reference()
-                                .and_then(|ff3_ref| {
-                                    doc.load_object(ff3_ref)
-                                        .inspect_err(|e| {
-                                            tracing::warn!(
-                                                "Font '{}': failed to load FontFile3 object {}: {}",
-                                                base_font,
-                                                ff3_ref,
-                                                e
-                                            )
-                                        })
-                                        .ok()
-                                        .map(|obj| (obj, ff3_ref))
-                                })
-                                .and_then(|(ff3_stream, ff3_ref)| {
-                                    doc.decode_stream_with_encryption(&ff3_stream, ff3_ref)
-                                        .inspect_err(|e| {
-                                            tracing::warn!(
-                                                "Font '{}': failed to decode FontFile3 stream {}: {}",
-                                                base_font,
-                                                ff3_ref,
-                                                e
-                                            )
-                                        })
-                                        .ok()
-                                })
-                                .map(|data| {
-                                    let data = if !data.is_empty() && data[0] == 1 && data.len() > 4 {
-                                        tracing::debug!(
-                                            "Font '{}': Wrapping raw CFF in OpenType ({} bytes)",
-                                            base_font,
-                                            data.len()
-                                        );
-                                        wrap_cff_in_opentype(&data)
-                                    } else {
-                                        tracing::debug!(
-                                            "Font '{}' loaded embedded CFF/OpenType font ({} bytes)",
-                                            base_font,
-                                            data.len()
-                                        );
-                                        data
-                                    };
-                                    Arc::new(data)
-                                });
-                            (font_data, false)
-                        } else if let Some(ff_obj) = descriptor_dict.get("FontFile") {
-                            tracing::debug!("Font '{}' has FontFile entry (Type 1)", base_font);
-                            let font_data = ff_obj
-                                .as_reference()
-                                .and_then(|ff_ref| {
-                                    doc.load_object(ff_ref)
-                                        .inspect_err(|e| {
-                                            tracing::warn!(
-                                                "Font '{}': failed to load FontFile object {}: {}",
-                                                base_font,
-                                                ff_ref,
-                                                e
-                                            )
-                                        })
-                                        .ok()
-                                        .map(|obj| (obj, ff_ref))
-                                })
-                                .and_then(|(ff_stream, ff_ref)| {
-                                    doc.decode_stream_with_encryption(&ff_stream, ff_ref)
-                                        .inspect_err(|e| {
-                                            tracing::warn!(
-                                                "Font '{}': failed to decode FontFile stream {}: {}",
-                                                base_font,
-                                                ff_ref,
-                                                e
-                                            )
-                                        })
-                                        .ok()
-                                })
-                                .map(|data| {
-                                    tracing::debug!(
-                                        "Font '{}' loaded embedded Type 1 font ({} bytes)",
-                                        base_font,
-                                        data.len()
-                                    );
-                                    Arc::new(data)
-                                });
-                            (font_data, false)
-                        } else {
-                            tracing::debug!("Font '{}' has no embedded font data", base_font);
-                            (None, false)
-                        };
-
-                        (
-                            weight,
-                            descriptor_flags,
-                            stem_v_value,
-                            embedded_font,
-                            is_truetype_font,
-                            ascent_value,
-                            descent_value,
-                            has_font_program,
-                        )
-                    } else {
-                        (None, None, None, None, false, None, None, false)
-                    }
-                }
-                _ => (None, None, None, None, false, None, None, false),
-            }
-        } else {
-            (None, None, None, None, false, None, None, false)
-        };
+        ) = Self::resolve_descriptor_fields(font_dict, doc, &base_font);
 
         // TrueType cmap extraction is now LAZY — deferred until first access via
         // truetype_cmap() accessor. This saves 10-25ms per font when ToUnicode CMap
         // (Priority 1) resolves all characters, making the cmap unnecessary.
         // The is_truetype_font flag is recorded here for the lazy accessor to use. ~keep
-
-        let is_symbolic_font = |flags_opt: Option<i32>| -> bool {
-            if let Some(flags_value) = flags_opt {
-                const SYMBOLIC_BIT: i32 = 1 << 2;
-                (flags_value & SYMBOLIC_BIT) != 0
-            } else {
-                let name_lower = base_font.to_lowercase();
-                name_lower.contains("symbol") || name_lower.contains("zapf") || name_lower.contains("dingbat")
-            }
-        };
 
         // Parse encoding (now that we have flags)
         // PDF Spec: ISO 32000-1:2008, Section 9.6.6.1
@@ -888,130 +695,8 @@ impl FontInfo {
             None
         };
 
-        // Writing-mode signal sourced from the encoding object. Resolved
-        // here because the `Encoding` enum collapses `Identity-H` and
-        // `Identity-V` to the same `Encoding::Identity` variant — we need
-        // the original name to recover wmode. Defaults to `0` (horizontal)
-        // when no encoding object is present. ~keep
-        let mut encoding_wmode: u8 = 0;
-        let (encoding, diff_multi_char_map, diff_glyph_names) = if let Some(enc_obj) = font_dict.get("Encoding") {
-            let resolved_enc_obj = if let Some(obj_ref) = enc_obj.as_reference() {
-                doc.load_object(obj_ref)?
-            } else {
-                enc_obj.clone()
-            };
-
-            // Inspect for `-V` predefined name or embedded `/WMode 1 def`
-            // before parse_encoding flattens the variant. ~keep
-            let (_enc_name, wm) = Self::resolve_encoding_writing_mode(&resolved_enc_obj, doc);
-            encoding_wmode = wm;
-
-            if is_symbolic_font(flags) {
-                tracing::debug!(
-                    "Font '{}' is symbolic (Flags={:?}) but has /Encoding — parsing it anyway (common in LaTeX/LibreOffice PDFs)",
-                    base_font,
-                    flags
-                );
-            } else {
-                tracing::debug!("Font '{}' using /Encoding entry", base_font);
-            }
-            let (mut parsed_enc, mut multi_map, glyph_names) =
-                Self::parse_encoding(&resolved_enc_obj, doc, font_program_enc_cache.as_ref())?;
-
-            // When /Encoding is a named encoding (e.g., /WinAnsiEncoding) AND the font
-            // has an embedded program, merge the font program's encoding. This handles
-            // fonts where the program maps glyphs to non-standard code positions
-            // (e.g., space at 0xCA) that the named encoding maps differently.
-            // The font program's mappings override the standard encoding. ~keep
-            if matches!(parsed_enc, Encoding::Standard(_))
-                && let Some(prog_enc) = &font_program_enc_cache
-            {
-                let std_name = match &parsed_enc {
-                    Encoding::Standard(n) => n.clone(),
-                    _ => "StandardEncoding".to_string(),
-                };
-
-                // Decide whether the embedded program's built-in encoding is a
-                // meaningful text encoding (a few non-standard slots to overlay,
-                // e.g. space at 0xCA) or a re-indexed *cipher* — a subset font's
-                // own glyph ordering that bears no relation to the producer's
-                // declared named base encoding. Overlaying a cipher rewrites every
-                // mapped code into mojibake. Discriminate by agreement: count how
-                // many program codes resolve to the SAME character the named base
-                // already gives. A real encoding agrees on most; a cipher on
-                // almost none. ~keep
-                let looks_like_cipher = builtin_encoding_looks_like_cipher(prog_enc, &std_name);
-
-                if looks_like_cipher {
-                    tracing::debug!(
-                        "Font '{base_font}': built-in encoding disagrees with {std_name} on most overlapping codes — treating as a subset cipher and keeping the named encoding"
-                    );
-                } else {
-                    tracing::debug!(
-                        "Font '{}': merging {} font program encoding entries with {}",
-                        base_font,
-                        prog_enc.len(),
-                        std_name,
-                    );
-                    let mut custom_map: HashMap<u8, char> = HashMap::new();
-                    for code in 0u8..=255 {
-                        if let Some(unicode_str) = standard_encoding_lookup(&std_name, code)
-                            && let Some(ch) = unicode_str.chars().next()
-                        {
-                            custom_map.insert(code, ch);
-                        }
-                    }
-                    for (&code, &ch) in prog_enc {
-                        custom_map.insert(code, ch);
-                        if is_ligature_char(ch)
-                            && let Some(expanded) = expand_ligature_char(ch)
-                        {
-                            multi_map.insert(code, expanded.to_string());
-                        }
-                    }
-                    parsed_enc = Encoding::Custom(custom_map);
-                }
-            }
-
-            (parsed_enc, multi_map, glyph_names)
-        } else {
-            if let Some(prog_enc) = font_program_enc_cache {
-                tracing::debug!(
-                    "Font '{}' using built-in font program encoding ({} mappings)",
-                    base_font,
-                    prog_enc.len()
-                );
-                let mut multi_map: HashMap<u8, String> = HashMap::new();
-                for (&code, &ch) in &prog_enc {
-                    if is_ligature_char(ch)
-                        && let Some(expanded) = expand_ligature_char(ch)
-                    {
-                        multi_map.insert(code, expanded.to_string());
-                    }
-                }
-                (Encoding::Custom(prog_enc), multi_map, HashMap::new())
-            } else if is_symbolic_font(flags) {
-                tracing::debug!(
-                    "Font '{}' is symbolic with no /Encoding - will use built-in encoding (Symbol/ZapfDingbats)",
-                    base_font
-                );
-                (
-                    Encoding::Standard("SymbolicBuiltIn".to_string()),
-                    HashMap::new(),
-                    HashMap::new(),
-                )
-            } else {
-                tracing::debug!(
-                    "Font '{}' has no /Encoding entry - defaulting to StandardEncoding",
-                    base_font
-                );
-                (
-                    Encoding::Standard("StandardEncoding".to_string()),
-                    HashMap::new(),
-                    HashMap::new(),
-                )
-            }
-        };
+        let (encoding_wmode, encoding, diff_multi_char_map, diff_glyph_names) =
+            Self::resolve_encoding_fields(font_dict, doc, &base_font, flags, font_program_enc_cache)?;
 
         // Parse ToUnicode CMap if present (Phase 5.1: Lazy Loading)
         // The CMap stream is stored raw and parsed only on first character lookup ~keep
@@ -1019,23 +704,13 @@ impl FontInfo {
             let stream_opt = match doc.load_object(cmap_ref) {
                 Ok(cmap_obj) => match doc.decode_stream_with_encryption(&cmap_obj, cmap_ref) {
                     Ok(data) => Some(data),
-                    Err(e) => {
-                        tracing::warn!(
-                            "Font '{}': Failed to decrypt/decode ToUnicode CMap stream {:?}: {}",
-                            base_font,
-                            cmap_ref,
-                            e
-                        );
+                    Err(error) => {
+                        crate::error::trace_recovery("decode_tounicode_cmap", &error);
                         None
                     }
                 },
-                Err(e) => {
-                    tracing::warn!(
-                        "Font '{}': Failed to load ToUnicode CMap object {:?}: {}",
-                        base_font,
-                        cmap_ref,
-                        e
-                    );
+                Err(error) => {
+                    crate::error::trace_recovery("load_tounicode_cmap", &error);
                     None
                 }
             };
@@ -1056,7 +731,12 @@ impl FontInfo {
         } else {
             if subtype == "Type0" {
                 let msg = format!("Type0 font '{}' has no ToUnicode entry!", base_font);
-                tracing::warn!("{}", msg);
+                tracing::warn!(
+                    target: crate::LOG_TARGET_ROOT,
+                    operation = "load_font",
+                    error_code = "missing_tounicode",
+                    "using composite-font fallback mapping"
+                );
                 // push to the structured sink. PDF
                 // Spec §9.10.2 "ToUnicode CMaps" describes the
                 // mapping; absent ToUnicode triggers the fallback
@@ -1205,12 +885,8 @@ impl FontInfo {
                         dvmetrics,
                     )
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        "Font '{}': Failed to parse DescendantFonts: {}. Using Identity fallback.",
-                        base_font,
-                        e
-                    );
+                Err(error) => {
+                    crate::error::trace_recovery("parse_descendant_fonts", &error);
                     (
                         Some(CIDToGIDMap::Identity),
                         None,
@@ -1374,13 +1050,12 @@ impl FontInfo {
                 (Some(n), _) => Some(n),
                 (None, _) => None,
             };
-            if let Some(c) = collection {
+            if collection.is_some() {
                 tracing::warn!(
-                    "Font '{}': flagged for CJK predefined-CIDFont substitution \
-                     (collection {:?}); no embedded outlines, base name is an \
-                     Adobe predefined CIDFont per ISO 32000-2 §9.7.5.2",
-                    base_font,
-                    c
+                    target: crate::LOG_TARGET_ROOT,
+                    operation = "load_cid_font",
+                    error_code = "predefined_font_substitution",
+                    "using bundled predefined CID font"
                 );
             }
             collection
@@ -1388,17 +1063,17 @@ impl FontInfo {
             if subtype == "Type0" && super::predefined_cidfont::is_predefined(&base_font).is_some() {
                 if has_font_program && embedded_font_data.is_none() {
                     tracing::warn!(
-                        "Font '{}': /FontFile{{,2,3}} present but the font program \
-                         failed to load/decode (see warnings above); NOT substituting \
-                         the bundled CJK fallback — glyphs for this font will not render",
-                        base_font
+                        target: crate::LOG_TARGET_ROOT,
+                        operation = "load_cid_font",
+                        error_code = "embedded_font_unavailable",
+                        "skipping predefined CID font substitution"
                     );
                 } else if !has_font_program && !matches!(encoding, Encoding::Identity) {
                     tracing::warn!(
-                        "Font '{}': Adobe predefined CIDFont without embedded outlines, \
-                         but /Encoding is a non-Identity CMap — charcodes are not CIDs, \
-                         so CJK substitution is skipped",
-                        base_font
+                        target: crate::LOG_TARGET_ROOT,
+                        operation = "load_cid_font",
+                        error_code = "unsupported_predefined_encoding",
+                        "skipping predefined CID font substitution"
                     );
                 }
             }
@@ -1444,6 +1119,348 @@ impl FontInfo {
             cid_default_vertical_metrics,
             cjk_substitution,
         })
+    }
+
+    /// Resolves the FontDescriptor-derived fields used by [`Self::from_dict`]: font
+    /// weight, flags, StemV, the embedded font program (if any), whether that program
+    /// is TrueType, raw ascent/descent, and whether any font-file key is present at
+    /// all (even if its program failed to decode). Code moved verbatim out of
+    /// `from_dict`; every failure path (missing descriptor, unresolved reference,
+    /// load error, non-dictionary descriptor) returns the same all-default tuple the
+    /// inline version did. ~keep
+    fn resolve_descriptor_fields(
+        font_dict: &HashMap<String, Object>,
+        doc: &PdfDocument,
+        base_font: &str,
+    ) -> (
+        Option<i32>,
+        Option<i32>,
+        Option<f32>,
+        Option<Arc<Vec<u8>>>,
+        bool,
+        Option<f32>,
+        Option<f32>,
+        bool,
+    ) {
+        let defaults = (None, None, None, None, false, None, None, false);
+
+        let Some(descriptor_ref) = font_dict.get("FontDescriptor").and_then(|obj| obj.as_reference()) else {
+            return defaults;
+        };
+        let Ok(descriptor_obj) = doc.load_object(descriptor_ref) else {
+            return defaults;
+        };
+        let Some(descriptor_dict) = descriptor_obj.as_dict() else {
+            return defaults;
+        };
+
+        let weight = descriptor_dict
+            .get("FontWeight")
+            .and_then(|weight_obj| weight_obj.as_integer())
+            .map(|w| w as i32);
+
+        let descriptor_flags = descriptor_dict
+            .get("Flags")
+            .and_then(|flags_obj| flags_obj.as_integer())
+            .map(|f| f as i32);
+
+        let stem_v_value = descriptor_dict.get("StemV").and_then(|sv_obj| {
+            sv_obj
+                .as_real()
+                .map(|r| r as f32)
+                .or_else(|| sv_obj.as_integer().map(|i| i as f32))
+        });
+
+        let ascent_value = descriptor_dict.get("Ascent").and_then(|obj| {
+            obj.as_real()
+                .map(|r| r as f32)
+                .or_else(|| obj.as_integer().map(|i| i as f32))
+        });
+
+        let descent_value = descriptor_dict.get("Descent").and_then(|obj| {
+            obj.as_real()
+                .map(|r| r as f32)
+                .or_else(|| obj.as_integer().map(|i| i as f32))
+        });
+
+        // Load embedded font data from FontFile2 (TrueType), FontFile (Type 1), or FontFile3 (CFF/OpenType)
+        // IMPORTANT: Track whether font is TrueType or CFF - only TrueType fonts have cmaps!
+        // ~keep
+        //
+        // Key presence is recorded separately from extraction
+        // success: a present-but-undecodable font program means
+        // the document intended to be self-contained, which
+        // downstream gates (CJK predefined-CIDFont substitution)
+        // must distinguish from "no program at all". ~keep
+        let has_font_program = descriptor_dict.contains_key("FontFile2")
+            || descriptor_dict.contains_key("FontFile3")
+            || descriptor_dict.contains_key("FontFile");
+        let (embedded_font, is_truetype_font) = if let Some(ff2_obj) = descriptor_dict.get("FontFile2") {
+            tracing::debug!("Font '{}' has FontFile2 entry (TrueType)", base_font);
+            let font_data = ff2_obj
+                .as_reference()
+                .and_then(|ff2_ref| {
+                    doc.load_object(ff2_ref)
+                        .inspect_err(|error| {
+                            crate::error::trace_recovery("load_truetype_font_program", error);
+                        })
+                        .ok()
+                        .map(|obj| (obj, ff2_ref))
+                })
+                .and_then(|(ff2_stream, ff2_ref)| {
+                    doc.decode_stream_with_encryption(&ff2_stream, ff2_ref)
+                        .inspect_err(|error| {
+                            crate::error::trace_recovery("decode_truetype_font_program", error);
+                        })
+                        .ok()
+                })
+                .map(|data| {
+                    tracing::debug!(
+                        "Font '{}' loaded embedded TrueType font ({} bytes)",
+                        base_font,
+                        data.len()
+                    );
+                    Arc::new(data)
+                });
+            (font_data, true)
+        } else if let Some(ff3_obj) = descriptor_dict.get("FontFile3") {
+            tracing::debug!(
+                "Font '{}' has FontFile3 entry (CFF/OpenType - no TrueType cmap)",
+                base_font
+            );
+            let font_data = ff3_obj
+                .as_reference()
+                .and_then(|ff3_ref| {
+                    doc.load_object(ff3_ref)
+                        .inspect_err(|error| {
+                            crate::error::trace_recovery("load_cff_font_program", error);
+                        })
+                        .ok()
+                        .map(|obj| (obj, ff3_ref))
+                })
+                .and_then(|(ff3_stream, ff3_ref)| {
+                    doc.decode_stream_with_encryption(&ff3_stream, ff3_ref)
+                        .inspect_err(|error| {
+                            crate::error::trace_recovery("decode_cff_font_program", error);
+                        })
+                        .ok()
+                })
+                .map(|data| {
+                    let data = if !data.is_empty() && data[0] == 1 && data.len() > 4 {
+                        tracing::debug!(
+                            "Font '{}': Wrapping raw CFF in OpenType ({} bytes)",
+                            base_font,
+                            data.len()
+                        );
+                        wrap_cff_in_opentype(&data)
+                    } else {
+                        tracing::debug!(
+                            "Font '{}' loaded embedded CFF/OpenType font ({} bytes)",
+                            base_font,
+                            data.len()
+                        );
+                        data
+                    };
+                    Arc::new(data)
+                });
+            (font_data, false)
+        } else if let Some(ff_obj) = descriptor_dict.get("FontFile") {
+            tracing::debug!("Font '{}' has FontFile entry (Type 1)", base_font);
+            let font_data = ff_obj
+                .as_reference()
+                .and_then(|ff_ref| {
+                    doc.load_object(ff_ref)
+                        .inspect_err(|error| {
+                            crate::error::trace_recovery("load_type1_font_program", error);
+                        })
+                        .ok()
+                        .map(|obj| (obj, ff_ref))
+                })
+                .and_then(|(ff_stream, ff_ref)| {
+                    doc.decode_stream_with_encryption(&ff_stream, ff_ref)
+                        .inspect_err(|error| {
+                            crate::error::trace_recovery("decode_type1_font_program", error);
+                        })
+                        .ok()
+                })
+                .map(|data| {
+                    tracing::debug!(
+                        "Font '{}' loaded embedded Type 1 font ({} bytes)",
+                        base_font,
+                        data.len()
+                    );
+                    Arc::new(data)
+                });
+            (font_data, false)
+        } else {
+            tracing::debug!("Font '{}' has no embedded font data", base_font);
+            (None, false)
+        };
+
+        (
+            weight,
+            descriptor_flags,
+            stem_v_value,
+            embedded_font,
+            is_truetype_font,
+            ascent_value,
+            descent_value,
+            has_font_program,
+        )
+    }
+
+    /// Resolves the encoding-related fields used by [`Self::from_dict`]: the writing
+    /// mode, the [`Encoding`], and the two `/Differences`-derived side maps. Code moved
+    /// verbatim out of `from_dict`; `encoding_wmode` was previously mutated in place via
+    /// a captured local and is now returned instead — same value, same only-set-when-an-
+    /// `/Encoding` entry-is-present behavior. ~keep
+    fn resolve_encoding_fields(
+        font_dict: &HashMap<String, Object>,
+        doc: &PdfDocument,
+        base_font: &str,
+        flags: Option<i32>,
+        font_program_enc_cache: Option<HashMap<u8, char>>,
+    ) -> Result<(u8, Encoding, HashMap<u8, String>, HashMap<u8, String>)> {
+        fn is_symbolic_font(flags_opt: Option<i32>, base_font: &str) -> bool {
+            if let Some(flags_value) = flags_opt {
+                const SYMBOLIC_BIT: i32 = 1 << 2;
+                (flags_value & SYMBOLIC_BIT) != 0
+            } else {
+                let name_lower = base_font.to_lowercase();
+                name_lower.contains("symbol") || name_lower.contains("zapf") || name_lower.contains("dingbat")
+            }
+        }
+
+        // Writing-mode signal sourced from the encoding object. Resolved
+        // here because the `Encoding` enum collapses `Identity-H` and
+        // `Identity-V` to the same `Encoding::Identity` variant — we need
+        // the original name to recover wmode. Defaults to `0` (horizontal)
+        // when no encoding object is present. ~keep
+        let mut encoding_wmode: u8 = 0;
+        let (encoding, diff_multi_char_map, diff_glyph_names) = if let Some(enc_obj) = font_dict.get("Encoding") {
+            let resolved_enc_obj = if let Some(obj_ref) = enc_obj.as_reference() {
+                doc.load_object(obj_ref)?
+            } else {
+                enc_obj.clone()
+            };
+
+            // Inspect for `-V` predefined name or embedded `/WMode 1 def`
+            // before parse_encoding flattens the variant. ~keep
+            let (_enc_name, wm) = Self::resolve_encoding_writing_mode(&resolved_enc_obj, doc);
+            encoding_wmode = wm;
+
+            if is_symbolic_font(flags, base_font) {
+                tracing::debug!(
+                    "Font '{}' is symbolic (Flags={:?}) but has /Encoding — parsing it anyway (common in LaTeX/LibreOffice PDFs)",
+                    base_font,
+                    flags
+                );
+            } else {
+                tracing::debug!("Font '{}' using /Encoding entry", base_font);
+            }
+            let (mut parsed_enc, mut multi_map, glyph_names) =
+                Self::parse_encoding(&resolved_enc_obj, doc, font_program_enc_cache.as_ref())?;
+
+            // When /Encoding is a named encoding (e.g., /WinAnsiEncoding) AND the font
+            // has an embedded program, merge the font program's encoding. This handles
+            // fonts where the program maps glyphs to non-standard code positions
+            // (e.g., space at 0xCA) that the named encoding maps differently.
+            // The font program's mappings override the standard encoding. ~keep
+            if matches!(parsed_enc, Encoding::Standard(_))
+                && let Some(prog_enc) = &font_program_enc_cache
+            {
+                let std_name = match &parsed_enc {
+                    Encoding::Standard(n) => n.clone(),
+                    _ => "StandardEncoding".to_string(),
+                };
+
+                // Decide whether the embedded program's built-in encoding is a
+                // meaningful text encoding (a few non-standard slots to overlay,
+                // e.g. space at 0xCA) or a re-indexed *cipher* — a subset font's
+                // own glyph ordering that bears no relation to the producer's
+                // declared named base encoding. Overlaying a cipher rewrites every
+                // mapped code into mojibake. Discriminate by agreement: count how
+                // many program codes resolve to the SAME character the named base
+                // already gives. A real encoding agrees on most; a cipher on
+                // almost none. ~keep
+                let looks_like_cipher = builtin_encoding_looks_like_cipher(prog_enc, &std_name);
+
+                if looks_like_cipher {
+                    tracing::debug!(
+                        "Font '{base_font}': built-in encoding disagrees with {std_name} on most overlapping codes — treating as a subset cipher and keeping the named encoding"
+                    );
+                } else {
+                    tracing::debug!(
+                        "Font '{}': merging {} font program encoding entries with {}",
+                        base_font,
+                        prog_enc.len(),
+                        std_name,
+                    );
+                    let mut custom_map: HashMap<u8, char> = HashMap::new();
+                    for code in 0u8..=255 {
+                        let Some(unicode_str) = standard_encoding_lookup(&std_name, code) else {
+                            continue;
+                        };
+                        let Some(ch) = unicode_str.chars().next() else {
+                            continue;
+                        };
+                        custom_map.insert(code, ch);
+                    }
+                    for (&code, &ch) in prog_enc {
+                        custom_map.insert(code, ch);
+                        if !is_ligature_char(ch) {
+                            continue;
+                        }
+                        let Some(expanded) = expand_ligature_char(ch) else {
+                            continue;
+                        };
+                        multi_map.insert(code, expanded.to_string());
+                    }
+                    parsed_enc = Encoding::Custom(custom_map);
+                }
+            }
+
+            (parsed_enc, multi_map, glyph_names)
+        } else if let Some(prog_enc) = font_program_enc_cache {
+            tracing::debug!(
+                "Font '{}' using built-in font program encoding ({} mappings)",
+                base_font,
+                prog_enc.len()
+            );
+            let mut multi_map: HashMap<u8, String> = HashMap::new();
+            for (&code, &ch) in &prog_enc {
+                if !is_ligature_char(ch) {
+                    continue;
+                }
+                let Some(expanded) = expand_ligature_char(ch) else {
+                    continue;
+                };
+                multi_map.insert(code, expanded.to_string());
+            }
+            (Encoding::Custom(prog_enc), multi_map, HashMap::new())
+        } else if is_symbolic_font(flags, base_font) {
+            tracing::debug!(
+                "Font '{}' is symbolic with no /Encoding - will use built-in encoding (Symbol/ZapfDingbats)",
+                base_font
+            );
+            (
+                Encoding::Standard("SymbolicBuiltIn".to_string()),
+                HashMap::new(),
+                HashMap::new(),
+            )
+        } else {
+            tracing::debug!(
+                "Font '{}' has no /Encoding entry - defaulting to StandardEncoding",
+                base_font
+            );
+            (
+                Encoding::Standard("StandardEncoding".to_string()),
+                HashMap::new(),
+                HashMap::new(),
+            )
+        };
+
+        Ok((encoding_wmode, encoding, diff_multi_char_map, diff_glyph_names))
     }
 
     /// Parse encoding from an encoding object.
@@ -1558,9 +1575,11 @@ impl FontInfo {
         // Use first element (PDF spec: "Usually contains a single element") ~keep
         if array.len() > 1 {
             tracing::warn!(
-                "Font '{}': DescendantFonts array has {} elements, using first",
-                base_font,
-                array.len()
+                target: crate::LOG_TARGET_ROOT,
+                operation = "parse_descendant_fonts",
+                error_code = "extra_descendants",
+                descendant_count = array.len(),
+                "using first descendant font"
             );
         }
 
@@ -1589,9 +1608,10 @@ impl FontInfo {
                 // Inline-dict path — accept it per §9.7.6 lenient
                 // reader posture. ~keep
                 tracing::warn!(
-                    "Type0 font '{}': DescendantFonts[0] is a direct dictionary \
-                     (non-conformant per §9.7.6 but recoverable); parsing inline",
-                    base_font,
+                    target: crate::LOG_TARGET_ROOT,
+                    operation = "parse_descendant_fonts",
+                    error_code = "inline_descendant",
+                    "parsing inline descendant font"
                 );
                 array[0].as_dict().ok_or_else(|| Error::ParseError {
                     offset: 0,
@@ -1625,104 +1645,13 @@ impl FontInfo {
 
         let cid_system_info = match Self::parse_cidsysteminfo(cidfont_dict, doc) {
             Ok(info) => Some(info),
-            Err(e) => {
-                tracing::warn!(
-                    "Font '{}': Failed to parse CIDSystemInfo: {}. Continuing with None.",
-                    base_font,
-                    e
-                );
+            Err(error) => {
+                crate::error::trace_recovery("parse_cid_system_info", &error);
                 None
             }
         };
 
-        let cid_to_gid_map = if cid_font_type == "CIDFontType2" {
-            match cidfont_dict.get("CIDToGIDMap") {
-                None => {
-                    tracing::debug!(
-                        "Font '{}': CIDToGIDMap not specified, defaulting to Identity",
-                        base_font
-                    );
-                    Some(CIDToGIDMap::Identity)
-                }
-                Some(cidtogid_obj) => {
-                    if let Some(name) = cidtogid_obj.as_name() {
-                        if name == "Identity" {
-                            tracing::debug!("Font '{}': CIDToGIDMap is Identity", base_font);
-                            Some(CIDToGIDMap::Identity)
-                        } else {
-                            tracing::warn!(
-                                "Font '{}': Invalid CIDToGIDMap name '{}' (only 'Identity' is valid as name)",
-                                base_font,
-                                name
-                            );
-                            Some(CIDToGIDMap::Identity)
-                        }
-                    } else if let Some(stream_ref) = cidtogid_obj.as_reference() {
-                        match doc.load_object(stream_ref) {
-                            Ok(stream_obj) => match doc.decode_stream_with_encryption(&stream_obj, stream_ref) {
-                                Ok(stream_data) => {
-                                    if stream_data.len() % 2 != 0 {
-                                        tracing::warn!(
-                                            "Font '{}': CIDToGIDMap stream has odd length {} (must be even). Using Identity fallback.",
-                                            base_font,
-                                            stream_data.len()
-                                        );
-                                        Some(CIDToGIDMap::Identity)
-                                    } else if stream_data.is_empty() {
-                                        tracing::warn!(
-                                            "Font '{}': CIDToGIDMap stream is empty. Using Identity fallback.",
-                                            base_font
-                                        );
-                                        Some(CIDToGIDMap::Identity)
-                                    } else {
-                                        let num_entries = stream_data.len() / 2;
-                                        let mut map = Vec::with_capacity(num_entries);
-                                        for i in 0..num_entries {
-                                            let gid = u16::from_be_bytes([stream_data[i * 2], stream_data[i * 2 + 1]]);
-                                            map.push(gid);
-                                        }
-                                        tracing::debug!(
-                                            "Font '{}': Loaded explicit CIDToGIDMap with {} entries",
-                                            base_font,
-                                            num_entries
-                                        );
-                                        Some(CIDToGIDMap::Explicit(map))
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "Font '{}': CIDToGIDMap stream decode failed: {}. Using Identity fallback.",
-                                        base_font,
-                                        e
-                                    );
-                                    Some(CIDToGIDMap::Identity)
-                                }
-                            },
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Font '{}': CIDToGIDMap stream object load failed: {}. Using Identity fallback.",
-                                    base_font,
-                                    e
-                                );
-                                Some(CIDToGIDMap::Identity)
-                            }
-                        }
-                    } else {
-                        tracing::warn!(
-                            "Font '{}': CIDToGIDMap is neither Name nor Stream reference. Using Identity fallback.",
-                            base_font
-                        );
-                        Some(CIDToGIDMap::Identity)
-                    }
-                }
-            }
-        } else {
-            tracing::debug!(
-                "Font '{}': CIDFontType0 (CFF/OpenType) - no CIDToGIDMap needed",
-                base_font
-            );
-            None
-        };
+        let cid_to_gid_map = Self::resolve_cid_to_gid_map(cidfont_dict, &cid_font_type, base_font, doc);
 
         let dw_value = cidfont_dict.get("DW").and_then(|obj| {
             let resolved = if let Some(r) = obj.as_reference() {
@@ -1747,8 +1676,8 @@ impl FontInfo {
                         dict_clone.insert("W".to_string(), resolved);
                         std::borrow::Cow::Owned(dict_clone)
                     }
-                    Err(e) => {
-                        tracing::warn!("Font '{}': Failed to resolve /W reference: {}", base_font, e);
+                    Err(error) => {
+                        crate::error::trace_recovery("resolve_cid_widths", &error);
                         std::borrow::Cow::Borrowed(cidfont_dict)
                     }
                 }
@@ -1777,8 +1706,8 @@ impl FontInfo {
                         dict_clone.insert("W2".to_string(), resolved);
                         std::borrow::Cow::Owned(dict_clone)
                     }
-                    Err(e) => {
-                        tracing::warn!("Font '{}': Failed to resolve /W2 reference: {}", base_font, e);
+                    Err(error) => {
+                        crate::error::trace_recovery("resolve_cid_vertical_metrics", &error);
                         resolved_cidfont_dict.clone()
                     }
                 }
@@ -1827,6 +1756,107 @@ impl FontInfo {
         ))
     }
 
+    /// Resolves `/CIDToGIDMap` for a descendant CIDFont, moved verbatim out of
+    /// [`Self::parse_descendant_fonts`]. `None` for CIDFontType0 (CFF/OpenType has no
+    /// GID indirection); every failure path for CIDFontType2 (missing key, non-Identity
+    /// name, non-name/non-reference value, unreadable stream, malformed stream length,
+    /// empty stream) falls back to `CIDToGIDMap::Identity`, exactly as the inline
+    /// version did. ~keep
+    fn resolve_cid_to_gid_map(
+        cidfont_dict: &HashMap<String, Object>,
+        cid_font_type: &str,
+        base_font: &str,
+        doc: &PdfDocument,
+    ) -> Option<CIDToGIDMap> {
+        if cid_font_type != "CIDFontType2" {
+            tracing::debug!(
+                "Font '{}': CIDFontType0 (CFF/OpenType) - no CIDToGIDMap needed",
+                base_font
+            );
+            return None;
+        }
+
+        let Some(cidtogid_obj) = cidfont_dict.get("CIDToGIDMap") else {
+            tracing::debug!(
+                "Font '{}': CIDToGIDMap not specified, defaulting to Identity",
+                base_font
+            );
+            return Some(CIDToGIDMap::Identity);
+        };
+
+        if let Some(name) = cidtogid_obj.as_name() {
+            if name == "Identity" {
+                tracing::debug!("Font '{}': CIDToGIDMap is Identity", base_font);
+            } else {
+                tracing::warn!(
+                    target: crate::LOG_TARGET_ROOT,
+                    operation = "parse_cid_to_gid_map",
+                    error_code = "invalid_map_name",
+                    "using identity CID-to-GID map"
+                );
+            }
+            return Some(CIDToGIDMap::Identity);
+        }
+
+        let Some(stream_ref) = cidtogid_obj.as_reference() else {
+            tracing::warn!(
+                target: crate::LOG_TARGET_ROOT,
+                operation = "parse_cid_to_gid_map",
+                error_code = "invalid_map_type",
+                "using identity CID-to-GID map"
+            );
+            return Some(CIDToGIDMap::Identity);
+        };
+
+        let stream_data = doc
+            .load_object(stream_ref)
+            .inspect_err(|error| crate::error::trace_recovery("load_cid_to_gid_map", error))
+            .ok()
+            .and_then(|stream_obj| {
+                doc.decode_stream_with_encryption(&stream_obj, stream_ref)
+                    .inspect_err(|error| crate::error::trace_recovery("decode_cid_to_gid_map", error))
+                    .ok()
+            });
+
+        let Some(stream_data) = stream_data else {
+            return Some(CIDToGIDMap::Identity);
+        };
+
+        if stream_data.len() % 2 != 0 {
+            tracing::warn!(
+                target: crate::LOG_TARGET_ROOT,
+                operation = "parse_cid_to_gid_map",
+                error_code = "odd_stream_length",
+                byte_count = stream_data.len(),
+                "using identity CID-to-GID map"
+            );
+            return Some(CIDToGIDMap::Identity);
+        }
+        if stream_data.is_empty() {
+            tracing::warn!(
+                target: crate::LOG_TARGET_ROOT,
+                operation = "parse_cid_to_gid_map",
+                error_code = "empty_stream",
+                byte_count = 0usize,
+                "using identity CID-to-GID map"
+            );
+            return Some(CIDToGIDMap::Identity);
+        }
+
+        let num_entries = stream_data.len() / 2;
+        let mut map = Vec::with_capacity(num_entries);
+        for i in 0..num_entries {
+            let gid = u16::from_be_bytes([stream_data[i * 2], stream_data[i * 2 + 1]]);
+            map.push(gid);
+        }
+        tracing::debug!(
+            "Font '{}': Loaded explicit CIDToGIDMap with {} entries",
+            base_font,
+            num_entries
+        );
+        Some(CIDToGIDMap::Explicit(map))
+    }
+
     /// Extract TrueType cmap from a font dictionary's /FontDescriptor /FontFile2.
     fn extract_truetype_cmap_from_descriptor(
         font_dict: &HashMap<String, Object>,
@@ -1844,25 +1874,15 @@ impl FontInfo {
         let ff2_ref = ff2_obj.as_reference()?;
         let ff2_stream = match doc.load_object(ff2_ref) {
             Ok(obj) => obj,
-            Err(e) => {
-                tracing::warn!(
-                    "Font '{}': Failed to load FontFile2 object {:?}: {}",
-                    base_font,
-                    ff2_ref,
-                    e
-                );
+            Err(error) => {
+                crate::error::trace_recovery("load_truetype_font_program", &error);
                 return None;
             }
         };
         let font_data = match doc.decode_stream_with_encryption(&ff2_stream, ff2_ref) {
             Ok(data) => data,
-            Err(e) => {
-                tracing::warn!(
-                    "Font '{}': Failed to decrypt/decode FontFile2 stream {:?}: {}",
-                    base_font,
-                    ff2_ref,
-                    e
-                );
+            Err(error) => {
+                crate::error::trace_recovery("decode_truetype_font_program", &error);
                 return None;
             }
         };
@@ -1950,15 +1970,15 @@ impl FontInfo {
                 };
                 let ff_stream = match doc.load_object(ff_ref) {
                     Ok(obj) => obj,
-                    Err(e) => {
-                        tracing::warn!("Font '{}': Failed to load {} {:?}: {}", base_font, key, ff_ref, e);
+                    Err(error) => {
+                        crate::error::trace_recovery("load_embedded_font_program", &error);
                         continue;
                     }
                 };
                 let font_data = match doc.decode_stream_with_encryption(&ff_stream, ff_ref) {
                     Ok(data) => data,
-                    Err(e) => {
-                        tracing::warn!("Font '{}': Failed to decode {} stream: {}", base_font, key, e);
+                    Err(error) => {
+                        crate::error::trace_recovery("decode_embedded_font_program", &error);
                         continue;
                     }
                 };
@@ -2192,9 +2212,82 @@ impl FontInfo {
     ///
     /// Returns `None` when `/W2` is absent or empty, allowing callers to skip
     /// the HashMap allocation entirely on horizontal fonts.
+    /// Applies the `/W2` array-form group `c [ w1y v_x v_y … ]` (Form A) for one CID
+    /// range. Extracted verbatim from `parse_cid_vertical_metrics`'s `Object::Array`
+    /// arm: every `break` in the original body only left the arm's own inner `while`
+    /// loop, never the caller's outer loop, so this is pure code motion. ~keep
+    fn apply_cid_vertical_metrics_triples(
+        cid_start: u16,
+        triples: &[Object],
+        metrics: &mut HashMap<u16, VerticalMetrics>,
+    ) {
+        // Walk the inner array in groups of three. A triple is atomic: if any of its
+        // three elements is non-numeric we drop the WHOLE triple (advance j+=3,
+        // emitted+=1) so the CID alignment of the rest of the inner array is
+        // preserved. The original implementation advanced j by 1 on a malformed
+        // element, which silently shifted every subsequent CID by one slot. ~keep
+        let mut j = 0;
+        let mut emitted: u32 = 0;
+        let read_num = |obj: &Object| -> Option<f32> {
+            match obj {
+                Object::Integer(v) => Some(*v as f32),
+                Object::Real(v) => Some(*v as f32),
+                _ => None,
+            }
+        };
+        while j + 2 < triples.len() {
+            let triple = (
+                read_num(&triples[j]),
+                read_num(&triples[j + 1]),
+                read_num(&triples[j + 2]),
+            );
+            // Compute CID with overflow detection BEFORE writing. saturating_add(emitted)
+            // would collapse every overflowing slot onto u16::MAX; instead we stop. ~keep
+            let Some(cid) = (cid_start as u32).checked_add(emitted) else {
+                tracing::warn!(
+                    target: crate::LOG_TARGET_ROOT,
+                    operation = "parse_cid_vertical_metrics",
+                    error_code = "cid_overflow",
+                    start_cid = cid_start,
+                    emitted_count = emitted,
+                    "stopping vertical metrics parsing"
+                );
+                break;
+            };
+            if cid > u16::MAX as u32 {
+                tracing::warn!(
+                    target: crate::LOG_TARGET_ROOT,
+                    operation = "parse_cid_vertical_metrics",
+                    error_code = "cid_out_of_range",
+                    start_cid = cid_start,
+                    emitted_count = emitted,
+                    "stopping vertical metrics parsing"
+                );
+                break;
+            }
+            match triple {
+                (Some(w1y), Some(v_x), Some(v_y)) => {
+                    metrics.insert(cid as u16, VerticalMetrics { w1y, v_x, v_y });
+                }
+                _ => {
+                    tracing::warn!(
+                        target: crate::LOG_TARGET_ROOT,
+                        operation = "parse_cid_vertical_metrics",
+                        error_code = "invalid_metric_triple",
+                        start_cid = cid_start,
+                        emitted_count = emitted,
+                        "skipping invalid vertical metric"
+                    );
+                }
+            }
+            emitted += 1;
+            j += 3;
+        }
+    }
+
     fn parse_cid_vertical_metrics(
         cidfont_dict: &HashMap<String, Object>,
-        base_font: &str,
+        _base_font: &str,
     ) -> Option<HashMap<u16, VerticalMetrics>> {
         let w2_obj = cidfont_dict.get("W2")?;
         let w2_array = w2_obj.as_array()?;
@@ -2211,9 +2304,11 @@ impl FontInfo {
                 Object::Integer(c) => *c as u16,
                 _ => {
                     tracing::warn!(
-                        "Font '{}': /W2 array element {} is not an integer, skipping",
-                        base_font,
-                        i
+                        target: crate::LOG_TARGET_ROOT,
+                        operation = "parse_cid_vertical_metrics",
+                        error_code = "invalid_start_cid",
+                        entry_index = i,
+                        "skipping invalid vertical metrics entry"
                     );
                     i += 1;
                     continue;
@@ -2227,69 +2322,7 @@ impl FontInfo {
 
             match &w2_array[i] {
                 Object::Array(triples) => {
-                    // Form A: c [ w1y v_x v_y w1y v_x v_y … ]
-                    // Walk the inner array in groups of three. A triple is
-                    // atomic: if any of its three elements is non-numeric
-                    // we drop the WHOLE triple (advance j+=3, emitted+=1)
-                    // so the CID alignment of the rest of the inner array
-                    // is preserved. The original implementation advanced
-                    // j by 1 on a malformed element, which silently
-                    // shifted every subsequent CID by one slot. ~keep
-                    let mut j = 0;
-                    let mut emitted: u32 = 0;
-                    let read_num = |obj: &Object| -> Option<f32> {
-                        match obj {
-                            Object::Integer(v) => Some(*v as f32),
-                            Object::Real(v) => Some(*v as f32),
-                            _ => None,
-                        }
-                    };
-                    while j + 2 < triples.len() {
-                        let triple = (
-                            read_num(&triples[j]),
-                            read_num(&triples[j + 1]),
-                            read_num(&triples[j + 2]),
-                        );
-                        // Compute CID with overflow detection BEFORE writing.
-                        // saturating_add(emitted) would collapse every
-                        // overflowing slot onto u16::MAX; instead we stop. ~keep
-                        let Some(cid) = (cid_start as u32).checked_add(emitted) else {
-                            tracing::warn!(
-                                "Font '{}': /W2 Form A starting at CID {} overflowed u32 \
-                                 at emitted offset {}; stopping",
-                                base_font,
-                                cid_start,
-                                emitted
-                            );
-                            break;
-                        };
-                        if cid > u16::MAX as u32 {
-                            tracing::warn!(
-                                "Font '{}': /W2 Form A starting at CID {} would assign \
-                                 beyond u16::MAX at emitted offset {}; stopping",
-                                base_font,
-                                cid_start,
-                                emitted
-                            );
-                            break;
-                        }
-                        match triple {
-                            (Some(w1y), Some(v_x), Some(v_y)) => {
-                                metrics.insert(cid as u16, VerticalMetrics { w1y, v_x, v_y });
-                            }
-                            _ => {
-                                tracing::warn!(
-                                    "Font '{}': /W2 Form A triple starting at CID {} (offset \
-                                     {}) is malformed; dropping it (keeping CID alignment)",
-                                    base_font,
-                                    cid_start,
-                                    emitted
-                                );
-                            }
-                        }
-                        emitted += 1;
-                        j += 3;
-                    }
+                    Self::apply_cid_vertical_metrics_triples(cid_start, triples, &mut metrics);
                     i += 1;
                 }
                 Object::Integer(cid_end_int) => {
@@ -2297,9 +2330,11 @@ impl FontInfo {
                     i += 1;
                     if i + 2 >= w2_array.len() {
                         tracing::warn!(
-                            "Font '{}': /W2 range starting at CID {} truncated",
-                            base_font,
-                            cid_start
+                            target: crate::LOG_TARGET_ROOT,
+                            operation = "parse_cid_vertical_metrics",
+                            error_code = "truncated_range",
+                            start_cid = cid_start,
+                            "stopping truncated vertical metrics range"
                         );
                         break;
                     }
@@ -2330,9 +2365,11 @@ impl FontInfo {
                 }
                 _ => {
                     tracing::warn!(
-                        "Font '{}': /W2 array has unexpected element type after CID {}",
-                        base_font,
-                        cid_start
+                        target: crate::LOG_TARGET_ROOT,
+                        operation = "parse_cid_vertical_metrics",
+                        error_code = "invalid_range_type",
+                        start_cid = cid_start,
+                        "skipping invalid vertical metrics range"
                     );
                     i += 1;
                 }
@@ -2342,7 +2379,22 @@ impl FontInfo {
         if metrics.is_empty() { None } else { Some(metrics) }
     }
 
-    fn parse_cid_widths(cidfont_dict: &HashMap<String, Object>, base_font: &str) -> Option<HashMap<u16, f32>> {
+    /// Applies the `/W` array-form width group `c [w1 w2 …]` for one CID range.
+    /// Extracted verbatim from `parse_cid_widths`'s `Object::Array` arm — no control
+    /// flow crosses into the caller's loop, so this is pure code motion. ~keep
+    fn apply_cid_width_array(cid_start: u16, width_array: &[Object], widths: &mut HashMap<u16, f32>) {
+        for (j, width_obj) in width_array.iter().enumerate() {
+            let width = match width_obj {
+                Object::Integer(w) => *w as f32,
+                Object::Real(w) => *w as f32,
+                _ => continue,
+            };
+            let cid = cid_start.saturating_add(j as u16);
+            widths.insert(cid, width);
+        }
+    }
+
+    fn parse_cid_widths(cidfont_dict: &HashMap<String, Object>, _base_font: &str) -> Option<HashMap<u16, f32>> {
         let w_obj = cidfont_dict.get("W")?;
         let w_array = w_obj.as_array()?;
 
@@ -2358,9 +2410,11 @@ impl FontInfo {
                 Object::Integer(c) => *c as u16,
                 _ => {
                     tracing::warn!(
-                        "Font '{}': /W array element {} is not an integer, skipping",
-                        base_font,
-                        i
+                        target: crate::LOG_TARGET_ROOT,
+                        operation = "parse_cid_widths",
+                        error_code = "invalid_start_cid",
+                        entry_index = i,
+                        "skipping invalid width entry"
                     );
                     i += 1;
                     continue;
@@ -2377,15 +2431,7 @@ impl FontInfo {
             // - An integer CID end (format: cfirst clast w) ~keep
             match &w_array[i] {
                 Object::Array(width_array) => {
-                    for (j, width_obj) in width_array.iter().enumerate() {
-                        let width = match width_obj {
-                            Object::Integer(w) => *w as f32,
-                            Object::Real(w) => *w as f32,
-                            _ => continue,
-                        };
-                        let cid = cid_start.saturating_add(j as u16);
-                        widths.insert(cid, width);
-                    }
+                    Self::apply_cid_width_array(cid_start, width_array, &mut widths);
                     i += 1;
                 }
                 Object::Integer(cid_end) => {
@@ -2394,10 +2440,12 @@ impl FontInfo {
 
                     if i >= w_array.len() {
                         tracing::warn!(
-                            "Font '{}': /W array missing width for CID range {}-{}",
-                            base_font,
-                            cid_start,
-                            cid_end
+                            target: crate::LOG_TARGET_ROOT,
+                            operation = "parse_cid_widths",
+                            error_code = "missing_range_width",
+                            start_cid = cid_start,
+                            end_cid = cid_end,
+                            "stopping truncated width range"
                         );
                         break;
                     }
@@ -2407,10 +2455,12 @@ impl FontInfo {
                         Object::Real(w) => *w as f32,
                         _ => {
                             tracing::warn!(
-                                "Font '{}': /W array has invalid width for CID range {}-{}",
-                                base_font,
-                                cid_start,
-                                cid_end
+                                target: crate::LOG_TARGET_ROOT,
+                                operation = "parse_cid_widths",
+                                error_code = "invalid_range_width",
+                                start_cid = cid_start,
+                                end_cid = cid_end,
+                                "skipping invalid width range"
                             );
                             i += 1;
                             continue;
@@ -2424,9 +2474,11 @@ impl FontInfo {
                 }
                 _ => {
                     tracing::warn!(
-                        "Font '{}': /W array has unexpected element type after CID {}",
-                        base_font,
-                        cid_start
+                        target: crate::LOG_TARGET_ROOT,
+                        operation = "parse_cid_widths",
+                        error_code = "invalid_range_type",
+                        start_cid = cid_start,
+                        "skipping invalid width range"
                     );
                     i += 1;
                 }
@@ -2457,6 +2509,200 @@ impl FontInfo {
             return m;
         }
         self.cid_default_vertical_metrics
+    }
+
+    /// If `dict` (an /Encoding dictionary) carries a /CMapName, resolves the Type0
+    /// CMap-stream encoding case and returns `Some` of the result to return early;
+    /// returns `None` when there is no /CMapName, telling the caller to continue with
+    /// the /BaseEncoding + /Differences path. Extracted verbatim from `parse_encoding`
+    /// — a pure early-return block, so wrapping it in `Option` preserves the original
+    /// `return Ok(...)` behavior exactly. ~keep
+    fn try_parse_cmap_stream_encoding(
+        dict: &HashMap<String, Object>,
+    ) -> Option<Result<(Encoding, HashMap<u8, String>, HashMap<u8, String>)>> {
+        let cmap_name = dict.get("CMapName").and_then(|n| n.as_name())?;
+
+        let is_adobe_collection = cmap_name.starts_with("Adobe-")
+            && (cmap_name.contains("Japan")
+                || cmap_name.contains("GB")
+                || cmap_name.contains("CNS")
+                || cmap_name.contains("Korea"));
+        if is_adobe_collection {
+            tracing::debug!(
+                "Encoding is Adobe CMap stream (CMapName={:?}), treating as Identity",
+                cmap_name
+            );
+            return Some(Ok((Encoding::Identity, HashMap::new(), HashMap::new())));
+        }
+        if cmap_name == "Identity-H" || cmap_name == "Identity-V" {
+            return Some(Ok((Encoding::Identity, HashMap::new(), HashMap::new())));
+        }
+        tracing::debug!(
+            "Encoding is custom CMap stream (CMapName={:?}), treating as Standard",
+            cmap_name
+        );
+        Some(Ok((
+            Encoding::Standard(cmap_name.to_string()),
+            HashMap::new(),
+            HashMap::new(),
+        )))
+    }
+
+    /// Resolves the base `code → char` map an /Encoding dictionary's /Differences
+    /// array (if any) is layered on top of: an explicit /BaseEncoding name, else the
+    /// font program's built-in encoding (PDF Spec ISO 32000-1:2008 §9.6.6.1), else
+    /// plain StandardEncoding. Extracted verbatim from `parse_encoding`. ~keep
+    fn resolve_base_encoding_map(
+        dict: &HashMap<String, Object>,
+        doc: &PdfDocument,
+        font_program_encoding: Option<&HashMap<u8, char>>,
+    ) -> HashMap<u8, char> {
+        if let Some(base_enc_obj) = dict.get("BaseEncoding") {
+            let resolved_base = if let Some(obj_ref) = base_enc_obj.as_reference() {
+                doc.load_object(obj_ref).ok()
+            } else {
+                None
+            };
+            let base_obj = resolved_base.as_ref().unwrap_or(base_enc_obj);
+
+            let Some(base_name) = base_obj.as_name() else {
+                return HashMap::new();
+            };
+            let mut map = HashMap::new();
+            for code in 0u8..=255 {
+                let Some(unicode_str) = standard_encoding_lookup(base_name, code) else {
+                    continue;
+                };
+                let Some(ch) = unicode_str.chars().next() else {
+                    continue;
+                };
+                map.insert(code, ch);
+            }
+            map
+        } else if let Some(prog_enc) = font_program_encoding {
+            // PDF Spec ISO 32000-1:2008, Section 9.6.6.1:
+            // "If BaseEncoding is absent and the font has a built-in encoding,
+            // the built-in encoding shall be used as the base encoding." ~keep
+            prog_enc.clone()
+        } else {
+            let mut map = HashMap::new();
+            for code in 0u8..=255 {
+                let Some(unicode_str) = standard_encoding_lookup("StandardEncoding", code) else {
+                    continue;
+                };
+                let Some(ch) = unicode_str.chars().next() else {
+                    continue;
+                };
+                map.insert(code, ch);
+            }
+            map
+        }
+    }
+
+    /// Applies an /Encoding dictionary's `/Differences` array (if present) on top of
+    /// `encoding_map`, filling in `multi_char_map` (compound glyph names) and
+    /// `diff_glyph_names` (the raw glyph name per code, for downstream punctuation
+    /// recovery) as it goes. A no-op when `/Differences` is absent. Extracted verbatim
+    /// from `parse_encoding`; no control flow crosses into the caller. ~keep
+    fn apply_differences_array(
+        dict: &HashMap<String, Object>,
+        doc: &PdfDocument,
+        encoding_map: &mut HashMap<u8, char>,
+        multi_char_map: &mut HashMap<u8, String>,
+        diff_glyph_names: &mut HashMap<u8, String>,
+    ) {
+        let Some(differences_obj) = dict.get("Differences") else {
+            return;
+        };
+        tracing::debug!("Found /Differences array in encoding dictionary");
+
+        let resolved_diff = if let Some(obj_ref) = differences_obj.as_reference() {
+            doc.load_object(obj_ref).ok()
+        } else {
+            None
+        };
+        let diff_obj = resolved_diff.as_ref().unwrap_or(differences_obj);
+
+        let Some(diff_array) = diff_obj.as_array() else {
+            tracing::warn!(
+                target: crate::LOG_TARGET_ROOT,
+                operation = "parse_font_encoding",
+                error_code = "invalid_differences_type",
+                "ignoring malformed font differences"
+            );
+            return;
+        };
+
+        tracing::debug!("/Differences array has {} items", diff_array.len());
+        let mut current_code: u32 = 0;
+
+        for item in diff_array {
+            let resolved_item = if let Some(obj_ref) = item.as_reference() {
+                doc.load_object(obj_ref).ok()
+            } else {
+                None
+            };
+            let actual_item = resolved_item.as_ref().unwrap_or(item);
+
+            match actual_item {
+                Object::Integer(code) => {
+                    current_code = *code as u32;
+                }
+                Object::Name(glyph_name) => {
+                    // Retain the authoritative glyph name for this code
+                    // (ISO 32000-1 §9.6.6.1, Table 114). Kept regardless
+                    // of whether it resolves to a single/compound/unknown
+                    // Unicode value, so the punctuation-recovery
+                    // interceptions in `char_to_unicode` can consult it. ~keep
+                    if current_code <= 255 {
+                        diff_glyph_names.insert(current_code as u8, glyph_name.clone());
+                    }
+                    if let Some(unicode_char) = glyph_name_to_unicode(glyph_name) {
+                        if current_code <= 255 {
+                            encoding_map.insert(current_code as u8, unicode_char);
+                            if is_ligature_char(unicode_char) {
+                                tracing::debug!(
+                                    "/Differences: code {} → /{} → '{}' (U+{:04X})",
+                                    current_code,
+                                    glyph_name,
+                                    unicode_char,
+                                    unicode_char as u32
+                                );
+                            }
+                        }
+                    } else if let Some(unicode_string) = glyph_name_to_unicode_string(glyph_name) {
+                        // Compound glyph name (e.g. f_f → "ff", f_f_i → "ffi")
+                        // ~keep
+                        if current_code <= 255 {
+                            multi_char_map.insert(current_code as u8, unicode_string.clone());
+                            tracing::debug!(
+                                "/Differences: code {} → /{} → {:?} (compound)",
+                                current_code,
+                                glyph_name,
+                                unicode_string
+                            );
+                        }
+                    } else {
+                        tracing::debug!(
+                            "Unknown glyph name '{}' at code {} in /Differences array",
+                            glyph_name,
+                            current_code
+                        );
+                    }
+                    current_code += 1;
+                }
+                _ => {
+                    tracing::warn!(
+                        target: crate::LOG_TARGET_ROOT,
+                        operation = "parse_font_encoding",
+                        error_code = "invalid_differences_entry",
+                        "skipping malformed font encoding entry"
+                    );
+                }
+            }
+        }
+
+        tracing::debug!("Parsed /Differences array with {} custom mappings", encoding_map.len());
     }
 
     /// Handles both named encodings (e.g., /WinAnsiEncoding) and encoding dictionaries
@@ -2515,154 +2761,16 @@ impl FontInfo {
             // can resolve CIDs via predefined CID-to-Unicode tables.
             // For custom CMaps (e.g., "Prince-ArialMT-H"), we preserve the default
             // behavior since we can't parse arbitrary CMap programs yet. ~keep
-            if let Some(cmap_name) = dict.get("CMapName").and_then(|n| n.as_name()) {
-                let is_adobe_collection = cmap_name.starts_with("Adobe-")
-                    && (cmap_name.contains("Japan")
-                        || cmap_name.contains("GB")
-                        || cmap_name.contains("CNS")
-                        || cmap_name.contains("Korea"));
-                if is_adobe_collection {
-                    tracing::debug!(
-                        "Encoding is Adobe CMap stream (CMapName={:?}), treating as Identity",
-                        cmap_name
-                    );
-                    return Ok((Encoding::Identity, HashMap::new(), HashMap::new()));
-                }
-                if cmap_name == "Identity-H" || cmap_name == "Identity-V" {
-                    return Ok((Encoding::Identity, HashMap::new(), HashMap::new()));
-                }
-                tracing::debug!(
-                    "Encoding is custom CMap stream (CMapName={:?}), treating as Standard",
-                    cmap_name
-                );
-                return Ok((
-                    Encoding::Standard(cmap_name.to_string()),
-                    HashMap::new(),
-                    HashMap::new(),
-                ));
+            if let Some(result) = Self::try_parse_cmap_stream_encoding(dict) {
+                return result;
             }
 
             let mut multi_char_map: HashMap<u8, String> = HashMap::new();
             let mut diff_glyph_names: HashMap<u8, String> = HashMap::new();
 
-            let mut encoding_map: HashMap<u8, char> = if let Some(base_enc_obj) = dict.get("BaseEncoding") {
-                let resolved_base = if let Some(obj_ref) = base_enc_obj.as_reference() {
-                    doc.load_object(obj_ref).ok()
-                } else {
-                    None
-                };
-                let base_obj = resolved_base.as_ref().unwrap_or(base_enc_obj);
+            let mut encoding_map: HashMap<u8, char> = Self::resolve_base_encoding_map(dict, doc, font_program_encoding);
 
-                if let Some(base_name) = base_obj.as_name() {
-                    let mut map = HashMap::new();
-                    for code in 0u8..=255 {
-                        if let Some(unicode_str) = standard_encoding_lookup(base_name, code)
-                            && let Some(ch) = unicode_str.chars().next()
-                        {
-                            map.insert(code, ch);
-                        }
-                    }
-                    map
-                } else {
-                    HashMap::new()
-                }
-            } else if let Some(prog_enc) = font_program_encoding {
-                // PDF Spec ISO 32000-1:2008, Section 9.6.6.1:
-                // "If BaseEncoding is absent and the font has a built-in encoding,
-                // the built-in encoding shall be used as the base encoding." ~keep
-                prog_enc.clone()
-            } else {
-                let mut map = HashMap::new();
-                for code in 0u8..=255 {
-                    if let Some(unicode_str) = standard_encoding_lookup("StandardEncoding", code)
-                        && let Some(ch) = unicode_str.chars().next()
-                    {
-                        map.insert(code, ch);
-                    }
-                }
-                map
-            };
-
-            if let Some(differences_obj) = dict.get("Differences") {
-                tracing::debug!("Found /Differences array in encoding dictionary");
-
-                let resolved_diff = if let Some(obj_ref) = differences_obj.as_reference() {
-                    doc.load_object(obj_ref).ok()
-                } else {
-                    None
-                };
-                let diff_obj = resolved_diff.as_ref().unwrap_or(differences_obj);
-
-                if let Some(diff_array) = diff_obj.as_array() {
-                    tracing::debug!("/Differences array has {} items", diff_array.len());
-                    let mut current_code: u32 = 0;
-
-                    for item in diff_array {
-                        let resolved_item = if let Some(obj_ref) = item.as_reference() {
-                            doc.load_object(obj_ref).ok()
-                        } else {
-                            None
-                        };
-                        let actual_item = resolved_item.as_ref().unwrap_or(item);
-
-                        match actual_item {
-                            Object::Integer(code) => {
-                                current_code = *code as u32;
-                            }
-                            Object::Name(glyph_name) => {
-                                // Retain the authoritative glyph name for this code
-                                // (ISO 32000-1 §9.6.6.1, Table 114). Kept regardless
-                                // of whether it resolves to a single/compound/unknown
-                                // Unicode value, so the punctuation-recovery
-                                // interceptions in `char_to_unicode` can consult it. ~keep
-                                if current_code <= 255 {
-                                    diff_glyph_names.insert(current_code as u8, glyph_name.clone());
-                                }
-                                if let Some(unicode_char) = glyph_name_to_unicode(glyph_name) {
-                                    if current_code <= 255 {
-                                        encoding_map.insert(current_code as u8, unicode_char);
-                                        if is_ligature_char(unicode_char) {
-                                            tracing::debug!(
-                                                "/Differences: code {} → /{} → '{}' (U+{:04X})",
-                                                current_code,
-                                                glyph_name,
-                                                unicode_char,
-                                                unicode_char as u32
-                                            );
-                                        }
-                                    }
-                                } else if let Some(unicode_string) = glyph_name_to_unicode_string(glyph_name) {
-                                    // Compound glyph name (e.g. f_f → "ff", f_f_i → "ffi")
-                                    // ~keep
-                                    if current_code <= 255 {
-                                        multi_char_map.insert(current_code as u8, unicode_string.clone());
-                                        tracing::debug!(
-                                            "/Differences: code {} → /{} → {:?} (compound)",
-                                            current_code,
-                                            glyph_name,
-                                            unicode_string
-                                        );
-                                    }
-                                } else {
-                                    tracing::debug!(
-                                        "Unknown glyph name '{}' at code {} in /Differences array",
-                                        glyph_name,
-                                        current_code
-                                    );
-                                }
-                                current_code += 1;
-                            }
-                            _ => {
-                                tracing::warn!("Unexpected item in /Differences array: {:?}", actual_item);
-                            }
-                        }
-                    }
-
-                    tracing::debug!("Parsed /Differences array with {} custom mappings", encoding_map.len());
-                } else {
-                    tracing::warn!("/Differences is not an array: {:?}", diff_obj);
-                }
-            }
+            Self::apply_differences_array(dict, doc, &mut encoding_map, &mut multi_char_map, &mut diff_glyph_names);
 
             if !encoding_map.is_empty() || !multi_char_map.is_empty() {
                 Ok((Encoding::Custom(encoding_map), multi_char_map, diff_glyph_names))
@@ -2801,6 +2909,10 @@ impl FontInfo {
                 return None;
             }
         }
+        self.get_standard_font_intrinsic_width(char_code)
+    }
+
+    fn get_standard_font_intrinsic_width(&self, char_code: u16) -> Option<f32> {
         // The name classification below is a pure function of `base_font`, but
         // this runs once per glyph — so it is resolved once and memoized. ~keep
         let std14 = (*self.std14_memo.get_or_init(|| self.classify_std14()))?;
@@ -3710,31 +3822,100 @@ impl FontInfo {
     /// Eliminates per-byte bounds check and subtraction in advance_position.
     #[inline]
     pub fn get_byte_to_width_table(&self) -> &[f32; 256] {
-        self.byte_to_width_table.get_or_init(|| {
-            let mut tbl = [self.default_width; 256];
-            if let Some(widths) = &self.widths {
-                if let Some(first_char) = self.first_char {
-                    for (idx, &w) in widths.iter().enumerate() {
-                        let code = first_char as usize + idx;
-                        if code < 256 {
-                            tbl[code] = w;
-                        }
-                    }
-                }
-            } else {
-                // Standard-14 fonts ship without /Widths arrays; per PDF
-                // spec (ISO 32000-1 §9.6.2.2) readers must use built-in
-                // metrics. get_standard_font_width returns Some(w) for
-                // Helvetica/Times/Courier variants and None otherwise,
-                // so non-standard fonts retain the default_width fallback. ~keep
-                for byte_code in 0..256u16 {
-                    if let Some(w) = self.get_standard_font_width(byte_code) {
-                        tbl[byte_code as usize] = w;
-                    }
+        self.byte_to_width_table.get_or_init(|| self.declared_byte_widths())
+    }
+
+    fn declared_byte_widths(&self) -> [f32; 256] {
+        let mut table = [self.default_width; 256];
+        if let (Some(widths), Some(first_char)) = (&self.widths, self.first_char) {
+            for (index, &width) in widths.iter().enumerate() {
+                let code = first_char as usize + index;
+                if code < 256 {
+                    table[code] = width;
                 }
             }
-            tbl
-        })
+        } else if self.widths.is_none() {
+            for byte_code in 0..256u16 {
+                if let Some(width) = self.get_standard_font_width(byte_code) {
+                    table[byte_code as usize] = width;
+                }
+            }
+        }
+        table
+    }
+
+    fn declared_zero_byte_codes(&self) -> Vec<u8> {
+        let Some(widths) = self.widths.as_ref() else {
+            return Vec::new();
+        };
+        let Some(first_char) = self.first_char else {
+            return Vec::new();
+        };
+        widths
+            .iter()
+            .enumerate()
+            .filter_map(|(index, width)| {
+                let code = first_char as usize + index;
+                (*width == 0.0 && code < 256).then_some(code as u8)
+            })
+            .collect()
+    }
+
+    fn extraction_fallback_width<'font>(
+        &self,
+        code: u8,
+        decoded: char,
+        font_ref: Option<&FontRef<'font>>,
+        embedded_metrics: Option<&(Metrics, GlyphMetrics<'font>)>,
+    ) -> Option<f32> {
+        let embedded_width = embedded_metrics.and_then(|(metrics, glyph_metrics)| {
+            let font = font_ref?;
+            let gid = self
+                .truetype_cmap()
+                .and_then(|cmap| cmap.code_to_gid(code as u16))
+                .map(GlyphId::from)
+                .or_else(|| font.charmap().map(decoded))?;
+            let advance = glyph_metrics.advance_width(gid)?;
+            (metrics.units_per_em > 0 && advance > 0.0).then_some(advance * 1000.0 / metrics.units_per_em as f32)
+        });
+        embedded_width
+            .or_else(|| self.get_standard_font_intrinsic_width(code as u16))
+            .filter(|width| width.is_finite() && *width > 0.0)
+    }
+
+    fn repair_zero_extraction_widths(&self, widths: &mut [f32; 256]) {
+        if self.subtype == "Type3" || self.subtype == "Type0" || self.wmode != 0 {
+            return;
+        }
+        let font_ref = self
+            .embedded_font_data
+            .as_deref()
+            .and_then(|data| FontRef::new(data).ok());
+        let embedded_metrics = font_ref.as_ref().map(|font| {
+            (
+                Metrics::new(font, Size::unscaled(), LocationRef::default()),
+                GlyphMetrics::new(font, Size::unscaled(), LocationRef::default()),
+            )
+        });
+        for code in self.declared_zero_byte_codes() {
+            let decoded = self.char_to_unicode(code as u32).and_then(|value| value.chars().next());
+            if decoded.is_some_and(|character| unicode_bidi::bidi_class(character) == unicode_bidi::BidiClass::NSM) {
+                continue;
+            }
+            let Some(width) = decoded.and_then(|character| {
+                self.extraction_fallback_width(code, character, font_ref.as_ref(), embedded_metrics.as_ref())
+            }) else {
+                continue;
+            };
+            widths[code as usize] = width;
+        }
+    }
+
+    /// Builds extraction-only widths without changing either public authored-width API. ~keep
+    pub(crate) fn build_extraction_byte_widths(&self) -> [f32; 256] {
+        let mut widths = self.declared_byte_widths();
+        self.repair_zero_extraction_widths(&mut widths);
+        widths
     }
 
     /// Convert a character code to Unicode string.
@@ -3821,38 +4002,38 @@ impl FontInfo {
                             self.base_font
                         );
                         return Some("\u{FFFD}".to_string());
-                    } else if is_c0_control {
+                    }
+                    if is_c0_control {
                         tracing::trace!(
                             "ToUnicode CMap maps code 0x{:04X} to C0 control char(s) in font '{}' - returning U+FFFD",
                             char_code,
                             self.base_font
                         );
                         return Some("\u{FFFD}".to_string());
-                    } else {
-                        // Interception A (Item 1): glyph-name-gated punctuation
-                        // recovery. When a present ToUnicode CMap resolves a code to
-                        // a non-sensible symbol (e.g. U+00AC `¬`) but the font's
-                        // authoritative glyph name for that code is punctuation
-                        // (`period`/`comma`/`hyphen`/`minus` via /Differences or the
-                        // embedded post/charset table), prefer the §9.10.2(a)+(b) AGL
-                        // result. Gated so a correctly-mapped period (whose hit is
-                        // already `.`) never enters here. ~keep
-                        if is_non_sensible_symbol(&unicode)
-                            && let Some(glyph_name) = self.glyph_name_for_code(char_code)
-                            && let Some(punct) = punctuation_unicode_for_glyph_name(glyph_name)
-                        {
-                            tracing::trace!(
-                                "Interception A: code 0x{:04X} ToUnicode '{}' is a non-sensible symbol; glyph name '{}' → '{}' (font '{}')",
-                                char_code,
-                                unicode,
-                                glyph_name,
-                                punct,
-                                self.base_font
-                            );
-                            return Some(punct.to_string());
-                        }
-                        return Some(unicode.into_owned());
                     }
+                    // Interception A (Item 1): glyph-name-gated punctuation
+                    // recovery. When a present ToUnicode CMap resolves a code to
+                    // a non-sensible symbol (e.g. U+00AC `¬`) but the font's
+                    // authoritative glyph name for that code is punctuation
+                    // (`period`/`comma`/`hyphen`/`minus` via /Differences or the
+                    // embedded post/charset table), prefer the §9.10.2(a)+(b) AGL
+                    // result. Gated so a correctly-mapped period (whose hit is
+                    // already `.`) never enters here. ~keep
+                    if is_non_sensible_symbol(&unicode)
+                        && let Some(glyph_name) = self.glyph_name_for_code(char_code)
+                        && let Some(punct) = punctuation_unicode_for_glyph_name(glyph_name)
+                    {
+                        tracing::trace!(
+                            "Interception A: code 0x{:04X} ToUnicode '{}' is a non-sensible symbol; glyph name '{}' → '{}' (font '{}')",
+                            char_code,
+                            unicode,
+                            glyph_name,
+                            punct,
+                            self.base_font
+                        );
+                        return Some(punct.to_string());
+                    }
+                    return Some(unicode.into_owned());
                 } else {
                     if had_hit {
                         tracing::trace!(
@@ -4239,19 +4420,18 @@ impl FontInfo {
                         // Note: CIDToGIDMap only works with u16 CIDs (2-byte codes)
                         // For CIDs > 0xFFFF, we skip CIDToGIDMap and use char_code as GID if it fits in u16
                         // ~keep
-                        let gid = if char_code <= 0xFFFF {
-                            if let Some(ref cid_to_gid) = self.cid_to_gid_map {
-                                cid_to_gid.get_gid(char_code as u16)
-                            } else {
-                                char_code as u16
-                            }
-                        } else {
+                        if char_code > 0xFFFF {
                             tracing::trace!(
                                 "CID 0x{:X} in font '{}' is too large (> 0xFFFF) for CIDToGIDMap - skipping TrueType cmap",
                                 char_code,
                                 self.base_font
                             );
                             return None;
+                        }
+                        let gid = if let Some(ref cid_to_gid) = self.cid_to_gid_map {
+                            cid_to_gid.get_gid(char_code as u16)
+                        } else {
+                            char_code as u16
                         };
 
                         if let Some(unicode_char) = tt_cmap.get_unicode(gid) {
@@ -5771,6 +5951,27 @@ fn standard_encoding_lookup(encoding: &str, code: u8) -> Option<String> {
 ///
 /// This function catches that case and decodes with encoding_rs so the correct
 /// CJK characters come out.
+/// Selects the legacy multi-byte encoding for a non-Unicode-based predefined CMap name,
+/// given the CIDSystemInfo ordering. Extracted verbatim from `decode_cjk_raw_charcode`'s
+/// `enc` binding — pure code motion, same condition order and same `None` fallback. ~keep
+fn select_cjk_legacy_encoding(enc_name: &str, ordering: &str) -> Option<&'static encoding_rs::Encoding> {
+    if enc_name.contains("GBK")
+        || enc_name.contains("GB-")
+        || enc_name.contains("GBpc")
+        || (enc_name.contains("EUC") && (ordering == "GB1" || enc_name.starts_with("GB")))
+    {
+        Some(encoding_rs::GBK)
+    } else if enc_name.contains("B5") || enc_name.contains("CNS") || (enc_name.contains("EUC") && ordering == "CNS1") {
+        Some(encoding_rs::BIG5)
+    } else if enc_name.contains("EUC") && ordering == "Japan1" {
+        Some(encoding_rs::EUC_JP)
+    } else if (enc_name.contains("KSC") || enc_name.contains("KSCms")) && ordering == "Korea1" {
+        Some(encoding_rs::EUC_KR)
+    } else {
+        None
+    }
+}
+
 fn decode_cjk_raw_charcode(char_code: u32, enc_name: &str, cid_system_info: &Option<CIDSystemInfo>) -> Option<String> {
     let ordering = cid_system_info.as_ref().map(|i| i.ordering.as_str()).unwrap_or("");
 
@@ -5799,23 +6000,7 @@ fn decode_cjk_raw_charcode(char_code: u32, enc_name: &str, cid_system_info: &Opt
         }
     }
 
-    let enc: Option<&'static encoding_rs::Encoding> = if enc_name.contains("GBK")
-        || enc_name.contains("GB-")
-        || enc_name.contains("GBpc")
-        || (enc_name.contains("EUC") && (ordering == "GB1" || enc_name.starts_with("GB")))
-    {
-        Some(encoding_rs::GBK)
-    } else if enc_name.contains("B5") || enc_name.contains("CNS") || (enc_name.contains("EUC") && ordering == "CNS1") {
-        Some(encoding_rs::BIG5)
-    } else if enc_name.contains("EUC") && ordering == "Japan1" {
-        Some(encoding_rs::EUC_JP)
-    } else if (enc_name.contains("KSC") || enc_name.contains("KSCms")) && ordering == "Korea1" {
-        Some(encoding_rs::EUC_KR)
-    } else {
-        None
-    };
-
-    let enc = enc?;
+    let enc = select_cjk_legacy_encoding(enc_name, ordering)?;
 
     // Reconstruct the raw bytes from the 2-byte char_code (big-endian) ~keep
     let bytes: [u8; 2] = [((char_code >> 8) & 0xFF) as u8, (char_code & 0xFF) as u8];
@@ -6239,13 +6424,11 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct MessageVisitor(String);
+    struct MessageVisitor(Vec<String>);
 
     impl tracing::field::Visit for MessageVisitor {
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                self.0 = format!("{:?}", value);
-            }
+            self.0.push(format!("{}={value:?}", field.name()));
         }
     }
 
@@ -6263,10 +6446,13 @@ mod tests {
         fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
 
         fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
             let mut visitor = MessageVisitor::default();
             event.record(&mut visitor);
             if let Ok(mut messages) = self.messages.lock() {
-                messages.push(visitor.0);
+                messages.push(visitor.0.join(" "));
             }
         }
 
@@ -6282,6 +6468,149 @@ mod tests {
         let messages = std::sync::Arc::clone(&subscriber.messages);
         tracing::subscriber::with_default(subscriber, f);
         messages.lock().map(|guard| guard.clone()).unwrap_or_default()
+    }
+
+    #[test]
+    fn font_dictionary_warnings_exclude_untrusted_names_and_objects() {
+        const SECRET_FONT: &str = "CONFIDENTIAL_FONT_73da";
+        const SECRET_OBJECT: &str = "CONFIDENTIAL_DIFFERENCE_916c";
+        let doc = minimal_pdf_doc();
+        let type3 = Object::Dictionary(HashMap::from([
+            ("Subtype".to_string(), Object::Name("Type3".to_string())),
+            ("BaseFont".to_string(), Object::Name(SECRET_FONT.to_string())),
+        ]));
+        let encoding = Object::Dictionary(HashMap::from([(
+            "Differences".to_string(),
+            Object::Array(vec![Object::String(SECRET_OBJECT.as_bytes().to_vec())]),
+        )]));
+
+        crate::extractors::warnings::drain_global_warnings();
+        let logs = capture_warnings(|| {
+            FontInfo::from_dict(&type3, &doc).expect("minimal Type3 dictionary must parse");
+            FontInfo::parse_encoding(&encoding, &doc, None).expect("malformed differences must recover");
+        });
+        crate::extractors::warnings::drain_global_warnings();
+
+        assert_eq!(logs.len(), 2, "expected exactly two recovery warnings: {logs:#?}");
+        assert_eq!(
+            logs.iter()
+                .filter(|event| {
+                    event.contains("operation=\"load_font\"") && event.contains("error_code=\"type3_font\"")
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            logs.iter()
+                .filter(|event| {
+                    event.contains("operation=\"parse_font_encoding\"")
+                        && event.contains("error_code=\"invalid_differences_entry\"")
+                })
+                .count(),
+            1
+        );
+        let rendered = format!("{logs:?}");
+        assert!(!rendered.contains(SECRET_FONT));
+        assert!(!rendered.contains(SECRET_OBJECT));
+    }
+
+    #[test]
+    fn cid_font_recovery_warnings_cover_all_malformed_branches_without_names() {
+        const SECRET_FONT: &str = "CONFIDENTIAL_CID_FONT_01c8";
+        const SECRET_OBJECT: &str = "CONFIDENTIAL_CID_OBJECT_79e3";
+        let doc = minimal_pdf_doc();
+        let system_info = Object::Dictionary(HashMap::from([
+            ("Registry".to_string(), Object::String(b"Adobe".to_vec())),
+            ("Ordering".to_string(), Object::String(b"Identity".to_vec())),
+            ("Supplement".to_string(), Object::Integer(0)),
+        ]));
+        let cid_font = Object::Dictionary(HashMap::from([
+            ("Subtype".to_string(), Object::Name("CIDFontType2".to_string())),
+            ("CIDSystemInfo".to_string(), system_info),
+            (
+                "CIDToGIDMap".to_string(),
+                Object::String(SECRET_OBJECT.as_bytes().to_vec()),
+            ),
+        ]));
+        let descendants = HashMap::from([(
+            "DescendantFonts".to_string(),
+            Object::Array(vec![cid_font, Object::Null]),
+        )]);
+
+        let logs = capture_warnings(|| {
+            FontInfo::parse_descendant_fonts(&descendants, SECRET_FONT, &doc).unwrap();
+            for w2 in [
+                vec![Object::Name(SECRET_OBJECT.to_string())],
+                vec![
+                    Object::Integer(65_535),
+                    Object::Array(vec![
+                        Object::Integer(1),
+                        Object::Integer(2),
+                        Object::Integer(3),
+                        Object::Integer(4),
+                        Object::Integer(5),
+                        Object::Integer(6),
+                    ]),
+                ],
+                vec![
+                    Object::Integer(1),
+                    Object::Array(vec![
+                        Object::Name(SECRET_OBJECT.to_string()),
+                        Object::Integer(2),
+                        Object::Integer(3),
+                    ]),
+                ],
+                vec![Object::Integer(1), Object::Integer(2), Object::Integer(3)],
+                vec![Object::Integer(1), Object::Name(SECRET_OBJECT.to_string())],
+            ] {
+                FontInfo::parse_cid_vertical_metrics(
+                    &HashMap::from([("W2".to_string(), Object::Array(w2))]),
+                    SECRET_FONT,
+                );
+            }
+            for widths in [
+                vec![Object::Name(SECRET_OBJECT.to_string())],
+                vec![Object::Integer(1), Object::Integer(2)],
+                vec![
+                    Object::Integer(1),
+                    Object::Integer(2),
+                    Object::Name(SECRET_OBJECT.to_string()),
+                ],
+                vec![Object::Integer(1), Object::Name(SECRET_OBJECT.to_string())],
+            ] {
+                FontInfo::parse_cid_widths(&HashMap::from([("W".to_string(), Object::Array(widths))]), SECRET_FONT);
+            }
+        });
+
+        assert_eq!(logs.len(), 12, "expected every malformed CID branch once: {logs:#?}");
+        for (operation, error_code) in [
+            ("parse_descendant_fonts", "extra_descendants"),
+            ("parse_descendant_fonts", "inline_descendant"),
+            ("parse_cid_to_gid_map", "invalid_map_type"),
+            ("parse_cid_vertical_metrics", "invalid_start_cid"),
+            ("parse_cid_vertical_metrics", "cid_out_of_range"),
+            ("parse_cid_vertical_metrics", "invalid_metric_triple"),
+            ("parse_cid_vertical_metrics", "truncated_range"),
+            ("parse_cid_vertical_metrics", "invalid_range_type"),
+            ("parse_cid_widths", "invalid_start_cid"),
+            ("parse_cid_widths", "missing_range_width"),
+            ("parse_cid_widths", "invalid_range_width"),
+            ("parse_cid_widths", "invalid_range_type"),
+        ] {
+            assert_eq!(
+                logs.iter()
+                    .filter(|event| {
+                        event.contains(&format!("operation=\"{operation}\""))
+                            && event.contains(&format!("error_code=\"{error_code}\""))
+                    })
+                    .count(),
+                1,
+                "missing exact {operation}/{error_code} event: {logs:#?}"
+            );
+        }
+        let rendered = format!("{logs:?}");
+        assert!(!rendered.contains(SECRET_FONT));
+        assert!(!rendered.contains(SECRET_OBJECT));
     }
 
     /// A font whose /ToUnicode CMap fails to parse must WARN about the
@@ -6342,14 +6671,12 @@ mod tests {
 
         let failure_warnings = logs
             .iter()
-            .filter(|message| {
-                message.contains("Failed to parse the ToUnicode CMap") && message.contains("BrokenCMapFont")
-            })
+            .filter(|message| message.contains("PDF operation degraded"))
             .count();
         assert_eq!(
             failure_warnings, 1,
-            "a broken ToUnicode must WARN once per font, naming it, not once per \
-             character code and not twice for one failure; got: {logs:?}"
+            "a broken ToUnicode must WARN once per font, not once per character \
+             code and not twice for one failure; got: {logs:?}"
         );
     }
 
@@ -9407,6 +9734,19 @@ mod tests {
         assert_eq!(table[67], 400.0);
         assert_eq!(table[0], 500.0);
         assert_eq!(table[100], 500.0);
+    }
+
+    #[test]
+    fn test_public_byte_width_table_preserves_authored_zero() {
+        let font = make_font(|font| {
+            font.base_font = "Helvetica".to_string();
+            font.subtype = "Type1".to_string();
+            font.widths = Some(vec![0.0]);
+            font.first_char = Some(65);
+            font.last_char = Some(65);
+        });
+        assert_eq!(font.get_glyph_width(65), 0.0);
+        assert_eq!(font.get_byte_to_width_table()[65], 0.0);
     }
 
     #[test]

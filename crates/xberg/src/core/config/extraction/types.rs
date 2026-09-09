@@ -9,6 +9,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::ExtractedDocument;
 
+/// ~keep: Selects which evidence is authoritative when Xberg infers a MIME type.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "alef-meta", alef(since = "1.1.0"))]
+#[serde(rename_all = "snake_case")]
+pub enum MimeDetectionPolicy {
+    /// ~keep: Prefer a supported content signature, falling back to the filename extension.
+    #[default]
+    PreferContent,
+    /// ~keep: Trust a supported filename extension without reading content for detection.
+    ///
+    /// # Security
+    ///
+    /// Filenames are attacker-controlled input in uploads and downloads. Use this only for trusted sources;
+    /// otherwise a misleading extension can route arbitrary content to the wrong extractor.
+    TrustExtension,
+    /// ~keep: Ignore the filename extension and require content-based detection.
+    ContentOnly,
+}
+
 /// Target format for re-encoding extracted images.
 ///
 /// Controls whether and how extracted images are normalised to a uniform
@@ -24,7 +44,7 @@ use crate::types::ExtractedDocument;
 ///
 /// Uses a tagged enum: `{"type": "native"}`, `{"type": "png"}`,
 /// `{"type": "jpeg", "quality": 90}`, etc.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ImageOutputFormat {
@@ -85,6 +105,44 @@ pub enum ImageOutputFormat {
     Svg,
 }
 
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum ImageOutputFormatWire {
+    Native {},
+    Png {},
+    Jpeg {
+        #[serde(default = "default_jpeg_quality")]
+        quality: u8,
+    },
+    Webp {
+        #[serde(default = "default_webp_quality")]
+        quality: u8,
+    },
+    Heif {
+        #[serde(default = "default_heif_quality")]
+        quality: u8,
+    },
+    #[cfg(feature = "svg")]
+    Svg {},
+}
+
+impl<'de> Deserialize<'de> for ImageOutputFormat {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match ImageOutputFormatWire::deserialize(deserializer)? {
+            ImageOutputFormatWire::Native {} => Self::Native,
+            ImageOutputFormatWire::Png {} => Self::Png,
+            ImageOutputFormatWire::Jpeg { quality } => Self::Jpeg { quality },
+            ImageOutputFormatWire::Webp { quality } => Self::Webp { quality },
+            ImageOutputFormatWire::Heif { quality } => Self::Heif { quality },
+            #[cfg(feature = "svg")]
+            ImageOutputFormatWire::Svg {} => Self::Svg,
+        })
+    }
+}
+
 const fn default_jpeg_quality() -> u8 {
     85
 }
@@ -105,7 +163,7 @@ const fn default_heif_quality() -> u8 {
 /// Used via [`ImageExtractionConfig::svg`].
 #[cfg(feature = "svg")]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SvgOptions {
     /// Run SVG bytes through `usvg` sanitization (strips external `href` attributes,
     /// JavaScript event handlers, and `foreignObject` elements) even when the
@@ -354,6 +412,7 @@ impl UrlExtractionConfig {
 
 /// Image extraction configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImageExtractionConfig {
     /// Extract images from documents
     #[serde(default = "default_true")]
@@ -468,6 +527,7 @@ pub struct ImageExtractionConfig {
 
 /// Token reduction configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TokenReductionOptions {
     /// Reduction mode: "off", "light", "moderate", "aggressive", "maximum"
     #[serde(default = "default_reduction_mode")]
@@ -480,6 +540,7 @@ pub struct TokenReductionOptions {
 
 /// Language detection configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LanguageDetectionConfig {
     /// Enable language detection
     #[serde(default = "default_true")]
@@ -786,5 +847,18 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let back: ImageExtractionConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.output_format, ImageOutputFormat::Jpeg { quality: 92 });
+    }
+
+    #[test]
+    fn image_output_format_rejects_unknown_fields_for_every_variant_shape() {
+        for json in [
+            r#"{"type":"native","unexpected_quality":90}"#,
+            r#"{"type":"jpeg","quality":90,"unexpected_quality":90}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ImageOutputFormat>(json).is_err(),
+                "unknown field must be rejected: {json}"
+            );
+        }
     }
 }

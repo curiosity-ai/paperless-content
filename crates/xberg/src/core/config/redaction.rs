@@ -13,6 +13,7 @@ use std::collections::HashSet;
 
 /// Configuration for the redaction post-processor.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "alef-meta", alef(since = "1.0.0"))]
 pub struct RedactionConfig {
@@ -67,6 +68,7 @@ fn default_case_sensitive() -> bool {
 /// metacharacters themselves). Case-insensitive by default — set
 /// [`Self::case_sensitive`] to `true` for exact byte-match semantics.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
 pub struct RedactionTerm {
     /// Custom category label surfaced in [`RedactionFinding::category`](crate::types::redaction::RedactionFinding::category).
@@ -105,6 +107,7 @@ impl RedactionTerm {
 /// sensitivity is encoded in the pattern via the `(?i)` inline flag when
 /// [`Self::case_sensitive`] is `false`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
 pub struct RedactionPattern {
     /// Custom category label surfaced in [`RedactionFinding::category`](crate::types::redaction::RedactionFinding::category).

@@ -49,10 +49,13 @@ xberg-tesseract = { version = "1.0.0-rc.1", features = ["dynamic-linking"], defa
 **System requirements for dynamic linking:**
 
 - Tesseract 5.x libraries installed (`libtesseract`, `libleptonica`)
+- A C++17 compiler for the crate's exception-safety shim
+- Linux, macOS, and MinGW: `pkg-config` metadata for both `tesseract` and `lept`
 - macOS: `brew install tesseract leptonica`
 - Ubuntu/Debian: `sudo apt-get install libtesseract-dev libleptonica-dev`
 - RHEL/CentOS/Fedora: `sudo dnf install tesseract-devel leptonica-devel`
-- Windows: Install from [Tesseract releases](https://github.com/tesseract-ocr/tesseract/releases) or vcpkg
+- Windows MSVC: install the `tesseract` vcpkg port, set `VCPKG_ROOT`, and set
+  `VCPKGRS_DYNAMIC=1` when using a dynamic vcpkg triplet
 
 ### Development Dependencies
 
@@ -80,9 +83,10 @@ When using dynamic linking with system-installed libraries, you need:
 
 - Rust 1.85.0 or later
 - Tesseract 5.x and Leptonica libraries installed on your system (see Installation section)
-- Internet connection (for downloading Tesseract source code)
+- A C++17 compiler to build the small exception-safety shim
+- `pkg-config` on Linux, macOS, and MinGW, or vcpkg on Windows MSVC
 
-No C++ compiler or CMake required for dynamic linking builds.
+Dynamic linking does not run CMake or download Tesseract source code.
 
 For a full development environment checklist (including optional tooling suggestions), see [CONTRIBUTING.md](../../CONTRIBUTING.md).
 
@@ -95,6 +99,10 @@ The following environment variables affect the build and test process:
 - `CARGO_CLEAN`: If set, cleans the cache directory before building
 - `RUSTC_WRAPPER`: If set to "sccache", enables compiler caching with sccache
 - `CC`: Compiler selection for C code (affects Linux builds)
+- `CXX`: C++ compiler used for the Tesseract exception-safety shim
+- `PKG_CONFIG_PATH`: Additional `tesseract.pc` and `lept.pc` search paths for dynamic linking
+- `VCPKG_ROOT`: vcpkg installation root for Windows MSVC dynamic linking
+- `VCPKGRS_DYNAMIC`: Set to `1` when using a dynamic Windows vcpkg triplet
 - `HOME` (Unix) or `APPDATA` (Windows): Used to determine cache directory location
 - `TESSERACT_RS_CACHE_DIR`: Optional override for the cache root. When unset or not writable, the build falls back to the default OS-specific directory, and if that still fails, a temporary directory under the system temp folder is used automatically.
 

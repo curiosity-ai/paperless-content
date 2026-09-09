@@ -1,5 +1,6 @@
 using System.Text;
 using Xberg.Core;
+using Xberg.Extractors;
 using Xunit;
 
 namespace Xberg.Tests;
@@ -245,5 +246,172 @@ public class MimeTests
             "<html><head><title>t</title></head><body><p>hello</p></body></html>");
 
         Assert.Equal("text/html", Mime.ResolveWithContent("text/plain", bytes));
+    }
+
+    // ── legacy OLE2 typing by root CLSID (xberg-io/xberg#1590) ────────────────
+
+    /// <summary>
+    /// A compound file cannot be typed from its magic bytes alone: <c>.doc</c>, <c>.xls</c> and
+    /// <c>.ppt</c> share the container, and only the root storage's CLSID tells them apart. Before
+    /// upstream's <c>fix(pdf,mime): … type OLE2 files by path</c> the port answered
+    /// <c>application/msword</c> for all three.
+    /// </summary>
+    [Theory]
+    [InlineData("00020906-0000-0000-c000-000000000046", "application/msword")]
+    [InlineData("00020810-0000-0000-c000-000000000046", "application/vnd.ms-excel")]
+    [InlineData("00020820-0000-0000-c000-000000000046", "application/vnd.ms-excel")]
+    [InlineData("64818d10-4f9b-11cf-86ea-00aa00b929e8", "application/vnd.ms-powerpoint")]
+    public void ALegacyOleDocumentIsTypedByItsRootClsid(string clsid, string expected)
+    {
+        // Padded past the 4 KiB sniff window, which is the size a real Office document has and
+        // the reason the header alone can never settle this: the FAT chain that locates the root
+        // directory entry references sectors a truncated prefix does not contain.
+        byte[] content = CfbBuilder.Build(Guid.Parse(clsid), ("Padding", new byte[8192]));
+        Assert.True(content.Length > 4096);
+
+        Assert.Equal(expected, Mime.DetectMimeTypeFromBytes(content));
+    }
+
+    /// <summary>The CLSID is confident enough to overrule a wrong extension, as any other
+    /// content-based finding is.</summary>
+    [Fact]
+    public void AWorkbookNamedDocIsStillAWorkbook()
+    {
+        byte[] content = CfbBuilder.Build(
+            Guid.Parse("00020810-0000-0000-c000-000000000046"), ("Padding", new byte[8192]));
+
+        Assert.Equal("application/vnd.ms-excel", Mime.ResolveWithContent("application/msword", content));
+    }
+
+    /// <summary>A container declaring a CLSID this port does not recognise stays ambiguous, so
+    /// the extension keeps its say — an <c>.msg</c> or <c>.hwp</c> must not be renamed to Word.
+    /// </summary>
+    [Fact]
+    public void AnUnrecognisedClsidLeavesTheExtensionInCharge()
+    {
+        byte[] content = CfbBuilder.Build(
+            Guid.Parse("0006f020-0000-0000-c000-000000000046"), ("Padding", new byte[8192]));
+
+        Assert.Equal("application/vnd.ms-outlook", Mime.ResolveWithContent("application/vnd.ms-outlook", content));
+    }
+
+    // ── geospatial formats (upstream feat(formats): add KML and GeoJSON support) ──
+
+    /// <summary>
+    /// Each keeps its own MIME so a consumer can tell what it is, while routing to the extractor
+    /// for the syntax it is written in. The content sniff sees generic XML or JSON, so the
+    /// specific extension has to win.
+    /// </summary>
+    [Theory]
+    [InlineData("map.kml",
+        "<?xml version=\"1.0\"?><kml xmlns=\"http://www.opengis.net/kml/2.2\"><Placemark><name>Berlin</name></Placemark></kml>",
+        "application/vnd.google-earth.kml+xml")]
+    [InlineData("point.geojson",
+        "{\"type\":\"Point\",\"coordinates\":[13.4,52.5]}",
+        "application/geo+json")]
+    public void AGeospatialFileKeepsItsOwnMimeType(string fileName, string content, string expected)
+    {
+        string? fromExtension = Mime.DetectMimeType(fileName, checkExists: false);
+
+        Assert.Equal(expected, fromExtension);
+        Assert.Equal(expected, Mime.ResolveWithContent(fromExtension, Encoding.UTF8.GetBytes(content)));
+    }
+
+    /// <summary>
+    /// Upstream <c>feat(diagram): extract flat ODF drawings (.fodg)</c>. Flat ODF drawings
+    /// advertised no extractor at all. A flat document carries the packaged MIME type inside
+    /// itself, as the root element's <c>office:mimetype</c>, so content detection reads that
+    /// attribute rather than sniffing a ZIP container — and identifies one even without the
+    /// extension.
+    /// </summary>
+    [Fact]
+    public void AFlatOdfDrawingIsDetectedFromItsOwnMimetypeAttribute()
+    {
+        byte[] content = Encoding.UTF8.GetBytes(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" +
+            "<office:document xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" " +
+            "office:mimetype=\"application/vnd.oasis.opendocument.graphics\">" +
+            "<office:body/></office:document>");
+
+        Assert.Equal(Mime.OdgFlatMimeType, Mime.DetectMimeType("diagram.fodg", checkExists: false));
+        Assert.Equal(Mime.OdgFlatMimeType, Mime.DetectMimeTypeFromBytes(content));
+        Assert.Contains(Mime.OdgFlatMimeType, new XmlExtractor().SupportedMimeTypes);
+    }
+
+    /// <summary>The attribute is trusted only on a real <c>office:document</c> root in the ODF
+    /// office namespace — a stylesheet that merely mentions the type is not a drawing.</summary>
+    [Fact]
+    public void AnUnrelatedRootCarryingTheAttributeIsNotAFlatDrawing()
+    {
+        byte[] content = Encoding.UTF8.GetBytes(
+            "<wrapper office:mimetype=\"application/vnd.oasis.opendocument.graphics\"/>");
+
+        Assert.NotEqual(Mime.OdgFlatMimeType, Mime.DetectMimeTypeFromBytes(content));
+    }
+
+    /// <summary>
+    /// Upstream <c>fix(mime): reject unsupported vocabulary MIME</c>. A more specific vocabulary
+    /// only outranks the generic syntax it is written in when this port can actually extract it:
+    /// <c>.atom</c> and <c>.gltf</c> are XML and JSON vocabularies nothing here handles, so those
+    /// files are better served as the XML or JSON the content says they are than as a type no
+    /// extractor claims.
+    /// </summary>
+    [Theory]
+    [InlineData("application/atom+xml", "<?xml version=\"1.0\"?><feed/>", "application/xml")]
+    [InlineData("model/gltf+json", "{\"asset\":{\"version\":\"2.0\"}}", "application/json")]
+    public void AnUnsupportedVocabularyDoesNotOverruleTheSyntaxItIsWrittenIn(
+        string extensionMime, string content, string expected)
+    {
+        Assert.Equal(expected, Mime.ResolveWithContent(extensionMime, Encoding.UTF8.GetBytes(content)));
+    }
+
+    /// <summary>A vocabulary the port does extract still wins, as it must.</summary>
+    [Fact]
+    public void ASupportedVocabularyStillOverrulesGenericContent()
+    {
+        Assert.Equal(
+            "application/x-fictionbook+xml",
+            Mime.ResolveWithContent(
+                "application/x-fictionbook+xml",
+                Encoding.UTF8.GetBytes("<?xml version=\"1.0\"?><FictionBook/>")));
+    }
+
+    /// <summary>
+    /// Upstream <c>feat(mime): complete format and extension registry</c>. Each of these
+    /// extensions names a format an extractor here already claims, and each resolved to nothing:
+    /// an <c>.xhtml</c> file never reached the HTML extractor at all, and the HEIF sequence types
+    /// the image extractor advertises had no extension pointing at them.
+    /// </summary>
+    [Theory]
+    [InlineData("page.xhtml", "application/xhtml+xml")]
+    [InlineData("page.xht", "application/xhtml+xml")]
+    [InlineData("notes.dj", "text/x-djot")]
+    [InlineData("deck.pps", "application/vnd.ms-powerpoint")]
+    [InlineData("book.xltm", "application/vnd.ms-excel.template.macroEnabled.12")]
+    [InlineData("addin.xla", "application/vnd.ms-excel")]
+    [InlineData("photo.hif", "image/heif")]
+    [InlineData("burst.heifs", "image/heif-sequence")]
+    [InlineData("burst.heics", "image/heic-sequence")]
+    public void AnAliasExtensionResolvesToItsFormat(string fileName, string expected) =>
+        Assert.Equal(expected, Mime.DetectMimeType(fileName, checkExists: false));
+
+    /// <summary>
+    /// Each alias above has to reach a real extractor, not just resolve to a name. The registry
+    /// derives its "supported" set from the extension table itself, so that set cannot answer
+    /// this — only the extractor registry can.
+    /// </summary>
+    [Theory]
+    [InlineData("page.xhtml")]
+    [InlineData("notes.dj")]
+    [InlineData("deck.pps")]
+    [InlineData("photo.hif")]
+    [InlineData("burst.heifs")]
+    [InlineData("burst.heics")]
+    public void AnAliasExtensionReachesAnExtractor(string fileName)
+    {
+        string? mime = Mime.DetectMimeType(fileName, checkExists: false);
+
+        Assert.NotNull(mime);
+        Assert.NotNull(Registry.RegisterDefaults().ForMime(mime!));
     }
 }

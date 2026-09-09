@@ -122,6 +122,52 @@ pub fn models_cached() -> bool {
     models_cached_in(None)
 }
 
+pub(crate) fn probe_models_in(dir: Option<&std::path::Path>) -> (usize, usize, usize) {
+    use std::io::Read;
+
+    let dir = dir.map(std::path::Path::to_path_buf).unwrap_or_else(default_cache_dir);
+    let mut present = 0;
+    let mut missing = 0;
+    let mut invalid = 0;
+    for (name, _, expected_size) in MODEL_FILES {
+        let path = dir.join(name);
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing += 1;
+                continue;
+            }
+            Err(_) => {
+                invalid += 1;
+                continue;
+            }
+        };
+        if metadata.len() != expected_size {
+            invalid += 1;
+            continue;
+        }
+        let readable = std::fs::File::open(path)
+            .and_then(|mut file| {
+                let mut byte = [0_u8; 1];
+                file.read_exact(&mut byte)
+            })
+            .is_ok();
+        if readable {
+            present += 1;
+        } else {
+            invalid += 1;
+        }
+    }
+    (present, missing, invalid)
+}
+
+pub(crate) fn cached_models_verified_in(dir: Option<&std::path::Path>) -> bool {
+    let dir = dir.map(std::path::Path::to_path_buf).unwrap_or_else(default_cache_dir);
+    MODEL_FILES
+        .iter()
+        .all(|(name, sha256, _)| crate::model_download::verify_sha256(&dir.join(name), sha256, name).is_ok())
+}
+
 /// Largest accepted model download; the encoder is ~89 MB.
 const MAX_MODEL_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -260,6 +306,13 @@ pub(crate) fn recognize_crop(crop: &RgbImage, accel: Option<&AccelerationConfig>
 /// runtime worker. The inline arm is unreachable today (the feature implies
 /// `tokio-runtime` and cannot be enabled on wasm32); it exists so the
 /// function stays total if either implication ever changes.
+///
+/// Both callers are themselves feature-gated entry points -- the PDF layout route
+/// (`extractors::pdf`, so `pdf`) and the image route (`any(ocr, ocr-wasm)`). With
+/// `formula-recognition` alone the recognizer has no entry point at all, so without this
+/// gate the wrapper is dead code. `recognize_crop` stays live either way via
+/// `recognize_for_test`. ~keep
+#[cfg(any(feature = "pdf", feature = "ocr", feature = "ocr-wasm"))]
 pub(crate) async fn recognize_crop_blocking(
     crop: RgbImage,
     accel: Option<AccelerationConfig>,
@@ -645,6 +698,26 @@ mod tests {
         assert_eq!(m.len(), 4);
         assert!(m.iter().all(|e| e.source_url.starts_with(RELEASE_BASE_URL)));
         assert!(m.iter().all(|e| e.sha256.len() == 64));
+    }
+
+    #[test]
+    fn bounded_cache_probe_does_not_hash_exact_size_artifacts() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for (name, _, size) in MODEL_FILES {
+            let file = std::fs::File::create(dir.path().join(name)).unwrap();
+            file.set_len(size).unwrap();
+        }
+
+        assert_eq!(probe_models_in(Some(dir.path())), (MODEL_FILES.len(), 0, 0));
+        assert!(!cached_models_verified_in(Some(dir.path())));
+    }
+
+    #[test]
+    fn bounded_cache_probe_reports_wrong_size_artifact_invalid() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(MODEL_FILES[0].0), b"truncated").unwrap();
+
+        assert_eq!(probe_models_in(Some(dir.path())), (0, MODEL_FILES.len() - 1, 1));
     }
 
     #[test]

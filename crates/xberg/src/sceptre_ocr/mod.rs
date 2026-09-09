@@ -340,15 +340,16 @@ fn run_blocking(
 ) -> Result<BlockingOutput> {
     #[cfg(not(auto_rotate))]
     let _ = rotation;
+    let decoded = decode_sceptre_image(image_bytes)?;
     #[cfg(auto_rotate)]
     let (image, orientation, was_rotated) = decode_and_rotate(
-        image_bytes,
+        decoded,
         rotation.enabled,
         rotation.detector.as_ref(),
         rotation.acceleration,
     )?;
     #[cfg(not(auto_rotate))]
-    let image = Image::from_bytes(image_bytes).map_err(map_sceptre_error)?;
+    let image = Image::from_rgb8(decoded.width(), decoded.height(), decoded.into_raw()).map_err(map_sceptre_error)?;
     let width = image.width();
     let height = image.height();
     let reader = reader_cell
@@ -368,22 +369,28 @@ fn run_blocking(
     })
 }
 
+fn decode_sceptre_image(image_bytes: &[u8]) -> Result<image::RgbImage> {
+    crate::extraction::image_decode::decode_standard_rgb8_with_default_security_limits(image_bytes).map_err(|error| {
+        XbergError::Ocr {
+            message: "Sceptre OCR operation failed".to_string(),
+            source: Some(Box::new(error)),
+        }
+    })
+}
+
 #[cfg(auto_rotate)]
 fn decode_and_rotate(
-    image_bytes: &[u8],
+    decoded: image::RgbImage,
     auto_rotate: bool,
     detector_cell: &OnceCell<crate::doc_orientation::DocOrientationDetector>,
     acceleration: Option<crate::core::config::AccelerationConfig>,
 ) -> Result<(Image, Option<crate::doc_orientation::OrientationResult>, bool)> {
     if !auto_rotate {
-        return Image::from_bytes(image_bytes)
+        return Image::from_rgb8(decoded.width(), decoded.height(), decoded.into_raw())
             .map(|image| (image, None, false))
             .map_err(map_sceptre_error);
     }
 
-    let decoded = image::load_from_memory(image_bytes)
-        .map_err(|error| ocr_error(format!("Failed to decode image for Sceptre auto-rotation: {error}")))?
-        .to_rgb8();
     let detector = detector_cell.get_or_init(|| {
         crate::doc_orientation::DocOrientationDetector::with_acceleration(
             crate::doc_orientation::resolve_cache_dir(),
@@ -1491,6 +1498,23 @@ mod tests {
             source.is_some(),
             "the Sceptre decode error must remain in the source chain"
         );
+    }
+
+    #[test]
+    fn should_reject_oversized_declared_dimensions_before_sceptre_decode() {
+        let bytes = crate::extraction::image_decode::bmp_with_declared_dimensions(6000, 6000);
+
+        let error = decode_sceptre_image(&bytes)
+            .expect_err("Sceptre decode must apply the default security budget before model work");
+
+        let XbergError::Ocr {
+            source: Some(source), ..
+        } = error
+        else {
+            panic!("Sceptre budget rejection must retain the validation error as its source");
+        };
+        assert!(source.to_string().contains("6000x6000"));
+        assert!(source.to_string().contains("security_limits.max_content_size"));
     }
 
     #[test]

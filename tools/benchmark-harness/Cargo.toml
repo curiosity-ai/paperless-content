@@ -28,7 +28,7 @@ path = "src/xberg_runtime_responsiveness_main.rs"
 
 [features]
 default = []
-profiling = ["pprof"]
+profiling = ["inferno", "pprof"]
 memory-profiling = ["tikv-jemallocator", "tikv-jemalloc-ctl"]
 glm-ocr-bench = ["xberg/candle-glm-ocr"]
 candle-deepseek-ocr-bench = ["xberg/candle-deepseek-ocr"]
@@ -57,13 +57,14 @@ blake3 = { workspace = true }
 chrono = { workspace = true }
 
 clap = { workspace = true }
-dirs = "6"
+dirs = "7"
 futures = { workspace = true }
-jsonschema = "0.51"
+
+inferno = { version = "0.12.8", default-features = false, features = ["nameattr"], optional = true }
+jsonschema = "0.55"
 libc = { workspace = true }
 num_cpus = { workspace = true }
-
-pprof = { version = "0.15", features = ["flamegraph", "criterion"], optional = true }
+pprof = { version = "0.15", optional = true }
 pulldown-cmark = "0.13"
 rayon = { workspace = true }
 regex = "1"

@@ -41,7 +41,9 @@ pub(crate) use sections::{
 // cannot see `pub(crate)` items. See its doc comment in `sections.rs` for the contract.
 pub use sections::layout_wastes_plain_output;
 
-pub(crate) use sections::{validate_binarization_method, validate_tesseract_oem, validate_tesseract_psm};
+#[cfg(test)]
+pub(crate) use sections::validate_binarization_method;
+pub(crate) use sections::{validate_image_preprocessing_config, validate_tesseract_oem, validate_tesseract_psm};
 
 // `validate_output_format` stays `#[cfg(test)]`-only, and correctly so: both
 // `ExtractionConfig::output_format` and `OcrConfig::output_format` are the strongly-typed
@@ -56,6 +58,8 @@ mod tests {
 
     #[test]
     fn test_validate_binarization_method_valid() {
+        assert!(validate_binarization_method("none").is_ok());
+        assert!(validate_binarization_method("off").is_ok());
         assert!(validate_binarization_method("otsu").is_ok());
         assert!(validate_binarization_method("adaptive").is_ok());
         assert!(validate_binarization_method("sauvola").is_ok());
@@ -63,6 +67,8 @@ mod tests {
 
     #[test]
     fn test_validate_binarization_method_case_insensitive() {
+        assert!(validate_binarization_method("NONE").is_ok());
+        assert!(validate_binarization_method("Off").is_ok());
         assert!(validate_binarization_method("OTSU").is_ok());
         assert!(validate_binarization_method("Adaptive").is_ok());
         assert!(validate_binarization_method("SAUVOLA").is_ok());
@@ -206,9 +212,24 @@ mod tests {
 
     #[test]
     fn test_validate_tesseract_psm_valid() {
-        for psm in 0..=13 {
+        for psm in 1..=13 {
             assert!(validate_tesseract_psm(psm).is_ok(), "PSM {} should be valid", psm);
         }
+    }
+
+    #[test]
+    fn should_reject_tesseract_psm_zero_because_osd_only_recognises_no_text() {
+        let error = validate_tesseract_psm(0).expect_err("PSM 0 is OSD-only and recognises no text");
+        let message = error.to_string();
+        assert!(
+            message.contains('0'),
+            "message should name the rejected value: {message}"
+        );
+        assert!(
+            message.contains("orientation"),
+            "message should say why PSM 0 cannot work: {message}"
+        );
+        assert!(message.contains('3'), "message should point at a usable PSM: {message}");
     }
 
     #[test]

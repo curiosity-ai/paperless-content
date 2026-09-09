@@ -85,8 +85,9 @@ extractor implementations, managed by the [plugin system](/concepts/plugin-syste
 
 If multiple extractors are registered for the same MIME type (for example, you registered a
 custom PDF extractor alongside the built-in one), the one with the higher `priority()` value
-is selected. All built-in extractors have a priority of 0, so any custom extractor with a
-priority above 0 takes precedence.
+is selected. Built-in extractors default to a priority of 50 (0-25 is reserved for
+fallback/low-quality extractors, 51-100 for premium or specialized ones), so a custom
+extractor needs a priority above 50 to take precedence over the built-in default.
 
 ```rust title="registry_lookup.rs"
 let registry = get_document_extractor_registry();
@@ -184,7 +185,12 @@ You register validators through the plugin system. See [Plugin System](/concepts
 
 These two steps run after validation.
 
-**Quality scoring** is optional. When `enable_quality_processing=True`, Xberg analyzes the extracted text and assigns a numeric score between 0.0 and 1.0. The score factors in the ratio of alphabetic characters to non-text characters, word frequency distribution (gibberish scores low), and the presence of formatting artifacts like repeated whitespace or encoding errors. The result is stored in `result.quality_score`.
+**Quality scoring** is optional. When `enable_quality_processing=True`, Xberg analyzes the retained text and assigns a
+cleanliness/readability score between 0.0 and 1.0. The score penalizes OCR artifacts, embedded script/style noise, and
+navigation chrome; it rewards sentence and paragraph structure, multiple paragraphs, and punctuation, with an
+optional metadata bonus. It is not a completeness or recall score: clean text can score highly even when other content
+was omitted. The result is stored in `result.quality_score`; inspect `result.processing_warnings` separately for known
+degraded or partial extraction.
 
 **Chunking** is also optional. When you provide a `ChunkingConfig`, the extracted text is split into overlapping fragments with configurable maximum size and overlap. Each chunk records its start and end offset relative to the original text.
 

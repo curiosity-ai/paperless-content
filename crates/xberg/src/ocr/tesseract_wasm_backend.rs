@@ -20,6 +20,7 @@ use crate::types::{ExtractedDocument, FormatMetadata, Metadata, OcrMetadata};
 use async_trait::async_trait;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::path::Path;
 use std::sync::Mutex;
 use xberg_tesseract::{Pix, TessMonitor, TessPageSegMode, TesseractAPI};
@@ -47,6 +48,9 @@ const DEFAULT_WASM_PSM: TessPageSegMode = TessPageSegMode::PSM_SINGLE_BLOCK;
 /// well under typical caller-side timeouts (e.g. the 30s WASM smoke-test
 /// limit that exposed issue #855).
 const RECOGNITION_DEADLINE_MS: i32 = 15_000;
+const MAX_WASM_OCR_IMAGE_DIMENSION: u32 = 4_096;
+const MAX_WASM_OCR_IMAGE_PIXELS: u64 = MAX_WASM_OCR_IMAGE_DIMENSION as u64 * MAX_WASM_OCR_IMAGE_DIMENSION as u64;
+const MAX_WASM_OCR_DECODE_ALLOCATION_BYTES: u64 = 128 * 1024 * 1024;
 
 /// WASM-compatible Tesseract OCR backend.
 #[cfg_attr(alef, alef(skip))]
@@ -131,7 +135,9 @@ impl OcrBackend for TesseractWasmBackend {
             });
         }
 
-        let languages = config.effective_languages();
+        // Reconciled with `tesseract_config.language` the same way the native backend does
+        // (#1572), so the two Tesseract backends agree on which field wins.
+        let languages = config.effective_tesseract_language();
         let language = languages[0].clone();
         if languages.len() > 1 {
             tracing::warn!(
@@ -142,16 +148,23 @@ impl OcrBackend for TesseractWasmBackend {
         }
         let tessdata = self.resolve_tessdata(&language, config)?;
 
-        let img = image::load_from_memory(image_bytes).map_err(|e| crate::XbergError::Ocr {
-            message: format!("Failed to decode image for OCR: {e}"),
-            source: Some(Box::new(e)),
-        })?;
-        let rgb = img.to_rgb8();
+        let img = decode_wasm_ocr_image(image_bytes)?;
+        let rgb = img.into_rgb8();
         let (width, height) = rgb.dimensions();
         let pix = Pix::from_raw_rgb(rgb.as_raw(), width, height).map_err(|e| crate::XbergError::Ocr {
             message: format!("Failed to create Leptonica Pix from image: {e}"),
             source: Some(Box::new(e)),
         })?;
+        drop(rgb);
+        let pix = match resolve_preprocessing(config) {
+            Some(preprocessing) => crate::ocr::preprocessing::preprocess_pix(pix, preprocessing).map_err(|error| {
+                crate::XbergError::Ocr {
+                    message: format!("Failed to preprocess image for OCR: {error}"),
+                    source: Some(Box::new(error)),
+                }
+            })?,
+            None => pix,
+        };
 
         let api = TesseractAPI::new().map_err(|e| crate::XbergError::Ocr {
             message: format!("Failed to create Tesseract API handle: {e}"),
@@ -243,17 +256,88 @@ fn bundled_eng_traineddata() -> Option<&'static [u8]> {
 
 /// Resolves the page segmentation mode to use for a recognition call.
 ///
-/// Respects `config.tesseract_config.psm` when it is present and maps to a
-/// valid `TessPageSegMode`. Falls back to [`DEFAULT_WASM_PSM`] — never to
-/// Tesseract's own `PSM_AUTO` default — when the config is unset or carries
-/// an out-of-range value, so callers can never end up hitting the PSM_AUTO
-/// hang described in issue #855 by omission.
+/// Respects `config.tesseract_config.psm` when it is explicitly set (not just when
+/// `tesseract_config` itself is present — #1573) and maps to a valid `TessPageSegMode`.
+/// Falls back to [`DEFAULT_WASM_PSM`] — never to Tesseract's own `PSM_AUTO` default —
+/// when `psm` is unset or carries an out-of-range value, so callers can never end up
+/// hitting the PSM_AUTO hang described in issue #855 by omission.
 fn resolve_psm(config: &OcrConfig) -> TessPageSegMode {
     config
         .tesseract_config
         .as_ref()
-        .and_then(|c| TessPageSegMode::try_from_int(c.psm))
+        .and_then(|c| c.psm)
+        .and_then(TessPageSegMode::try_from_int)
         .unwrap_or(DEFAULT_WASM_PSM)
+}
+
+fn resolve_preprocessing(config: &OcrConfig) -> Option<&crate::types::ImagePreprocessingConfig> {
+    config
+        .tesseract_config
+        .as_ref()
+        .and_then(|tesseract| tesseract.preprocessing.as_ref())
+}
+
+fn decode_wasm_ocr_image(image_bytes: &[u8]) -> Result<image::DynamicImage> {
+    let limits = wasm_ocr_decode_limits();
+    let mut reader = image::ImageReader::new(Cursor::new(image_bytes))
+        .with_guessed_format()
+        .map_err(ocr_image_decode_error)?;
+    reader.limits(limits.clone());
+    let format = reader.format().ok_or_else(|| crate::XbergError::Validation {
+        message: "OCR input image format could not be determined".to_string(),
+        source: None,
+    })?;
+    let dimensions = reader.into_dimensions().map_err(wasm_ocr_image_error)?;
+    validate_wasm_ocr_dimensions(dimensions.0, dimensions.1)?;
+
+    let mut reader = image::ImageReader::with_format(Cursor::new(image_bytes), format);
+    reader.limits(limits);
+    reader.decode().map_err(wasm_ocr_image_error)
+}
+
+fn wasm_ocr_decode_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_WASM_OCR_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_WASM_OCR_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_WASM_OCR_DECODE_ALLOCATION_BYTES);
+    limits
+}
+
+fn validate_wasm_ocr_dimensions(width: u32, height: u32) -> Result<()> {
+    let pixels = u64::from(width) * u64::from(height);
+    if width == 0
+        || height == 0
+        || width > MAX_WASM_OCR_IMAGE_DIMENSION
+        || height > MAX_WASM_OCR_IMAGE_DIMENSION
+        || pixels > MAX_WASM_OCR_IMAGE_PIXELS
+    {
+        return Err(crate::XbergError::Validation {
+            message: format!(
+                "OCR input dimensions {width}x{height} exceed the WebAssembly limit of \
+                 {MAX_WASM_OCR_IMAGE_DIMENSION}x{MAX_WASM_OCR_IMAGE_DIMENSION}"
+            ),
+            source: None,
+        });
+    }
+    Ok(())
+}
+
+fn ocr_image_decode_error(error: impl std::error::Error + Send + Sync + 'static) -> crate::XbergError {
+    crate::XbergError::Ocr {
+        message: format!("Failed to decode image for OCR: {error}"),
+        source: Some(Box::new(error)),
+    }
+}
+
+fn wasm_ocr_image_error(error: image::ImageError) -> crate::XbergError {
+    if matches!(error, image::ImageError::Limits(_)) {
+        crate::XbergError::Validation {
+            message: "OCR input image exceeds WebAssembly decoding limits".to_string(),
+            source: Some(Box::new(error)),
+        }
+    } else {
+        ocr_image_decode_error(error)
+    }
 }
 
 #[cfg(test)]
@@ -288,10 +372,43 @@ mod tests {
     }
 
     #[test]
+    fn should_resolve_wasm_preprocessing_from_tesseract_config() {
+        let preprocessing = crate::types::ImagePreprocessingConfig {
+            denoise: true,
+            ..Default::default()
+        };
+        let config = OcrConfig {
+            tesseract_config: Some(crate::types::TesseractConfig {
+                preprocessing: Some(preprocessing),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(resolve_preprocessing(&config).is_some_and(|resolved| resolved.denoise));
+    }
+
+    #[test]
+    fn should_reject_wasm_ocr_images_over_the_dimension_budget() {
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::new(MAX_WASM_OCR_IMAGE_DIMENSION + 1, 1));
+        let mut encoded = Cursor::new(Vec::new());
+        image.write_to(&mut encoded, image::ImageFormat::Png).unwrap();
+
+        let result = decode_wasm_ocr_image(encoded.get_ref());
+
+        assert!(matches!(result, Err(crate::XbergError::Validation { .. })));
+    }
+
+    #[test]
+    fn should_accept_wasm_ocr_images_within_the_pixel_budget() {
+        assert!(validate_wasm_ocr_dimensions(MAX_WASM_OCR_IMAGE_DIMENSION, MAX_WASM_OCR_IMAGE_DIMENSION).is_ok());
+    }
+
+    #[test]
     fn should_respect_explicit_psm_from_tesseract_config() {
         let config = OcrConfig {
             tesseract_config: Some(crate::types::TesseractConfig {
-                psm: 7,
+                psm: Some(7),
                 ..Default::default()
             }),
             ..Default::default()
@@ -304,7 +421,7 @@ mod tests {
     fn should_respect_explicit_psm_auto_when_caller_opts_in() {
         let config = OcrConfig {
             tesseract_config: Some(crate::types::TesseractConfig {
-                psm: 3,
+                psm: Some(3),
                 ..Default::default()
             }),
             ..Default::default()
@@ -317,7 +434,23 @@ mod tests {
     fn should_fall_back_to_default_wasm_psm_for_out_of_range_psm_value() {
         let config = OcrConfig {
             tesseract_config: Some(crate::types::TesseractConfig {
-                psm: 255,
+                psm: Some(255),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(resolve_psm(&config), DEFAULT_WASM_PSM);
+    }
+
+    // Regression test for #1573: a `TesseractConfig` present for a reason unrelated to
+    // `psm` must still resolve to the platform default PSM, exactly as if the struct
+    // were absent — the field's absence, not the struct's, is what should matter.
+    #[test]
+    fn should_fall_back_to_default_wasm_psm_when_tesseract_config_present_but_psm_unset() {
+        let config = OcrConfig {
+            tesseract_config: Some(crate::types::TesseractConfig {
+                enable_table_detection: false,
                 ..Default::default()
             }),
             ..Default::default()

@@ -345,14 +345,22 @@ where
 /// # Returns
 ///
 /// The rendered image as bytes in the specified format.
-#[tracing::instrument(name = "pdf.render_page", skip_all, fields(page = page_num, dpi = options.dpi), err)]
+#[tracing::instrument(name = "pdf.render_page", skip_all, fields(page = page_num, dpi = options.dpi))]
 pub fn render_page(
     doc: &crate::document::PdfDocument,
     page_num: usize,
     options: &RenderOptions,
 ) -> Result<RenderedImage> {
+    // The rasterizer decodes text through the same font paths as extraction, so
+    // it needs the document in scope for those recoveries to be counted rather
+    // than lost (GH#1547). ~keep
+    let _recovery_scope = crate::extractors::recovery_tally::RecoveryScope::enter(doc.recovery_counts());
     let mut renderer = PageRenderer::new(options.clone());
-    renderer.render_page(doc, page_num)
+    let result = renderer.render_page(doc, page_num);
+    if let Err(error) = &result {
+        crate::error::trace_failure("render_page", error);
+    }
+    result
 }
 
 /// Render a rectangular region of a page. `crop_rect_pt` is in PDF

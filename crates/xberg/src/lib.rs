@@ -27,7 +27,7 @@
 //!
 //! - Fast parallel processing with async/await
 //! - Priority-based extractor selection
-//! - Comprehensive MIME type detection (115 file extensions)
+//! - Comprehensive MIME type detection (141 file extensions)
 //! - Configurable caching and quality processing
 //! - Cross-language plugin support (Python, Node.js planned)
 
@@ -108,8 +108,12 @@ pub mod sparse_embeddings;
 #[cfg(any(feature = "late-interaction-presets", feature = "late-interaction"))]
 pub mod late_interaction;
 
-#[cfg(feature = "ocr-pipeline")]
-/// Image preprocessing and DPI utilities for OCR pipelines.
+// `layout-detection` renders PDF pages itself and needs `image::dpi` to honour a configured
+// render DPI (#1577); it does not imply `ocr-pipeline`, so the module gate has to cover both or
+// `pdf + layout-detection` fails to compile. The submodules that genuinely need the OCR
+// dependency set stay gated inside `image/mod.rs`. ~keep
+#[cfg(any(feature = "ocr-pipeline", feature = "layout-detection"))]
+/// Image preprocessing and DPI utilities for OCR and layout pipelines.
 pub mod image;
 
 #[cfg(feature = "language-detection")]
@@ -224,11 +228,12 @@ pub use core::config::{
     ChunkClassificationDefinition, ChunkSizing, ChunkerType, ChunkingConfig, ConcurrencyConfig, ContentFilterConfig,
     CredentialProviderConfig, CsvConfig, EmailConfig, EmbeddingConfig, EmbeddingModelType, ExecutionProviderType,
     ExtractInput, ExtractInputKind, ExtractionConfig, ExtractionErrorItem, ExtractionResult, ExtractionSummary,
-    FileExtractionConfig, ImageExtractionConfig, JupyterCellRendering, LanguageDetectionConfig, LlmBudgetConfig,
-    LlmCacheConfig, LlmConfig, LlmProviderConfig, LlmRateLimitConfig, MergeMode, NerBackendKind, NerConfig, OcrConfig,
-    OutputFormat, PageClassificationConfig, PageConfig, PostProcessorConfig, RedactionConfig, RedactionPattern,
-    RedactionTerm, RerankerConfig, RerankerHead, RerankerModelType, StructuredExtractionConfig, SummarizationConfig,
-    TableChunkingMode, TokenReductionOptions, TranslationConfig, UrlExtractionConfig, UrlExtractionMode,
+    FileExtractionConfig, GeoJsonExtractionConfig, ImageExtractionConfig, JupyterCellRendering,
+    LanguageDetectionConfig, LlmBudgetConfig, LlmCacheConfig, LlmConfig, LlmProviderConfig, LlmRateLimitConfig,
+    MergeMode, MimeDetectionPolicy, NerBackendKind, NerConfig, OcrConfig, OutputFormat, PageClassificationConfig,
+    PageConfig, PostProcessorConfig, RedactionConfig, RedactionPattern, RedactionTerm, RerankerConfig, RerankerHead,
+    RerankerModelType, StructuredExtractionConfig, SummarizationConfig, TableChunkingMode, TokenReductionOptions,
+    TranslationConfig, UrlExtractionConfig, UrlExtractionMode,
 };
 pub use core::config::{
     LateInteractionConfig, LateInteractionModelType, SparseEmbeddingConfig, SparseEmbeddingModelType,
@@ -351,7 +356,10 @@ pub use tree_sitter_language_pack::{
     CommentKind, DiagnosticSeverity, ExportKind, FileMetrics, ProcessConfig, StructureKind,
 };
 
-pub use core::mime::{SupportedFormat, detect_mime_type_from_bytes, get_extensions_for_mime, list_supported_formats};
+pub use core::mime::{
+    SUPPORTED_EXTENSION_COUNT, SUPPORTED_FORMAT_COUNT, SupportedFormat, detect_mime_type_from_bytes,
+    get_extensions_for_mime, list_supported_formats,
+};
 
 /// Detect the MIME type of a file at the given path.
 ///

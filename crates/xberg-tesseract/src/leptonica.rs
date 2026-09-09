@@ -87,6 +87,29 @@ ffi_extern! {
         ppixd: *mut *mut c_void,
     ) -> i32;
 
+    /// Applies a grayscale rank filter. A rank of 0.5 is a median filter.
+    fn pixRankFilterGray(pixs: *mut c_void, width: i32, height: i32, rank: f32) -> *mut c_void;
+
+    /// Applies a gamma transfer curve while stretching the selected input range to 0–255.
+    fn pixGammaTRC(
+        pixd: *mut c_void,
+        pixs: *mut c_void,
+        gamma: f32,
+        min_value: i32,
+        max_value: i32,
+    ) -> *mut c_void;
+
+    /// Applies tiled Sauvola local thresholding to an 8 bpp grayscale image.
+    fn pixSauvolaBinarizeTiled(
+        pixs: *mut c_void,
+        window_half_size: i32,
+        factor: f32,
+        tile_columns: i32,
+        tile_rows: i32,
+        ppixth: *mut *mut c_void,
+        ppixd: *mut *mut c_void,
+    ) -> i32;
+
     /// Normalises the background of a grayscale image using morphological operations.
     ///
     /// `reduction` is the subsampling factor (e.g. 4), `size` is the morphological
@@ -184,6 +207,12 @@ unsafe impl Send for Pix {}
 
 #[cfg(any(feature = "build-tesseract", feature = "build-tesseract-wasm"))]
 impl Pix {
+    const ADAPTIVE_OTSU_SCORE_FRACTION: f32 = 0.1;
+    const ADAPTIVE_OTSU_SMOOTHING_HALF_WIDTH: i32 = 1;
+    const MEDIAN_FILTER_RANK: f32 = 0.5;
+    const MINIMUM_OTSU_TILE_DIMENSION: i32 = 16;
+    const STANDARD_OTSU_SCORE_FRACTION: f32 = 0.0;
+
     /// Creates a 32 bpp Leptonica Pix from a packed RGB byte slice.
     ///
     /// `data` must contain exactly `width * height * 3` bytes in left-to-right,
@@ -336,26 +365,178 @@ impl Pix {
     /// assert_eq!(binary.depth(), 1);
     /// ```
     pub fn adaptive_threshold(&self, tile_width: i32, tile_height: i32) -> Result<Pix> {
+        if tile_width < Self::MINIMUM_OTSU_TILE_DIMENSION || tile_height < Self::MINIMUM_OTSU_TILE_DIMENSION {
+            return Err(TesseractError::InvalidParameterError);
+        }
+        self.otsu_threshold_with_options(
+            tile_width,
+            tile_height,
+            Self::ADAPTIVE_OTSU_SMOOTHING_HALF_WIDTH,
+            Self::ADAPTIVE_OTSU_SMOOTHING_HALF_WIDTH,
+            Self::ADAPTIVE_OTSU_SCORE_FRACTION,
+        )
+    }
+
+    /// Binarises this image using one global standard Otsu threshold.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TesseractError::InvalidParameterError` for non-grayscale input,
+    /// or an OCR/null-pointer error if Leptonica cannot create the binary image.
+    pub fn otsu_threshold(&self) -> Result<Pix> {
+        self.otsu_threshold_with_options(
+            self.width().max(Self::MINIMUM_OTSU_TILE_DIMENSION),
+            self.height().max(Self::MINIMUM_OTSU_TILE_DIMENSION),
+            0,
+            0,
+            Self::STANDARD_OTSU_SCORE_FRACTION,
+        )
+    }
+
+    fn otsu_threshold_with_options(
+        &self,
+        tile_width: i32,
+        tile_height: i32,
+        smooth_x: i32,
+        smooth_y: i32,
+        score_fraction: f32,
+    ) -> Result<Pix> {
+        self.require_grayscale()?;
+        let resolution = self.get_resolution()?;
         let mut result: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `self.ptr` is an owned non-null 8 bpp Pix, all scalar options are validated by
+        // the public callers, the threshold output is intentionally null, and `result` lives for
+        // the call and is adopted or freed exactly once below.
         let status = unsafe {
             pixOtsuAdaptiveThreshold(
                 self.ptr,
                 tile_width,
                 tile_height,
-                0,
-                0,
-                0.1,
+                smooth_x,
+                smooth_y,
+                score_fraction,
                 std::ptr::null_mut(),
                 &mut result,
             )
         };
         if status != 0 {
+            Self::discard_transformed_ptr(result);
             return Err(TesseractError::OcrError);
         }
         if result.is_null() {
             return Err(TesseractError::NullPointerError);
         }
-        Ok(Pix { ptr: result })
+        Self::from_transformed_ptr(result, resolution)
+    }
+
+    /// Removes impulse noise from an 8 bpp image with a median rank filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TesseractError::InvalidParameterError` unless the input is
+    /// grayscale and both filter dimensions are positive.
+    pub fn median_filter(&self, width: i32, height: i32) -> Result<Pix> {
+        self.require_grayscale()?;
+        if width <= 0 || height <= 0 {
+            return Err(TesseractError::InvalidParameterError);
+        }
+        let resolution = self.get_resolution()?;
+        // SAFETY: `self.ptr` is an owned non-null 8 bpp Pix and the positive kernel dimensions
+        // were validated above; the returned allocation is adopted exactly once below.
+        let result = unsafe { pixRankFilterGray(self.ptr, width, height, Self::MEDIAN_FILTER_RANK) };
+        Self::from_transformed_ptr(result, resolution)
+    }
+
+    /// Stretches a grayscale intensity range to 0–255 with gamma correction.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TesseractError::InvalidParameterError` unless `gamma` is finite
+    /// and positive and `0 <= min_value < max_value <= 255`.
+    pub fn contrast_stretch(&self, gamma: f32, min_value: i32, max_value: i32) -> Result<Pix> {
+        self.require_grayscale()?;
+        if !gamma.is_finite() || gamma <= 0.0 || min_value < 0 || max_value > 255 || min_value >= max_value {
+            return Err(TesseractError::InvalidParameterError);
+        }
+        let resolution = self.get_resolution()?;
+        // SAFETY: `self.ptr` is an owned non-null 8 bpp Pix, the transfer parameters were
+        // validated above, and a null destination requests a new allocation adopted below.
+        let result = unsafe { pixGammaTRC(std::ptr::null_mut(), self.ptr, gamma, min_value, max_value) };
+        Self::from_transformed_ptr(result, resolution)
+    }
+
+    /// Binarises an 8 bpp image using tiled Sauvola local thresholds.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TesseractError::InvalidParameterError` for invalid window,
+    /// factor, tile-count, or input-depth values. Returns an OCR/null-pointer
+    /// error if Leptonica cannot create the binary output.
+    pub fn sauvola_threshold(
+        &self,
+        window_half_size: i32,
+        factor: f32,
+        tile_columns: i32,
+        tile_rows: i32,
+    ) -> Result<Pix> {
+        self.require_grayscale()?;
+        let minimum_dimension = self.width().min(self.height());
+        let window_fits = window_half_size
+            .checked_mul(2)
+            .and_then(|diameter| diameter.checked_add(3))
+            .is_some_and(|minimum_required| minimum_dimension >= minimum_required);
+        if window_half_size < 2
+            || !window_fits
+            || !factor.is_finite()
+            || factor < 0.0
+            || tile_columns < 1
+            || tile_rows < 1
+        {
+            return Err(TesseractError::InvalidParameterError);
+        }
+
+        let resolution = self.get_resolution()?;
+        let mut result: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `self.ptr` is an owned non-null 8 bpp Pix, the window/factor/tile values were
+        // validated above, the threshold output is intentionally null, and `result` lives for the
+        // call and is adopted or freed exactly once below.
+        let status = unsafe {
+            pixSauvolaBinarizeTiled(
+                self.ptr,
+                window_half_size,
+                factor,
+                tile_columns,
+                tile_rows,
+                std::ptr::null_mut(),
+                &mut result,
+            )
+        };
+        if status != 0 {
+            Self::discard_transformed_ptr(result);
+            return Err(TesseractError::OcrError);
+        }
+        Self::from_transformed_ptr(result, resolution)
+    }
+
+    fn require_grayscale(&self) -> Result<()> {
+        if self.depth() == 8 {
+            Ok(())
+        } else {
+            Err(TesseractError::InvalidParameterError)
+        }
+    }
+
+    fn from_transformed_ptr(ptr: *mut c_void, resolution: (i32, i32)) -> Result<Pix> {
+        if ptr.is_null() {
+            return Err(TesseractError::NullPointerError);
+        }
+        let mut pix = Pix { ptr };
+        pix.set_resolution(resolution.0, resolution.1)?;
+        Ok(pix)
+    }
+
+    fn discard_transformed_ptr(ptr: *mut c_void) {
+        drop(Pix { ptr });
     }
 
     /// Returns the horizontal and vertical resolution (DPI) of this image.
@@ -724,9 +905,41 @@ impl Drop for Pix {
 mod tests {
     use super::*;
 
+    const TEST_X_RESOLUTION: i32 = 240;
+    const TEST_Y_RESOLUTION: i32 = 180;
+
     fn make_rgb_pix(width: u32, height: u32, fill: u8) -> Pix {
         let data = vec![fill; (width * height * 3) as usize];
         Pix::from_raw_rgb(&data, width, height).expect("from_raw_rgb failed")
+    }
+
+    fn gray_pixel(pix: &Pix, x: i32, y: i32) -> f64 {
+        pix.clip_rectangle(x, y, 1, 1)
+            .expect("clip failed")
+            .mean_gray_value(1)
+            .expect("pixel read failed")
+    }
+
+    fn gray_fixture(width: u32, height: u32) -> Pix {
+        let mut data = Vec::with_capacity((width * height * 3) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let value = 48 + ((x * 160) / width) as u8;
+                let value = if (x + y * 17).is_multiple_of(53) { 255 } else { value };
+                data.extend_from_slice(&[value, value, value]);
+            }
+        }
+        make_gray_pix_with_resolution(&data, width, height)
+    }
+
+    fn make_gray_pix_with_resolution(data: &[u8], width: u32, height: u32) -> Pix {
+        let mut pix = Pix::from_raw_rgb(data, width, height)
+            .expect("from_raw_rgb failed")
+            .to_grayscale()
+            .expect("to_grayscale failed");
+        pix.set_resolution(TEST_X_RESOLUTION, TEST_Y_RESOLUTION)
+            .expect("set_resolution failed");
+        pix
     }
 
     #[test]
@@ -790,6 +1003,109 @@ mod tests {
         let gray = pix.to_grayscale().expect("to_grayscale failed");
         let binary = gray.adaptive_threshold(32, 32).expect("adaptive_threshold failed");
         assert_eq!(binary.depth(), 1);
+    }
+
+    #[test]
+    fn median_filter_removes_single_pixel_noise_and_preserves_resolution() {
+        const WIDTH: u32 = 9;
+        const HEIGHT: u32 = 9;
+        let mut data = vec![200; (WIDTH * HEIGHT * 3) as usize];
+        let center = ((HEIGHT / 2 * WIDTH + WIDTH / 2) * 3) as usize;
+        data[center..center + 3].fill(0);
+        let gray = make_gray_pix_with_resolution(&data, WIDTH, HEIGHT);
+
+        let filtered = gray.median_filter(3, 3).expect("median_filter failed");
+
+        assert_eq!(gray_pixel(&filtered, 4, 4), 200.0);
+        assert_eq!(
+            filtered.get_resolution().unwrap(),
+            (TEST_X_RESOLUTION, TEST_Y_RESOLUTION)
+        );
+    }
+
+    #[test]
+    fn contrast_stretch_changes_dynamic_range_and_preserves_resolution() {
+        let width = 3;
+        let data = [50, 50, 50, 125, 125, 125, 200, 200, 200];
+        let gray = make_gray_pix_with_resolution(&data, width, 1);
+
+        let stretched = gray.contrast_stretch(1.0, 50, 200).expect("contrast_stretch failed");
+
+        assert_eq!(gray_pixel(&stretched, 0, 0), 0.0);
+        assert_eq!(gray_pixel(&stretched, 2, 0), 255.0);
+        assert_eq!(
+            stretched.get_resolution().unwrap(),
+            (TEST_X_RESOLUTION, TEST_Y_RESOLUTION)
+        );
+    }
+
+    #[test]
+    fn global_otsu_threshold_produces_binary_and_preserves_resolution() {
+        let gray = gray_fixture(96, 64);
+
+        let binary = gray.otsu_threshold().expect("otsu_threshold failed");
+
+        assert_eq!(binary.depth(), 1);
+        assert_eq!(binary.get_resolution().unwrap(), (TEST_X_RESOLUTION, TEST_Y_RESOLUTION));
+    }
+
+    #[test]
+    fn adaptive_otsu_threshold_produces_binary_and_preserves_resolution() {
+        let gray = gray_fixture(96, 64);
+
+        let binary = gray.adaptive_threshold(32, 32).expect("adaptive_threshold failed");
+
+        assert_eq!(binary.depth(), 1);
+        assert_eq!(binary.get_resolution().unwrap(), (TEST_X_RESOLUTION, TEST_Y_RESOLUTION));
+    }
+
+    #[test]
+    fn tiled_sauvola_threshold_produces_binary_and_preserves_resolution() {
+        let gray = gray_fixture(96, 64);
+
+        let binary = gray.sauvola_threshold(7, 0.35, 2, 2).expect("sauvola_threshold failed");
+
+        assert_eq!(binary.depth(), 1);
+        assert_eq!(binary.get_resolution().unwrap(), (TEST_X_RESOLUTION, TEST_Y_RESOLUTION));
+    }
+
+    #[test]
+    fn preprocessing_wrappers_reject_invalid_parameters_before_ffi() {
+        let rgb = make_rgb_pix(32, 32, 128);
+        let gray = rgb.to_grayscale().expect("to_grayscale failed");
+
+        assert!(matches!(
+            rgb.median_filter(3, 3),
+            Err(TesseractError::InvalidParameterError)
+        ));
+        assert!(matches!(
+            gray.median_filter(0, 3),
+            Err(TesseractError::InvalidParameterError)
+        ));
+        assert!(matches!(
+            gray.contrast_stretch(f32::NAN, 0, 255),
+            Err(TesseractError::InvalidParameterError)
+        ));
+        assert!(matches!(
+            gray.contrast_stretch(1.0, 200, 100),
+            Err(TesseractError::InvalidParameterError)
+        ));
+        assert!(matches!(
+            gray.adaptive_threshold(8, 32),
+            Err(TesseractError::InvalidParameterError)
+        ));
+        assert!(matches!(
+            gray.sauvola_threshold(1, 0.35, 1, 1),
+            Err(TesseractError::InvalidParameterError)
+        ));
+        assert!(matches!(
+            gray.sauvola_threshold(7, -0.1, 1, 1),
+            Err(TesseractError::InvalidParameterError)
+        ));
+        assert!(matches!(
+            gray.sauvola_threshold(7, 0.35, 0, 1),
+            Err(TesseractError::InvalidParameterError)
+        ));
     }
 
     #[test]

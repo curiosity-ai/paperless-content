@@ -8,17 +8,20 @@ pub(super) fn probe_layout(config: &ExtractionConfig) -> Vec<DoctorCheck> {
     #[cfg(not(feature = "layout-types"))]
     {
         let _ = config;
-        Vec::new()
+        vec![DoctorCheck::skip(
+            "layout",
+            "layout detection configuration is not available in this build",
+        )]
     }
     #[cfg(feature = "layout-types")]
     {
         if config.layout.is_none() {
-            return Vec::new();
+            return vec![DoctorCheck::skip("layout", "layout detection is not configured")];
         }
         #[cfg(target_arch = "wasm32")]
         let reason = "layout inference is not available on wasm32";
         #[cfg(all(not(target_arch = "wasm32"), not(layout_detection)))]
         let reason = "layout detection is not compiled in (enable `layout-detection` or `layout-tract`)";
-        vec![DoctorCheck::skip("layout", reason)]
+        vec![DoctorCheck::fail("layout", reason)]
     }
 }

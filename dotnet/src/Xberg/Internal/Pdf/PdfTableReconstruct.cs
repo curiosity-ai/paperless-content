@@ -78,10 +78,66 @@ internal static partial class PdfTableReconstruct
     /// <summary>Port of `segments_to_words`.</summary>
     public static List<HocrWord> SegmentsToWords(List<SegmentData> segments, float pageHeight)
     {
-        var words = new List<HocrWord>();
+        var perSegment = new List<List<HocrWord>>(segments.Count);
         foreach (var seg in segments)
+        {
+            var words = new List<HocrWord>();
             SplitSegmentToWords(seg, pageHeight, words);
-        return words;
+            perSegment.Add(words);
+        }
+        return MergeTouchingSegmentBoundaries(segments, perSegment);
+    }
+
+    /// <summary>
+    /// Rejoin a word split across two adjacent segments before cells are assigned, so the
+    /// cell-text join never re-inserts a space the word split dropped by construction.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="HocrWord"/> is integer-rounded and carries neither font size nor baseline, so a
+    /// sub-point gap like the reported 0.069 pt is not representable once words exist: the test
+    /// has to run here, on the segments, one boundary at a time. Only the last word of one
+    /// segment's group and the first of the next can be a split-word boundary, since a segment's
+    /// own words came from whitespace-splitting its own text (xberg-io/xberg#1566).
+    /// </remarks>
+    private static List<HocrWord> MergeTouchingSegmentBoundaries(
+        List<SegmentData> segments, List<List<HocrWord>> perSegment)
+    {
+        for (int boundary = 0; boundary + 1 < perSegment.Count; boundary++)
+        {
+            var left = perSegment[boundary];
+            var right = perSegment[boundary + 1];
+            if (left.Count == 0 || right.Count == 0) continue;
+            if (!PdfStructure.SegmentsAreTouching(
+                    segments[boundary], left[^1].Text, segments[boundary + 1], right[0].Text))
+                continue;
+
+            var prevWord = left[^1];
+            left.RemoveAt(left.Count - 1);
+            right[0] = MergeHocrWords(prevWord, right[0]);
+        }
+
+        var merged = new List<HocrWord>();
+        foreach (var group in perSegment) merged.AddRange(group);
+        return merged;
+    }
+
+    /// <summary>Combine two words that are one split word: text concatenated with no separator,
+    /// bounding box the union of both, confidence the lower of the two.</summary>
+    private static HocrWord MergeHocrWords(HocrWord prev, HocrWord next)
+    {
+        uint left = Math.Min(prev.Left, next.Left);
+        uint top = Math.Min(prev.Top, next.Top);
+        uint right = Math.Max(prev.Right, next.Right);
+        uint bottom = Math.Max(prev.Bottom, next.Bottom);
+        return new HocrWord
+        {
+            Text = prev.Text + next.Text,
+            Left = left,
+            Top = top,
+            Width = right - left,
+            Height = bottom - top,
+            Confidence = Math.Min(prev.Confidence, next.Confidence),
+        };
     }
 
     private static void SplitSegmentToWords(SegmentData seg, float pageHeight, List<HocrWord> outWords)
@@ -838,7 +894,17 @@ internal static partial class PdfTableReconstruct
         var dataRows = table.GetRange(dataStart, table.Count - dataStart);
 
         if (headerRows.Count > 2)
-            headerRows = headerRows.GetRange(headerRows.Count - 2, 2);
+        {
+            // Keep the two-row header cap, but do not discard an unusually long prefix the
+            // data-start inference produced: earlier rows are still table content. They are
+            // demoted to data in their original order, and the two rows closest to the detected
+            // boundary stay the header (xberg-io/xberg#1558).
+            int surplus = headerRows.Count - 2;
+            var demoted = headerRows.GetRange(0, surplus);
+            headerRows.RemoveRange(0, surplus);
+            demoted.AddRange(dataRows);
+            dataRows = demoted;
+        }
 
         if (headerRows.Count == 0)
         {
@@ -1056,9 +1122,19 @@ internal static partial class PdfTableReconstruct
         // Normalize cells.
         for (int i = 0; i < processed[0].Count; i++)
             processed[0][i] = processed[0][i].Trim().Replace("  ", " ");
+        // Gated per column rather than applied to every data cell: the dash and exponent
+        // rewriting is right for a financial column (an em-dash cell means nil, `1.5E-05` is
+        // scientific notation) and corrupts a prose one (`Functionaliteit—12`, a part code
+        // `HRE - HReco`). Row 0 never reaches this loop (xberg-io/xberg#1582).
+        var numericColumns = new bool[processed[0].Count];
+        for (int c = 0; c < numericColumns.Length; c++)
+            numericColumns[c] = ColumnIsNumericForNormalization(processed, c);
+
         for (int r = 1; r < processed.Count; r++)
             for (int c = 0; c < processed[r].Count; c++)
-                processed[r][c] = NormalizeDataCell(processed[r][c]);
+                processed[r][c] = c < numericColumns.Length && numericColumns[c]
+                    ? NormalizeDataCell(processed[r][c])
+                    : processed[r][c].Trim();
 
         return processed;
     }
@@ -1104,19 +1180,97 @@ internal static partial class PdfTableReconstruct
 
     private static string NormalizeDataCell(string cell)
     {
-        string text = cell.Trim();
-        if (text.Length == 0) return "";
+        string trimmed = cell.Trim();
+        if (trimmed.Length == 0) return "";
 
-        text = text.Replace('—', '-').Replace('–', '-').Replace('−', '-');
-
-        if (text.StartsWith("- ")) text = "-" + text.Substring(2).TrimStart();
-
-        text = text.Replace("- ", "-");
-        text = text.Replace(" -", "-");
+        string text = NormalizeDashGlyphsAndSpacing(trimmed);
         text = text.Replace("E-", "e-").Replace("E+", "e+");
 
-        if (text == "-") return "";
+        return text == "-" ? "" : text;
+    }
+
+    /// <summary>
+    /// Rewrite em-dash, en-dash and minus-sign glyphs to an ASCII hyphen and collapse the
+    /// whitespace around a leading or embedded one (<c>"- 3"</c> → <c>"-3"</c>), without the
+    /// exponent lowercasing or lone-dash clearing that follow it.
+    /// </summary>
+    /// <remarks>
+    /// Shared with <see cref="ColumnIsNumericForNormalization"/>, which needs the same
+    /// dash-normalized preview to decide whether a cell is numeric <em>before</em> the full
+    /// normalization runs: testing the raw text would miss <c>"- 3"</c>, which only reads as a
+    /// number once this rewrite has run.
+    /// </remarks>
+    private static string NormalizeDashGlyphsAndSpacing(string text)
+    {
+        text = text.Replace('\u2014', '-').Replace('\u2013', '-').Replace('\u2212', '-');
+        if (text.StartsWith("- ", StringComparison.Ordinal)) text = "-" + text.Substring(2).TrimStart();
+        text = text.Replace("- ", "-");
+        text = text.Replace(" -", "-");
         return text;
+    }
+
+    /// <summary>
+    /// Minimum percentage of a column's non-ambiguous data cells that must parse as a bare
+    /// numeric literal for the column to receive the dash and exponent rewriting.
+    /// </summary>
+    private const int NumericColumnMinNumericPercent = 60;
+
+    /// <summary>
+    /// Whether a column's data rows are predominantly bare numeric literals once dash glyphs are
+    /// normalized — the gate that keeps the numeric rewriting off a prose column.
+    /// </summary>
+    /// <remarks>
+    /// A cell that is nothing but a dash is nil-or-N/A and cannot decide the question on its own,
+    /// so it is excluded from the vote and left to the column's other cells.
+    /// </remarks>
+    private static bool ColumnIsNumericForNormalization(List<List<string>> table, int col)
+    {
+        int evidence = 0, numeric = 0;
+        for (int r = 1; r < table.Count; r++)
+        {
+            if (col >= table[r].Count) continue;
+            string trimmed = table[r][col].Trim();
+            if (trimmed.Length == 0 || IsLoneDashCell(trimmed)) continue;
+            evidence++;
+            if (LooksLikeNumericLiteral(NormalizeDashGlyphsAndSpacing(trimmed))) numeric++;
+        }
+        return evidence > 0 && numeric * 100 >= evidence * NumericColumnMinNumericPercent;
+    }
+
+    /// <summary>Whether the cell is nothing but one dash glyph — ambiguous nil-or-N/A content
+    /// that carries no evidence either way.</summary>
+    private static bool IsLoneDashCell(string text) =>
+        text is "-" or "\u2014" or "\u2013" or "\u2212";
+
+    /// <summary>
+    /// Whether the text — already dash-normalized — is a bare numeric literal: an optional
+    /// leading <c>-</c>, digits with at most one <c>.</c>, and an optional exponent. Anything
+    /// carrying a letter outside the exponent marker, or no digits at all, is not a number.
+    /// </summary>
+    private static bool LooksLikeNumericLiteral(string text)
+    {
+        if (text.StartsWith('-')) text = text.Substring(1);
+        int e = text.IndexOfAny(['e', 'E']);
+        string mantissa = e < 0 ? text : text.Substring(0, e);
+        if (!IsNumericMantissa(mantissa)) return false;
+        if (e < 0) return true;
+
+        string exponent = text.Substring(e + 1);
+        if (exponent.StartsWith('-') || exponent.StartsWith('+')) exponent = exponent.Substring(1);
+        return exponent.Length > 0 && exponent.All(char.IsAsciiDigit);
+    }
+
+    /// <summary>Whether the text is one or more ASCII digits with at most one <c>.</c>.</summary>
+    private static bool IsNumericMantissa(string text)
+    {
+        bool seenDot = false, seenDigit = false;
+        foreach (char c in text)
+        {
+            if (char.IsAsciiDigit(c)) seenDigit = true;
+            else if (c == '.' && !seenDot) seenDot = true;
+            else return false;
+        }
+        return seenDigit;
     }
 
     // ── header/column repair (pdf/table_reconstruct.rs) ─────────────────────

@@ -126,8 +126,27 @@ public sealed class TextMetadata
     public uint WordCount { get; set; }
     public uint CharacterCount { get; set; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public List<string>? Headers { get; set; }
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public List<string[]>? Links { get; set; }
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public List<string[]>? CodeBlocks { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public List<MarkdownLink>? Links { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public List<MarkdownCodeBlock>? CodeBlocks { get; set; }
+}
+
+/// <summary>A Markdown link's visible text and destination.</summary>
+/// <remarks>
+/// Serialized as a named object. Upstream carried these as positional two-element arrays until
+/// <c>fix(types): serialize named structs as JSON objects, not tuples</c>, which is the shape
+/// every shipped binding — this one included — already expected.
+/// </remarks>
+public sealed class MarkdownLink
+{
+    public string Text { get; set; } = "";
+    public string Url { get; set; } = "";
+}
+
+/// <summary>A fenced code block's language tag and body.</summary>
+public sealed class MarkdownCodeBlock
+{
+    public string Language { get; set; } = "";
+    public string Code { get; set; } = "";
 }
 
 public sealed class ExcelMetadata

@@ -480,4 +480,147 @@ public class OoxmlTests
         Assert.True(plain.IndexOf("Cell", StringComparison.Ordinal)
             < plain.IndexOf("Bullet text", StringComparison.Ordinal), plain);
     }
+
+    // ── gridSpan / vMerge deduplication (xberg-io/xberg#1549) ──────────────────
+
+    private const string MergedAnswerText =
+        "The platform has been deployed at the primary site with full redundancy across two " +
+        "availability zones, and the secondary site remains on standby for disaster recovery " +
+        "drills conducted every quarter under the current operations runbook.";
+
+    /// <summary>
+    /// The three-column, five-row table from the issue's reproduction: a <c>gridSpan=3</c>
+    /// title row, a <c>vMerge</c>d two-row group, and a <c>gridSpan=2</c> + <c>vMerge</c>d
+    /// two-row group.
+    /// </summary>
+    private static byte[] MergedCellDocx() => Zip(
+        ("word/document.xml",
+            "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body>" +
+            "<w:tbl>" +
+            "<w:tblGrid><w:gridCol w:w=\"2000\"/><w:gridCol w:w=\"2000\"/><w:gridCol w:w=\"2000\"/></w:tblGrid>" +
+            "<w:tr><w:tc><w:tcPr><w:gridSpan w:val=\"3\"/></w:tcPr>" +
+            "<w:p><w:r><w:t>Overview</w:t></w:r></w:p></w:tc></w:tr>" +
+            "<w:tr><w:tc><w:tcPr><w:vMerge w:val=\"restart\"/></w:tcPr>" +
+            "<w:p><w:r><w:t>Services</w:t></w:r></w:p></w:tc>" +
+            "<w:tc><w:p><w:r><w:t>A1</w:t></w:r></w:p></w:tc>" +
+            "<w:tc><w:p><w:r><w:t>B1</w:t></w:r></w:p></w:tc></w:tr>" +
+            "<w:tr><w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p/></w:tc>" +
+            "<w:tc><w:p><w:r><w:t>A2</w:t></w:r></w:p></w:tc>" +
+            "<w:tc><w:p><w:r><w:t>B2</w:t></w:r></w:p></w:tc></w:tr>" +
+            "<w:tr><w:tc><w:p><w:r><w:t>Reference</w:t></w:r></w:p></w:tc>" +
+            "<w:tc><w:tcPr><w:gridSpan w:val=\"2\"/><w:vMerge w:val=\"restart\"/></w:tcPr>" +
+            $"<w:p><w:r><w:t>{MergedAnswerText}</w:t></w:r></w:p></w:tc></w:tr>" +
+            "<w:tr><w:tc><w:p><w:r><w:t>Sector</w:t></w:r></w:p></w:tc>" +
+            "<w:tc><w:tcPr><w:gridSpan w:val=\"2\"/><w:vMerge/></w:tcPr><w:p/></w:tc></w:tr>" +
+            "</w:tbl></w:body></w:document>"));
+
+    /// <summary>
+    /// Upstream <c>fix(docx): return a merged cell once instead of per covered column and row</c>.
+    /// A cell spanning N grid columns was cloned into every one of them, and a <c>w:vMerge</c>
+    /// continuation then copied the row above down over all of them, so a cell merged across
+    /// 4 columns and 3 rows came back 12 times.
+    /// </summary>
+    [Fact]
+    public void Docx_MergedCellAppearsOnceAtItsOrigin()
+    {
+        var doc = new DocxExtractor().Extract(MergedCellDocx(), DocxMime, new ExtractionConfig());
+
+        var table = Assert.Single(doc.Tables);
+        Assert.Equal(
+            new List<List<string>>
+            {
+                new() { "Overview", "", "" },
+                new() { "Services", "A1", "B1" },
+                new() { "", "A2", "B2" },
+                new() { "Reference", MergedAnswerText, "" },
+                new() { "Sector", "", "" },
+            },
+            table.Cells);
+    }
+
+    /// <summary>
+    /// The rendered content is the second consumer-visible grid the issue reports duplicating
+    /// cell text.
+    /// </summary>
+    [Fact]
+    public void Docx_MergedCellTextIsNotRepeatedInRenderedContent()
+    {
+        var doc = new DocxExtractor().Extract(MergedCellDocx(), DocxMime, new ExtractionConfig());
+
+        foreach (var format in new[] { OutputFormat.Plain, OutputFormat.Markdown })
+        {
+            string content = Render(doc, format);
+            int occurrences = 0;
+            for (int i = content.IndexOf(MergedAnswerText, StringComparison.Ordinal); i >= 0;
+                 i = content.IndexOf(MergedAnswerText, i + 1, StringComparison.Ordinal))
+                occurrences++;
+
+            Assert.Equal(1, occurrences);
+        }
+    }
+
+    /// <summary>
+    /// Upstream <c>fix(docx): map extracted images to the page they appear on</c>
+    /// (xberg-io/xberg#1546). Every image was reported as page 1, because the page was looked up
+    /// by searching rendered markdown for a per-image placeholder that does not exist — every
+    /// drawing renders to the same target. The page comes from the parsed element walk instead.
+    /// </summary>
+    [Fact]
+    public void Docx_ImagesCarryThePageTheyAppearOn()
+    {
+        const string Drawing =
+            "<w:r><w:drawing><wp:inline><wp:docPr id=\"1\" name=\"p\"/><a:graphic><a:graphicData>" +
+            "<pic:pic><pic:blipFill><a:blip r:embed=\"rId1\"/></pic:blipFill></pic:pic>" +
+            "</a:graphicData></a:graphic></wp:inline></w:drawing></w:r>";
+
+        byte[] docx = Zip(
+            ("word/document.xml",
+                "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" " +
+                "xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" " +
+                "xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" " +
+                "xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\" " +
+                "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><w:body>" +
+                $"<w:p>{Drawing}</w:p>" +
+                "<w:p><w:r><w:br w:type=\"page\"/></w:r></w:p>" +
+                $"<w:p>{Drawing}</w:p>" +
+                "<w:p><w:r><w:br w:type=\"page\"/></w:r></w:p>" +
+                $"<w:p>{Drawing}</w:p>" +
+                "</w:body></w:document>"),
+            ("word/_rels/document.xml.rels",
+                "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" +
+                "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" " +
+                "Target=\"media/image1.png\"/></Relationships>"));
+
+        var doc = new DocxExtractor().Extract(docx, DocxMime, new ExtractionConfig());
+
+        Assert.Equal(3, doc.Images.Count);
+        Assert.Equal(new uint?[] { 1u, 2u, 3u }, doc.Images.Select(i => i.PageNumber).ToArray());
+    }
+
+    /// <summary>
+    /// Upstream <c>fix extraction regressions reported in open issues</c> (xberg-io/xberg#1562):
+    /// DrawingML and VML text boxes dropped XML and numeric character references. Upstream's
+    /// pull parser surfaces an entity reference as its own event, which that walk ignored; the
+    /// reader here resolves them while parsing, so this pins the behaviour rather than fixing it.
+    /// </summary>
+    [Fact]
+    public void Docx_TextBoxKeepsCharacterReferences()
+    {
+        byte[] docx = Zip(
+            ("word/document.xml",
+                "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" " +
+                "xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" " +
+                "xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" " +
+                "xmlns:wps=\"http://schemas.microsoft.com/office/word/2010/wordprocessingShape\"><w:body>" +
+                "<w:p><w:r><w:drawing><wp:inline><a:graphic><a:graphicData>" +
+                "<wps:wsp><wps:txbx><w:txbxContent><w:p><w:r>" +
+                "<w:t>Tom &amp; Jerry cost &#8364;5</w:t>" +
+                "</w:r></w:p></w:txbxContent></wps:txbx></wps:wsp>" +
+                "</a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>" +
+                "</w:body></w:document>"));
+
+        var doc = new DocxExtractor().Extract(docx, DocxMime, new ExtractionConfig());
+
+        Assert.Contains("Tom & Jerry cost \u20ac5", Render(doc, OutputFormat.Plain), StringComparison.Ordinal);
+    }
 }

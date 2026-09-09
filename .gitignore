@@ -331,6 +331,13 @@ erl_crash.dump
 
 packages/go/.lib/
 
+# Native libraries staged into the package trees by `alef build`. The Go leg above was
+# already covered; the C# and Java legs were not, leaving 689 MB untracked-but-not-ignored --
+# enough that a stray `git add -A` would commit them. Scoped to the artifact directories
+# rather than the package roots, so real package sources stay visible. ~keep
+packages/csharp/src/Xberg/runtimes/
+packages/java/src/main/resources/natives/
+
 .build/
 
 # basemind code-map index (local tooling)

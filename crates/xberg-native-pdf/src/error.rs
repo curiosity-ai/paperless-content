@@ -130,6 +130,73 @@ pub enum Error {
     Type4Runtime(String),
 }
 
+impl Error {
+    pub(crate) const fn telemetry_code(&self) -> &'static str {
+        match self {
+            Self::InvalidHeader(_) => "invalid_header",
+            Self::UnsupportedVersion(_) => "unsupported_version",
+            Self::ParseError { .. } => "parse_error",
+            Self::ParseWarning { .. } => "parse_warning",
+            Self::InvalidXref => "invalid_xref",
+            Self::ObjectNotFound(_, _) => "object_not_found",
+            Self::InvalidObjectType { .. } => "invalid_object_type",
+            Self::UnexpectedEof => "unexpected_eof",
+            Self::Io(_) => "io_error",
+            Self::Utf8Error(_) => "utf8_error",
+            Self::Unsupported(_) => "unsupported",
+            Self::InvalidPdf(_) => "invalid_pdf",
+            Self::Decode(_) => "decode_error",
+            Self::Encode(_) => "encode_error",
+            Self::UnsupportedFilter(_) => "unsupported_filter",
+            Self::Font(_) => "font_error",
+            Self::Image(_) => "image_error",
+            Self::CircularReference(_) => "circular_reference",
+            Self::RecursionLimitExceeded(_) => "recursion_limit_exceeded",
+            Self::InvalidOperation(_) => "invalid_operation",
+            Self::LayoutAnalysis(_) => "layout_analysis_error",
+            Self::EncryptedPdf => "encrypted_pdf",
+            Self::Type4Runtime(_) => "type4_runtime_error",
+        }
+    }
+
+    pub(crate) const fn telemetry_offset(&self) -> Option<usize> {
+        match self {
+            Self::ParseError { offset, .. } | Self::ParseWarning { offset, .. } => Some(*offset),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) fn trace_recovery(operation: &'static str, error: &Error) {
+    tracing::warn!(
+        target: crate::LOG_TARGET_ROOT,
+        operation,
+        error_code = error.telemetry_code(),
+        error_offset = ?error.telemetry_offset(),
+        "PDF operation degraded"
+    );
+}
+
+pub(crate) fn trace_failure(operation: &'static str, error: &Error) {
+    tracing::error!(
+        target: crate::LOG_TARGET_ROOT,
+        operation,
+        error_code = error.telemetry_code(),
+        error_offset = ?error.telemetry_offset(),
+        "PDF operation failed"
+    );
+}
+
+pub(crate) fn trace_recovery_count(operation: &'static str, error_code: &'static str, skipped_count: usize) {
+    tracing::warn!(
+        target: crate::LOG_TARGET_ROOT,
+        operation,
+        error_code,
+        skipped_count,
+        "PDF recovery skipped malformed input"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -41,6 +41,10 @@ impl RegisteredDocumentExtractor {
         self.extractor.as_ref()
     }
 
+    pub(crate) fn is_builtin(&self) -> bool {
+        self.internal.is_some()
+    }
+
     async fn extract_content_inner(
         &self,
         content: &[u8],
@@ -444,8 +448,9 @@ impl Default for DocumentExtractorRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::config::ExtractionConfig;
-    use crate::plugins::{InternalDocumentExtractor, Plugin};
+    use crate::core::config::{ExtractInput, ExtractionConfig};
+    use crate::plugins::{DocumentExtractor, InternalDocumentExtractor, Plugin};
+    use crate::types::{ExtractedDocument, ExtractionMethod};
 
     use async_trait::async_trait;
 
@@ -453,6 +458,36 @@ mod tests {
         name: String,
         mime_types: &'static [&'static str],
         priority: i32,
+    }
+
+    struct PublicMockExtractor {
+        name: &'static str,
+        extraction_method: Option<ExtractionMethod>,
+    }
+
+    impl Plugin for PublicMockExtractor {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn version(&self) -> String {
+            "1.0.0".to_string()
+        }
+    }
+
+    #[async_trait]
+    impl DocumentExtractor for PublicMockExtractor {
+        async fn extract(&self, _input: ExtractInput, _config: &ExtractionConfig) -> Result<ExtractedDocument> {
+            Ok(ExtractedDocument {
+                mime_type: "application/x-public".into(),
+                extraction_method: self.extraction_method,
+                ..Default::default()
+            })
+        }
+
+        fn supported_mime_types(&self) -> &[&str] {
+            &["application/x-public"]
+        }
     }
 
     impl Plugin for MockExtractor {
@@ -508,6 +543,73 @@ mod tests {
         let names = registry.list();
         assert_eq!(names.len(), 1);
         assert!(names.contains(&"pdf-extractor".to_string()));
+    }
+
+    #[test]
+    fn should_distinguish_builtin_extractors_from_public_plugins() {
+        let builtin = Arc::new(MockExtractor {
+            name: "builtin".to_string(),
+            mime_types: &["application/x-builtin"],
+            priority: 100,
+        });
+        let plugin = Arc::new(MockExtractor {
+            name: "plugin".to_string(),
+            mime_types: &["application/x-plugin"],
+            priority: 100,
+        });
+        let mut registry = DocumentExtractorRegistry::new();
+        registry.register_internal(builtin).unwrap();
+        registry.register(plugin).unwrap();
+
+        assert!(registry.get_registered("application/x-builtin").unwrap().is_builtin());
+        assert!(!registry.get_registered("application/x-plugin").unwrap().is_builtin());
+    }
+
+    #[tokio::test]
+    async fn should_preserve_explicit_public_plugin_provenance_for_bytes_and_paths() {
+        let registered = RegisteredDocumentExtractor::public(Arc::new(PublicMockExtractor {
+            name: "public-explicit",
+            extraction_method: Some(ExtractionMethod::Ocr),
+        }));
+        let config = ExtractionConfig::default();
+
+        let bytes = registered
+            .extract_content_inner(b"content", "application/x-public", &config)
+            .await
+            .unwrap();
+        let path = registered
+            .extract_path_inner(Path::new("unused"), "application/x-public", &config)
+            .await
+            .unwrap();
+
+        for document in [bytes, path] {
+            assert_eq!(
+                document.metadata.additional.get("extraction_method"),
+                Some(&serde_json::Value::String("ocr".to_string()))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn should_leave_unspecified_public_plugin_provenance_absent_for_bytes_and_paths() {
+        let registered = RegisteredDocumentExtractor::public(Arc::new(PublicMockExtractor {
+            name: "public-unspecified",
+            extraction_method: None,
+        }));
+        let config = ExtractionConfig::default();
+
+        let bytes = registered
+            .extract_content_inner(b"content", "application/x-public", &config)
+            .await
+            .unwrap();
+        let path = registered
+            .extract_path_inner(Path::new("unused"), "application/x-public", &config)
+            .await
+            .unwrap();
+
+        for document in [bytes, path] {
+            assert!(!document.metadata.additional.contains_key("extraction_method"));
+        }
     }
 
     #[test]

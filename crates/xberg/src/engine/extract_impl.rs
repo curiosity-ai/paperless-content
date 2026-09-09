@@ -56,8 +56,8 @@ const BATCH_PROGRESS_STAGE_ERROR: &str = "extract_batch_error";
 
 /// Namespace prefix mixed into the content-hash cache key so a future,
 /// incompatible key derivation can never collide with entries this version wrote.
-const CACHE_KEY_NAMESPACE: &[u8] = b"xberg-engine-extract-v1";
-const BATCH_CACHE_KEY_NAMESPACE: &[u8] = b"xberg-engine-extract-batch-v1";
+const CACHE_KEY_NAMESPACE: &[u8] = b"xberg-engine-extract-v2";
+const BATCH_CACHE_KEY_NAMESPACE: &[u8] = b"xberg-engine-extract-batch-v2";
 
 /// Extract content from a single bytes or URI input.
 ///
@@ -1135,18 +1135,20 @@ async fn extract_one_resolved(
 }
 
 async fn extract_bytes_input(input: ExtractInput, config: &ExtractionConfig, index: usize) -> Result<ExtractionResult> {
+    let filename = input.filename;
+    let mime_type = input.mime_type;
     let bytes = input
         .bytes
         .ok_or_else(|| XbergError::validation("extract input kind 'bytes' requires the 'bytes' field".to_string()))?;
-    let mime_type = resolve_bytes_mime_type(input.mime_type.as_deref(), input.filename.as_deref(), &bytes)?;
+    let (bytes, mime_type) = resolve_owned_bytes_mime(bytes, mime_type, filename.clone(), config).await?;
     let mut cfg = config.clone();
-    cfg.source_name = input.filename.as_deref().map(str::to_string);
+    cfg.source_name.clone_from(&filename);
     let mut result = Box::pin(extract_bytes(&bytes, &mime_type, &cfg)).await?;
     annotate_source(
         &mut result,
         "bytes",
-        input.filename.as_deref().unwrap_or("<bytes>"),
-        input.filename.as_deref().unwrap_or("<bytes>"),
+        filename.as_deref().unwrap_or("<bytes>"),
+        filename.as_deref().unwrap_or("<bytes>"),
         index,
     );
     Ok(ExtractionResult::single(result))
@@ -1211,22 +1213,24 @@ async fn extract_uri_input(input: ExtractInput, config: &ExtractionConfig, index
     Ok(ExtractionResult::single(result))
 }
 
-fn resolve_bytes_mime_type(mime_type: Option<&str>, filename: Option<&str>, bytes: &[u8]) -> Result<String> {
-    if let Some(mime_type) = mime_type {
-        return Ok(mime_type.to_string());
-    }
+async fn resolve_owned_bytes_mime(
+    bytes: Vec<u8>,
+    mime_type: Option<String>,
+    filename: Option<String>,
+    config: &ExtractionConfig,
+) -> Result<(Vec<u8>, String)> {
+    crate::core::mime::resolve_owned_bytes_mime(bytes, filename, mime_type, config.mime_detection_policy).await
+}
 
-    if let Some(filename) = filename
-        && let Ok(detected) = crate::core::mime::detect_mime_type(filename, false)
-    {
-        return Ok(detected);
-    }
-
-    if let Some(kind) = infer::get(bytes) {
-        return Ok(kind.mime_type().to_string());
-    }
-
-    Ok("application/octet-stream".to_string())
+#[cfg(all(test, feature = "tokio-runtime"))]
+fn resolve_bytes_mime_type(
+    mime_type: Option<&str>,
+    filename: Option<&str>,
+    bytes: &[u8],
+    config: &ExtractionConfig,
+) -> Result<String> {
+    let explicit = mime_type.filter(|mime| *mime != "application/octet-stream");
+    crate::core::mime::detect_or_validate_bytes(bytes, filename, explicit, config.mime_detection_policy)
 }
 
 fn file_uri_to_path(uri: &str) -> Result<PathBuf> {
@@ -1442,49 +1446,18 @@ fn merge_crawl_summary(
     }
 }
 
-/// Refine the MIME type for a downloaded document when the server returned the
-/// generic `application/octet-stream` placeholder.
-///
-/// Specific MIME types (e.g. `application/pdf`, `image/png`) are trusted as-is.
-/// Only the generic `application/octet-stream` is overridden, using the URL
-/// filename's extension — which reaches the tree-sitter language-detection path
-/// for source-code files (`.py` → `text/x-source-code`).
-///
-/// If extension-based detection yields an unsupported MIME type, or no filename
-/// is available, the original `application/octet-stream` is returned and
-/// `extract_bytes` handles it via content sniffing.
-#[cfg(feature = "url-ingestion")]
-fn refine_downloaded_mime_type(mime_type: &str, filename: Option<&str>, url: &str) -> String {
-    if mime_type != "application/octet-stream" {
-        return mime_type.to_string();
-    }
-
-    if let Some(name) = filename
-        && let Ok(detected) = crate::core::mime::detect_mime_type(name, false)
-        && crate::core::mime::validate_mime_type(&detected).is_ok()
-    {
-        tracing::debug!(
-            url = %url,
-            filename = %name,
-            detected = %detected,
-            "refined application/octet-stream via URL filename extension"
-        );
-        return detected;
-    }
-
-    mime_type.to_string()
-}
-
 #[cfg(feature = "url-ingestion")]
 async fn extract_downloaded_document(
     document: DownloadedDocument,
     config: &ExtractionConfig,
     index: usize,
 ) -> Result<ExtractedDocument> {
-    let mime_type = refine_downloaded_mime_type(&document.mime_type, document.filename.as_deref(), &document.url);
+    let mime_hint = Some(document.mime_type.clone().into_owned());
+    let filename_hint = document.filename.as_deref().map(str::to_owned);
+    let (content, mime_type) = resolve_owned_bytes_mime(document.content, mime_hint, filename_hint, config).await?;
     let mut cfg = config.clone();
     cfg.source_name = document.filename.as_deref().map(str::to_string);
-    let mut result = extract_bytes(&document.content, &mime_type, &cfg).await?;
+    let mut result = extract_bytes(&content, &mime_type, &cfg).await?;
     annotate_source(&mut result, "url_document", &document.url, &document.url, index);
     result
         .metadata
@@ -1523,6 +1496,7 @@ async fn result_from_scrape_page(
         content,
         scrape.markdown.is_some(),
         &content_type,
+        &scrape.html,
         links_to_uris(scrape.links.iter().map(|link| (&link.url, &link.text))),
         config,
     )
@@ -1561,6 +1535,7 @@ async fn result_from_crawl_page(
         content,
         page.markdown.is_some(),
         &content_type,
+        &page.html,
         links_to_uris(page.links.iter().map(|link| (&link.url, &link.text))),
         config,
     )
@@ -1586,15 +1561,36 @@ async fn run_url_page_pipeline(
     content: String,
     is_markdown: bool,
     content_type: &str,
+    source_html: &str,
     uris: Vec<ExtractedUri>,
     config: &ExtractionConfig,
 ) -> Result<ExtractedDocument> {
-    let mime_type = if is_markdown {
+    #[cfg(not(feature = "html"))]
+    let _ = source_html;
+    let source_mime_type = normalized_content_type(content_type);
+    let extraction_mime_type = if is_markdown {
         "text/markdown".to_string()
     } else {
-        normalized_content_type(content_type)
+        source_mime_type.clone()
     };
-    let mut result = extract_bytes(content.as_bytes(), &mime_type, config).await?;
+    #[cfg(feature = "html")]
+    let is_html_source = source_mime_type.starts_with("text/html");
+    let mut result = extract_bytes(content.as_bytes(), &extraction_mime_type, config).await?;
+    result.mime_type = source_mime_type.into();
+
+    // ~keep The line above restamps the result `text/html`, so a consumer reading
+    // `metadata.format.html` is entitled to find it. But when crawlberg supplied pre-rendered
+    // markdown the extraction ran as `text/markdown`, so the HTML extractor never ran and no
+    // HtmlMetadata was ever produced -- leaving `format: None` contradicting the MIME type
+    // (CI E2E `test_metadata_access`). Recover it from the page HTML instead.
+    #[cfg(feature = "html")]
+    if is_html_source
+        && result.metadata.format.is_none()
+        && !source_html.is_empty()
+        && let Some(html_metadata) = crate::extraction::html::extract_html_metadata_only(source_html)
+    {
+        result.metadata.format = Some(crate::types::FormatMetadata::Html(Box::new(html_metadata)));
+    }
     match result.uris.as_mut() {
         Some(existing) => existing.extend(uris),
         None if !uris.is_empty() => result.uris = Some(uris),
@@ -1605,12 +1601,7 @@ async fn run_url_page_pipeline(
 
 #[cfg(feature = "url-ingestion")]
 fn normalized_content_type(content_type: &str) -> String {
-    let mime = content_type.split(';').next().unwrap_or(content_type).trim();
-    if mime.is_empty() {
-        "text/html".to_string()
-    } else {
-        mime.to_string()
-    }
+    crate::core::mime::validate_mime_type(content_type).unwrap_or_else(|_| "text/html".to_string())
 }
 
 #[cfg(feature = "url-ingestion")]

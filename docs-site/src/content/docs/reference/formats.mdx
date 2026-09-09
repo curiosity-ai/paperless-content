@@ -4,7 +4,7 @@ title: "Format Support"
 
 import { Tabs, TabItem } from "@astrojs/starlight/components";
 
-Xberg supports 100 file formats across 120 file extensions across major categories through native Rust extractors.
+Xberg supports 107 file formats across 140 unique file extensions and accepts 53 compatibility MIME aliases.
 
 ## Overview
 
@@ -25,17 +25,17 @@ All formats support async/await and batch processing. Image formats and PDFs sup
 | Format                   | Extensions                                                                  | MIME Type                                                                   | Extraction Method       | OCR Support               | Special Features                                            |
 | ------------------------ | --------------------------------------------------------------------------- | --------------------------------------------------------------------------- | ----------------------- | ------------------------- | ----------------------------------------------------------- |
 | PDF                      | `.pdf`                                                                      | `application/pdf`                                                           | Native Rust (xberg-native-pdf) | Yes                       | Metadata extraction, image extraction, text layer detection |
-| Excel                    | `.xlsx`, `.xlsm`, `.xlsb`, `.xls`, `.xlam`, `.xla`, `.xltx`, `.xlt`, `.ods` | Various Excel MIME types                                                    | Native Rust (calamine)  | No                        | Multi-sheet support, formula preservation                   |
+| Excel                    | `.xlsx`, `.xlsm`, `.xlsb`, `.xls`, `.xlam`, `.xla`, `.xltm`, `.xltx`, `.xlt`, `.ods` | Various Excel MIME types                                                    | Native Rust (calamine)  | No                        | Multi-sheet support, formula preservation                   |
 | PowerPoint               | `.pptx`, `.pptm`, `.ppsx`                                                   | `application/vnd.openxmlformats-officedocument.presentationml.presentation` | Native Rust (roxmltree) | Yes (for embedded images) | Slide extraction, image OCR, table detection                |
 | PowerPoint Template      | `.potx`, `.potm`, `.pot`                                                    | Various PowerPoint template MIME types                                      | Native Rust (roxmltree) | Yes (for embedded images) | Template slide extraction                                   |
 | Word (Modern)            | `.docx`                                                                     | `application/vnd.openxmlformats-officedocument.wordprocessingml.document`   | Native Rust             | No                        | Preserves formatting, extracts metadata                     |
 | Word (Macro/Template)    | `.docm`, `.dotx`, `.dotm`, `.dot`                                           | Various Word MIME types                                                     | Native Rust             | No                        | Macro-enabled and template variants                         |
 | Word (Legacy)            | `.doc`                                                                      | `application/msword`                                                        | Native OLE/CFB          | Yes                       | Direct binary parsing                                       |
-| PowerPoint (Legacy)      | `.ppt`                                                                      | `application/vnd.ms-powerpoint`                                             | Native OLE/CFB          | Yes                       | Direct binary parsing                                       |
+| PowerPoint (Legacy)      | `.ppt`, `.pps`                                                              | `application/vnd.ms-powerpoint`                                             | Native OLE/CFB          | Yes                       | Direct binary parsing                                       |
 | OpenDocument Text        | `.odt`                                                                      | `application/vnd.oasis.opendocument.text`                                   | Native Rust             | No                        | Full OpenDocument support                                   |
 | OpenDocument Spreadsheet | `.ods`                                                                      | `application/vnd.oasis.opendocument.spreadsheet`                            | Native Rust (calamine)  | No                        | Multi-sheet support                                         |
 | OpenDocument Presentation | `.odp`                                                                     | `application/vnd.oasis.opendocument.presentation`                          | Native Rust (roxmltree) | Yes (for embedded images) | Slide extraction, tables, images, metadata                  |
-| dBASE                    | `.dbf`                                                                      | `application/x-dbf`                                                         | Native Rust (dbase)     | No                        | Table data extraction, field type support                   |
+| dBASE                    | `.dbf`                                                                      | `application/vnd.dbf`                                                       | Native Rust (dbase)     | No                        | Table data extraction, field type support                   |
 | Hangul Word Processor    | `.hwp`, `.hwpx`                                                             | `application/x-hwp`                                                         | Native Rust (hwpers)    | No                        | Korean document format, text extraction                     |
 | Apple Pages              | `.pages`                                                                    | `application/x-iwork-pages-sffpages`                                        | Native Rust             | No                        | Modern iWork format support                                 |
 | Apple Numbers            | `.numbers`                                                                  | `application/x-iwork-numbers-sffnumbers`                                    | Native Rust             | No                        | Spreadsheet extraction                                      |
@@ -48,14 +48,20 @@ All formats support async/await and batch processing. Image formats and PDFs sup
 | ---------------- | ------------------ | ------------------------------------ | -------------------------------------------------------------------------------- | ----------- | -------------------------------------------------------------------------------- |
 | Plain Text       | `.txt`             | `text/plain`                         | Native Rust (streaming)                                                          | No          | Line/word/character counting, memory-efficient streaming                         |
 | Markdown         | `.md`, `.markdown` | `text/markdown`, `text/x-markdown`   | Native Rust (streaming)                                                          | No          | Header extraction, link detection, code block detection                          |
-| HTML             | `.html`, `.htm`    | `text/html`, `application/xhtml+xml` | Native Rust ([html-to-markdown-rs](https://docs.html-to-markdown.xberg.io)) | No          | Converts to Markdown, metadata extraction                                        |
+| CommonMark       | `.commonmark`      | `text/x-commonmark`                  | Native Rust (pulldown-cmark)                                                     | No          | Standard CommonMark parsing                                                       |
+| Quarto           | `.qmd`             | `text/x-quarto`                      | Native Rust (pulldown-cmark)                                                     | No          | Quarto Markdown content                                                           |
+| R Markdown       | `.rmd`             | `text/x-r-markdown`                  | Native Rust (pulldown-cmark)                                                     | No          | R Markdown content                                                                |
+| HTML             | `.html`, `.htm`    | `text/html`                          | Native Rust ([html-to-markdown-rs](https://docs.html-to-markdown.xberg.io)) | No          | Converts to Markdown, metadata extraction                                        |
+| XHTML            | `.xhtml`, `.xht`   | `application/xhtml+xml`              | Native Rust ([html-to-markdown-rs](https://docs.html-to-markdown.xberg.io)) | No          | XML-serialized HTML with Markdown conversion                                     |
 | XML              | `.xml`             | `application/xml`, `text/xml`        | Native Rust (quick-xml streaming)                                                | No          | Element counting, unique element tracking                                        |
+| KML              | `.kml`             | `application/vnd.google-earth.kml+xml` | Native Rust (quick-xml streaming)                                              | No          | Geographic feature and metadata extraction                                       |
 | SVG              | `.svg`             | `image/svg+xml`                      | Native Rust (XML parser)                                                         | No          | Treated as XML document                                                          |
-| reStructuredText | `.rst`             | `text/x-rst`                         | Native (rst-parser)                                                              | No          | Full reST syntax support                                                         |
-| Org Mode         | `.org`             | `text/x-org`                         | Native (org)                                                                     | No          | Emacs Org mode support                                                           |
+| reStructuredText | `.rst`             | `text/prs.fallenstein.rst`           | Native (rst-parser)                                                              | No          | Full reST syntax support                                                         |
+| Org Mode         | `.org`             | `text/org`                           | Native (org)                                                                     | No          | Emacs Org mode support                                                           |
 | Rich Text Format | `.rtf`             | `application/rtf`, `text/rtf`        | Native (rtf-parser)                                                              | No          | RTF 1.x support                                                                  |
-| Djot             | `.djot`            | `text/x-djot`                        | Native Rust (jotdown)                                                            | No          | Smart punctuation, tables, code blocks, YAML frontmatter, footnotes, math blocks |
+| Djot             | `.djot`, `.dj`     | `text/x-djot`                        | Native Rust (jotdown)                                                            | No          | Smart punctuation, tables, code blocks, YAML frontmatter, footnotes, math blocks |
 | MDX              | `.mdx`             | `text/mdx`                           | Native Rust (pulldown-cmark)                                                     | No          | JSX-in-Markdown, component-based documents                                       |
+| Docling DocTags  | `.doctags`         | `text/vnd.docling.doctags`           | Native Rust                                                                      | No          | Explicit DocTags representation                                                   |
 | AsciiDoc         | `.adoc`, `.asciidoc` | `text/asciidoc`                    | Native (asciidoc parser)                                                         | No          | Titles, section levels, lists, tables, admonitions, source blocks, attribute substitution |
 | WebVTT           | `.vtt`             | `text/vtt`                           | Native (vtt parser)                                                              | No          | Cue text extraction, voice spans, timing metadata                               |
 
@@ -64,11 +70,14 @@ All formats support async/await and batch processing. Image formats and PDFs sup
 | Format | Extensions      | MIME Type                                        | Extraction Method        | OCR Support | Special Features                            |
 | ------ | --------------- | ------------------------------------------------ | ------------------------ | ----------- | ------------------------------------------- |
 | JSON   | `.json`         | `application/json`, `text/json`                  | Native Rust (serde_json) | No          | Field counting, nested structure extraction |
+| GeoJSON | `.geojson`     | `application/geo+json`                           | Native Rust (serde_json) | No          | Geographic feature and geometry extraction  |
 | JSON Lines | `.jsonl`, `.ndjson` | `application/x-ndjson`                       | Native Rust (serde_json) | No          | Newline-delimited JSON records              |
-| YAML   | `.yaml`, `.yml` | `application/x-yaml`, `text/yaml`, `text/x-yaml` | Native Rust (serde_yaml) | No          | Multi-document support, field counting      |
+| YAML   | `.yaml`, `.yml` | `application/yaml`, `application/x-yaml`, `text/yaml`, `text/x-yaml` | Native Rust (serde_yaml) | No          | Multi-document support, field counting      |
 | TOML   | `.toml`         | `application/toml`, `text/toml`                  | Native Rust (toml crate) | No          | Configuration file support                  |
 | CSV    | `.csv`          | `text/csv`                                       | Native Rust              | No          | Tabular data extraction                     |
 | TSV    | `.tsv`          | `text/tab-separated-values`                      | Native Rust              | No          | Tab-separated data extraction               |
+| SQLite | `.sqlite`, `.sqlite3`, `.db` | `application/vnd.sqlite3`            | Native Rust (`sqlite`)   | No          | User tables; internal metadata excluded; BLOB size placeholders |
+| GeoPackage | `.gpkg`, `.gpkx` | `application/geopackage+sqlite3`             | Native Rust (`sqlite`)   | No          | Application-ID detection; user tables without GeoPackage metadata |
 
 ### Email
 
@@ -90,10 +99,11 @@ All image formats support OCR when configured with `ocr` parameter in `Extractio
 | BMP        | `.bmp`                         | `image/bmp`, `image/x-bmp`, `image/x-ms-bmp`       | Native Rust (image-rs)       | Yes         | Uncompressed format                                                                                                         |
 | TIFF       | `.tiff`, `.tif`                | `image/tiff`, `image/x-tiff`                       | Native Rust (image-rs)       | Yes         | Multi-page support                                                                                                          |
 | GIF        | `.gif`                         | `image/gif`                                        | Native Rust (image-rs)       | Yes         | Animation frame extraction                                                                                                  |
-| JPEG 2000  | `.jp2`, `.j2k`, `.j2c`, `.jpx`, `.jpm`, `.mj2` | `image/jp2`, `image/jpx`, `image/jpm`, `image/mj2` | Native Rust (hayro-jpeg2000) | Yes         | OCR: Pure Rust, memory-safe decoder for JP2 container and J2K codestream formats, table detection, format-specific metadata |
+| JPEG 2000 container | `.jp2`, `.jpg2`       | `image/jp2`                         | Native Rust (hayro-jpeg2000) | Yes         | OCR for JP2 containers, table detection, format-specific metadata |
+| JPEG 2000 codestream | `.j2c`, `.j2k`, `.jpc` | `image/j2c`                        | Native Rust (hayro-jpeg2000) | Yes         | OCR for raw JPEG 2000 codestreams, table detection               |
 | JBIG2      | `.jbig2`, `.jb2`               | `image/x-jbig2`                                    | Native Rust (hayro-jbig2)    | Yes         | OCR: Pure Rust bi-level decoder, commonly found in scanned PDFs                                                             |
 | PNM Family | `.pnm`, `.pbm`, `.pgm`, `.ppm` | `image/x-portable-anymap`, and so on.              | Native Rust (image-rs)       | Yes         | NetPBM formats                                                                                                              |
-| HEIC / HEIF | `.heic`, `.heics`, `.heif`    | `image/heic`, `image/heif`, `image/heic-sequence`  | Native libheif binding       | Yes         | Pixel decoding requires `heic` and libheif; EXIF metadata is pure Rust                                                       |
+| HEIC / HEIF | `.heic`, `.heics`, `.heif`, `.heifs`, `.hif` | `image/heic`, `image/heic-sequence`, `image/heif`, `image/heif-sequence` | Native libheif binding | Yes | Pixel decoding requires `heic` and libheif; EXIF metadata is pure Rust |
 | AVIF / AVCS | `.avif`, `.avcs`              | `image/avif`, `image/avcs`                         | Native libheif binding       | Yes         | Available through the HEIC-family aggregate                                         |
 
 ### Audio and Video
@@ -106,7 +116,8 @@ Audio/video formats use Whisper ONNX transcription when the `transcription` Carg
 | M4A / AAC       | `.m4a`           | `audio/mp4`  | Whisper ONNX            | No          | Speech-to-text transcript                |
 | WAV             | `.wav`           | `audio/wav`  | Whisper ONNX            | No          | Speech-to-text transcript                |
 | WebM Audio      | `.webm`          | `audio/webm` | Whisper ONNX            | No          | Speech-to-text transcript                |
-| MP4 Video Audio | `.mp4`, `.mpeg`  | `video/mp4`  | Whisper ONNX            | No          | Audio-track transcription only           |
+| MP4 Video Audio | `.mp4`, `.mpg4`, `.mp4v`, `.m4v` | `video/mp4` | Whisper ONNX          | No          | Audio-track transcription only           |
+| MPEG Video Audio | `.mpeg`, `.mpg`, `.mpe`, `.m1v`, `.m2v` | `video/mpeg` | Whisper ONNX       | No          | Audio-track transcription only           |
 | WebM Video Audio | `.webm`         | `video/webm` | Whisper ONNX            | No          | Audio-track transcription only           |
 
 ### Archives
@@ -125,11 +136,11 @@ Audio/video formats use Whisper ONNX transcription when the `transcription` Carg
 | LaTeX            | `.tex`, `.latex`   | `application/x-latex`, `text/x-tex`              | Native (manual parser)                                                                        | No          | Full LaTeX document support                                                    |
 | EPUB             | `.epub`            | `application/epub+zip`                           | Native (zip + roxmltree + [html-to-markdown-rs](https://docs.html-to-markdown.xberg.io)) | No          | E-book format, metadata extraction                                             |
 | BibTeX           | `.bib`             | `application/x-bibtex`, `application/x-biblatex` | Native (biblatex)                                                                             | No          | Bibliography database support                                                  |
-| Typst            | `.typst`, `.typ`   | `application/x-typst`                            | Native (typst-syntax)                                                                         | No          | Modern typesetting format                                                      |
+| Typst            | `.typst`, `.typ`   | `text/vnd.typst`                                 | Native (typst-syntax)                                                                         | No          | Modern typesetting format                                                      |
 | Jupyter Notebook | `.ipynb`           | `application/x-ipynb+json`                       | Native (JSON parsing)                                                                         | No          | Code cells, markdown cells, output extraction                                  |
 | FictionBook      | `.fb2`             | `application/x-fictionbook+xml`                  | Native (fb2)                                                                                  | No          | XML-based e-book format                                                        |
-| DocBook          | `.docbook`, `.dbk` | `application/docbook+xml`                        | Native (roxmltree)                                                                            | No          | Technical documentation format                                                 |
-| JATS             | `.jats`            | `application/x-jats+xml`                         | Native (roxmltree)                                                                            | No          | Journal article XML format                                                     |
+| DocBook          | `.docbook`, `.dbk`, `.docbook4`, `.docbook5` | `application/docbook+xml`       | Native (roxmltree)                                                                            | No          | Technical documentation format                                                 |
+| JATS             | `.jats`, `.nxml`   | `application/x-jats+xml`                         | Native (roxmltree)                                                                            | No          | Journal article XML format                                                     |
 | OPML             | `.opml`            | `application/xml+opml`                           | Native (roxmltree)                                                                            | No          | Outline format                                                                 |
 | RIS              | `.ris`             | `application/x-research-info-systems`            | Native (biblib)                                                                               | No          | Structured citation parsing with title, authors, DOI, and abstract extraction  |
 | EndNote XML      | `.enw`             | `application/x-endnote+xml`                      | Native (biblib)                                                                               | No          | Structured citation parsing with title, authors, DOI, and keywords extraction  |
@@ -309,7 +320,8 @@ Xberg automatically detects file formats using:
 
 1. **File Extension Mapping**: the supported-format registry maps extensions to MIME types
 2. **mime_guess Crate**: Fallback for unknown extensions
-3. **Manual Override**: Explicit MIME type can be provided
+3. **Manual Override**: A specific explicit MIME type is authoritative. `application/octet-stream`
+   is a generic placeholder that triggers policy-based detection.
 
 Use `list_supported_formats()` when you need the exact runtime registry for the current build.
 
@@ -522,7 +534,6 @@ config = ExtractionConfig(
     ocr=OcrConfig(
         tesseract_config=TesseractConfig(
             language=["eng", "deu"],  # English and German
-            psm=3,                    # Page segmentation mode: Auto
             oem=1                     # OCR Engine mode: LSTM neural net
         )
     ),

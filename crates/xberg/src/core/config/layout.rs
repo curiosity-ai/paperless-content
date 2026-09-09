@@ -178,6 +178,7 @@ impl fmt::Display for LayoutStrategy {
 /// When set on [`ExtractionConfig`](super::ExtractionConfig), layout detection
 /// is enabled for PDF extraction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LayoutDetectionConfig {
     /// Which pages the layout model runs on.
     ///
@@ -351,11 +352,11 @@ mod tests {
     }
 
     #[test]
-    fn test_backward_compat_unknown_fields_ignored() {
+    fn unknown_fields_are_rejected() {
         let json = r#"{"preset": "accurate", "apply_heuristics": true}"#;
-        let config: LayoutDetectionConfig = serde_json::from_str(json).unwrap();
-        assert!(config.apply_heuristics);
-        assert_eq!(config.table_model, TableModel::Tatr);
+        let error = serde_json::from_str::<LayoutDetectionConfig>(json)
+            .expect_err("unknown layout fields must fail deserialization");
+        assert!(error.to_string().contains("preset"));
     }
 
     #[test]

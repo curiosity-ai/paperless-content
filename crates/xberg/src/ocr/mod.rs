@@ -61,6 +61,8 @@ pub mod hocr_parser;
 ))]
 /// Assembles layout-detection bounding boxes with OCR word spans for region-level extraction.
 pub mod layout_assembly;
+#[cfg(any(feature = "ocr", feature = "ocr-wasm"))]
+pub(crate) mod preprocessing;
 #[cfg(feature = "ocr")]
 /// High-level Tesseract OCR processor with caching and table reconstruction.
 pub mod processor;

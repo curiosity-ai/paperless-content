@@ -1188,6 +1188,39 @@ mod feature_profile_tests {
         }
     }
 
+    #[cfg(feature = "ocr-surface")]
+    #[test]
+    fn should_hard_disable_ocr_when_extract_parses_ocr_false() {
+        let cli = Cli::try_parse_from([
+            "xberg",
+            "extract",
+            "scan.pdf",
+            "--ocr",
+            "false",
+            "--no-config-discovery",
+        ])
+        .expect("clap should parse --ocr false");
+
+        let Commands::Extract {
+            config: config_path,
+            no_config_discovery,
+            overrides,
+            ..
+        } = cli.command
+        else {
+            panic!("expected Commands::Extract");
+        };
+        let mut config = load_config(config_path, !no_config_discovery)
+            .expect("built-in extraction config should load without discovery");
+        overrides.apply(&mut config);
+
+        assert!(
+            config.disable_ocr,
+            "--ocr false should hard-disable implicit OCR fallback"
+        );
+        assert!(config.ocr.is_none(), "--ocr false should clear OCR backend settings");
+    }
+
     #[cfg(not(feature = "pdf-surface"))]
     #[test]
     fn non_pdf_profile_omits_pdf_overrides() {

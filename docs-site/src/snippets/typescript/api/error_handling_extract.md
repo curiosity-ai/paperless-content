@@ -1,4 +1,5 @@
 ```typescript title="TypeScript"
+/// <reference types="node" />
 import { readFileSync } from "node:fs";
 
 async function extractDocument(): Promise<void> {

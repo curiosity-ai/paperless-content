@@ -611,7 +611,7 @@ impl InternalDocumentExtractor for HwpxExtractor {
     }
 
     fn supported_mime_types(&self) -> &[&str] {
-        &["application/haansofthwpx"]
+        &["application/haansofthwpx", "application/hwp+zip"]
     }
 
     fn priority(&self) -> i32 {
@@ -1207,7 +1207,10 @@ mod tests {
         assert_eq!(extractor.name(), "hwpx-extractor");
         assert_eq!(extractor.version(), env!("CARGO_PKG_VERSION"));
         assert_eq!(extractor.priority(), 50);
-        assert_eq!(extractor.supported_mime_types(), &["application/haansofthwpx"]);
+        assert_eq!(
+            extractor.supported_mime_types(),
+            &["application/haansofthwpx", "application/hwp+zip"]
+        );
     }
 
     #[test]

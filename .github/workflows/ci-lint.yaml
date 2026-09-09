@@ -80,6 +80,8 @@ jobs:
         uses: xberg-io/actions/install-task@v1
       - name: Validate benchmark scripts
         run: task benchmark:validate:scripts
+      - name: Validate Publish workflow contracts
+        run: python3 scripts/ci/test_publish_workflow_contracts.py
 
   plugin-freshness:
     if: github.event.pull_request.draft != true
@@ -119,6 +121,22 @@ jobs:
       - name: Verify submodule gitlinks are reachable on their remotes
         run: scripts/ci/check-submodule-gitlinks.sh --on-fetch-failure=fail
 
+  ruby-windows-features:
+    if: github.event.pull_request.draft != true
+    name: Ruby Windows feature agreement
+    runs-on: ubuntu-latest
+    steps:
+      # submodules: false -- this job reads three manifests and a workflow file, no fixtures. ~keep
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+      # The Windows gem's binding features and the core features it compiles against are two
+      # independent switches, and when they drift the generated conversions stop compiling on
+      # that leg alone. It has broken the release twice and is invisible to every other job
+      # here, because Linux and macOS never take the `--no-default-features` path. ~keep
+      - name: Verify the Windows Ruby leg's features match the core bundle
+        run: scripts/ci/check-ruby-windows-features.sh
+
   alef-readme-paths:
     if: github.event.pull_request.draft != true
     name: Alef readme/docs paths resolve
@@ -127,6 +145,11 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install Task
         uses: xberg-io/actions/install-task@v1
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.12.5"
+          python-version: "3.11"
       # Static check: every readme/docs path alef.toml points at (templates,
       # snippets_dir + snippet_language overrides, CLI/MCP doc sources, skills
       # template_dir) must resolve on disk. Catches a class of bug that
@@ -143,6 +166,8 @@ jobs:
       # AND the generated manifest both carry the formats. ~keep
       - name: Verify the native FFI build still selects every document format
         run: task alef:verify:ffi-formats
+      - name: Verify published format counts match the MIME registry
+        run: task supported-counts:verify
       # GH#1443: per-target feature aggregates in crates/xberg/Cargo.toml (windows-target,
       # formats-no-heic, full-no-heic, macos-intel-target, windows-gnu-target) are hand-maintained
       # supersets/subsets of `full` and silently drift when a feature is added to `full` without
@@ -332,29 +357,40 @@ jobs:
         env:
           RUSTFLAGS: ""
       # Most per-language snippet validators (rust/python/typescript/go/ruby/php/
-      # csharp/kotlin/swift/c) are covered for free -- the ubuntu-latest runner
-      # image ships those toolchains preinstalled, so `which tsc`/`which swiftc`/etc.
-      # already succeed with no setup step here. Dart, Elixir, and Zig are not on that
-      # image, so their validators (which::which("dart"/"mix"/"zig")) always reported
-      # Unavailable and those 20 snippets were never actually checked -- confirmed via
+      # csharp/kotlin/c) are covered for free -- the ubuntu-latest runner image ships
+      # those toolchains preinstalled, so `which tsc`/`which dotnet`/etc. already
+      # succeed with no setup step here. SWIFT IS NOT among them, contrary to what this
+      # comment claimed until 2026-08-27: `which swiftc` fails on that image, which is
+      # why all 110 swift snippets report Unavailable. Adding a Swift toolchain would
+      # not by itself help -- swift snippets link the FFI artifact this job never
+      # builds, so they would trade Unavailable for a link failure, which is why swift
+      # is excluded below rather than installed. Dart and Elixir are not on that
+      # image, so their validators (which::which("dart"/"mix")) always reported
+      # Unavailable and those snippets were never actually checked -- confirmed via
       # `gh run view --job=94784579741 --log`, which shows `... dart N/A ...`,
-      # `... elixir N/A ...`, `... zig N/A ...` in the summary while every other
-      # language shows a real PASS/FAIL. Versions match the e2e matrix
-      # (ci-e2e.yaml) so this job validates snippets against the same toolchains the
-      # generated e2e suites run against. ~keep
+      # `... elixir N/A ...` in the summary while every other language shows a real
+      # PASS/FAIL. Versions match the e2e matrix (ci-e2e.yaml) so this job validates
+      # snippets against the same toolchains the generated e2e suites run against.
+      # Zig was briefly added here too (a `Setup Zig` step), on the same premise --
+      # but zig's 110 snippets link `../../target/release/libxberg_ffi.so`, which this
+      # job never builds, so they report Unavailable regardless of toolchain presence.
+      # The step was removed; zig is excluded below alongside go/typescript/kotlin/
+      # swift instead -- see the `~keep` comment on `snippets:all` in
+      # `.task/tools/docs.yml` for the full accounting. ~keep
       - name: Setup Dart
         uses: dart-lang/setup-dart@v1
         with:
-          sdk: "3.11"
+          # packages/dart's freezed ^4.0.1 resolves to freezed >=4.0.0, which needs
+          # SDK >=3.13.0; every dart snippet fails pub version-solving before it
+          # compiles otherwise (110 of the gate's 111 failures). The required floor
+          # moves with whichever freezed pub picks, so read the error's own
+          # "requires SDK version" rather than assuming the previous floor. ~keep
+          sdk: "3.13"
       - name: Setup Elixir
         uses: xberg-io/actions/setup-elixir@v1
         with:
           elixir-version: "1.19"
           otp-version: "28"
-      - name: Setup Zig
-        uses: xberg-io/actions/setup-zig@v1
-        with:
-          version: "0.16.0"
       # Java is the one preinstalled toolchain that is not usable as shipped: the
       # ubuntu-latest image's default JRE is 17 (`class file versions up to 61.0`), and
       # the java validator runs maven against packages/java, whose checkstyle plugin
@@ -363,7 +399,7 @@ jobs:
       # packages/java/pom.xml `<maven.compiler.release>` and the `validate` job below,
       # which already sets the same version for the same reason. ~keep
       - name: Setup Java
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "25"
@@ -377,34 +413,70 @@ jobs:
       # below applies via the reusable workflow's `install-system-deps`. ~keep
       - name: Install system dependencies
         uses: ./.github/actions/install-system-deps
-      # `task docs:snippets:all` (audit + gaps + syntax-validate) is described
-      # as the "canonical docs:snippets gate" in .task/tools/docs.yml, but
-      # nothing invoked it -- a broken or orphaned snippet could land
-      # undetected. ~keep
+      # `task docs:snippets:all` (audit + gaps + validate) is described as the
+      # "canonical docs:snippets gate" in .task/tools/docs.yml, but nothing
+      # invoked it -- a broken or orphaned snippet could land undetected. ~keep
+      # This job never runs `alef build`/`task build`, so `validation_level =
+      # "compile"` (alef.toml) can only succeed for languages that need no
+      # built xberg artifact: c, csharp, dart, elixir, java, php, python,
+      # ruby, rust. `task docs:snippets:all` restricts the compile check
+      # to exactly that set via `--lang` -- see the `~keep` comment on
+      # `snippets:all` in .task/tools/docs.yml for the measured per-language
+      # breakdown and why `--lang`'s fence-tag granularity forces dropping
+      # typescript (node+wasm) and kotlin (JVM+android) as whole groups rather
+      # than just their broken wasm/android halves.
+      #
+      # NOT compile-verified in this job: go (141 snippets -- needs
+      # `libxberg_ffi.so`), typescript (124 snippets across node+wasm -- wasm
+      # needs the built `@xberg-io/xberg-wasm` package), kotlin (104 snippets
+      # across kotlin+kotlin_android -- android needs an Android/Gradle
+      # build), swift (110 snippets -- no Swift toolchain installed here at
+      # all), zig (110 snippets -- needs `target/release/libxberg_ffi.so`,
+      # same as go; a `Setup Zig` step was tried here first but the missing
+      # artifact is the real blocker, not the toolchain, so it was removed and
+      # zig joined this list instead). That is ~589 of 1985 snippets (~30%)
+      # with no compile-level gate anywhere today; audit/gaps above still
+      # cover their structure and cross-language parity. Closing this belongs
+      # in ci-e2e.yaml's per-language matrix legs, which already build each
+      # language's native artifact -- not here, where the only fix would be a
+      # second, ~1-hour, redundant FFI build per run. ~keep
       - name: Run docs snippets gate
         run: task docs:snippets:all
+      - name: Report snippet languages not compile-verified in this job
+        if: always()
+        run: |
+          echo "::notice::docs-snippets gate does not compile-verify: go (141 snippets), \
+          typescript/node+wasm (124 snippets), kotlin/kotlin_android (104 snippets), \
+          swift (110 snippets), zig (110 snippets) -- see the ~keep comment above this step \
+          and in .task/tools/docs.yml:snippets:all for why and where that coverage belongs."
 
   validate:
     if: github.event.pull_request.draft != true
     uses: xberg-io/actions/.github/workflows/reusable-validate.yml@v1
     with:
-      # Left empty, the reusable workflow asks the GitHub API for the newest poly
-      # release on every run, and a rate-limited or failed request kills the job
-      # with `failed to resolve latest poly release from the GitHub API` before it
-      # lints anything. Pinning skips that request. It also stops a poly release
-      # from changing what this gate enforces without a commit here. ~keep
-      poly-version: "v0.21.0"
-      # poly.toml:789-793 defines an `alef-snippets` pre-commit hook running
-      # `alef snippets check --strict --cache off`, and `poly lint .` runs it as part of
-      # its whole-project phase. The reusable workflow only installs the alef CLI when
-      # this input is set, and it defaults to false -- so every run that got past
-      # `Format check` died with `× alef-snippets / poly-hook: 1: alef: not found` and
-      # exit 1, with cargo-clippy green beside it (verified in jobs 93568055890 and
-      # 93702252442). The job was permanently red, masked only because `Format check`
-      # failed earlier in almost every run. Setting this also enables the workflow's own
-      # fixture-snippet generate/drift/validate steps, which were skipped for the same
-      # reason. ~keep
-      check-fixture-snippets: true
+      # poly-version is deliberately unset so the reusable workflow resolves the
+      # newest release. A pin goes stale against the tree: an alef regen reformats
+      # with the poly bundled in the alef toolchain, so `poly fmt --check` then fails
+      # on files the regen itself just rewrote -- `c0aa8575e2` re-indented
+      # docs-site/src/components/ApiSnippetGroup.astro under a newer poly while the
+      # pin still enforced v0.21.0's rules. Reverting the file is not the fix; the
+      # next regen undoes it. ~keep
+      # Deliberately false. This input once had to be true because poly.toml defined an
+      # `alef-snippets` hook and only this input installed the alef CLI poly needed
+      # (`× alef-snippets / poly-hook: 1: alef: not found`, jobs 93568055890/93702252442).
+      # That hook no longer exists -- `1449ebdf83` dropped it and alef.toml no longer
+      # declares it -- so `poly lint .` needs no alef binary and this job needs no alef.
+      # Leaving it true is now actively harmful: it also runs the reusable workflow's own
+      # `alef snippets check --strict --cache off`, which takes NO `--lang` filter, in a
+      # job that builds no native artifacts. 469 snippets (go, typescript/wasm,
+      # kotlin_android, zig, swift) report Unavailable, and --strict fails on Unavailable,
+      # so the step can never pass here regardless of snippet quality. Both halves of it
+      # are already covered by dedicated jobs above: `Generated e2e suites freshness`
+      # runs `alef e2e generate` + `git diff --exit-code e2e/`, and `Docs snippets gate`
+      # runs the strict check scoped by `--lang` to the languages this runner can satisfy.
+      # This job's own purpose is `poly fmt --check` and `poly lint .`, which the failing
+      # step masked. ~keep
+      check-fixture-snippets: false
       setup-rust: true
       # poly's cargo-clippy hook builds the whole workspace, and
       # tools/benchmark-harness depends on xberg with `full`, which pulls

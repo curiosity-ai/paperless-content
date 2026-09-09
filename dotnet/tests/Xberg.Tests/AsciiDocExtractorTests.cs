@@ -233,4 +233,35 @@ public class AsciiDocExtractorTests
     {
         Assert.Empty(TextsOf(Parse("++++\n<hr/>\n++++\n"), ElementKindTag.Formula));
     }
+
+    /// <summary>
+    /// Upstream <c>fix(types): serialize named structs as JSON objects, not tuples</c>. Links and
+    /// code blocks were carried as positional two-element arrays, which is not the shape any
+    /// shipped binding expects — a consumer parsing the core JSON rejects an array where it
+    /// wants an object.
+    /// </summary>
+    [Fact]
+    public void LinksAndCodeBlocksSerializeAsNamedObjects()
+    {
+        var doc = Parse(
+            "= Title\n\n" +
+            "See https://example.com[the docs] for more.\n\n" +
+            "[source,rust]\n----\nfn main() {}\n----\n");
+
+        var text = Assert.IsType<TextMetadata>(doc.Metadata.Format!.Payload);
+
+        var link = Assert.Single(text.Links!);
+        Assert.Equal("the docs", link.Text);
+        Assert.Equal("https://example.com", link.Url);
+
+        var block = Assert.Single(text.CodeBlocks!);
+        Assert.Equal("rust", block.Language);
+        Assert.Equal("fn main() {}", block.Code);
+
+        string json = System.Text.Json.JsonSerializer.Serialize(
+            text.Links, Xberg.Types.Json.Options);
+        Assert.Contains("\"text\"", json, StringComparison.Ordinal);
+        Assert.Contains("\"url\"", json, StringComparison.Ordinal);
+        Assert.DoesNotContain("[[", json, StringComparison.Ordinal);
+    }
 }

@@ -8,6 +8,10 @@ use std::time::Instant;
 
 use image::RgbImage;
 
+const LAYOUT_MODEL_MAX_INPUT_SIDE: u32 = 1_280;
+const LAYOUT_MODEL_FLOAT_RGB_BYTES_PER_PIXEL: u64 = 12;
+const LAYOUT_MODEL_RESIZED_RGB_BYTES_PER_PIXEL: u64 = 3;
+
 use crate::layout::error::LayoutError;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::layout::model_manager::LayoutModelManager;
@@ -287,6 +291,16 @@ impl LayoutEngine {
     /// Returns a [`DetectionResult`] with bounding boxes, classes, and confidence scores.
     /// If `apply_heuristics` is enabled in config, postprocessing is applied automatically.
     pub fn detect(&mut self, img: &RgbImage) -> Result<DetectionResult, LayoutError> {
+        self.detect_with_security_limits(img, &crate::extractors::security::SecurityLimits::default())
+    }
+
+    pub(crate) fn detect_with_security_limits(
+        &mut self,
+        img: &RgbImage,
+        security_limits: &crate::extractors::security::SecurityLimits,
+    ) -> Result<DetectionResult, LayoutError> {
+        validate_layout_peak(img, security_limits)
+            .map_err(|error| LayoutError::Image(image::ImageError::IoError(std::io::Error::other(error))))?;
         let (result, _timings) = self.detect_timed(img)?;
         for detection in &result.detections {
             tracing::trace!(class = ?detection.class_name, confidence = detection.confidence, "Layout detection result");
@@ -300,7 +314,8 @@ impl LayoutEngine {
     /// image bytes (PNG/JPEG/…) rather than a decoded [`RgbImage`] — notably the
     /// WASM bridge, which receives image bytes from JS.
     pub fn detect_image_bytes(&mut self, image_bytes: &[u8]) -> Result<DetectionResult, LayoutError> {
-        let img = image::load_from_memory(image_bytes)?.to_rgb8();
+        let img = crate::extraction::image_decode::decode_standard_rgb8_with_default_security_limits(image_bytes)
+            .map_err(|error| LayoutError::Image(image::ImageError::IoError(std::io::Error::other(error))))?;
         self.detect(&img)
     }
 
@@ -422,10 +437,141 @@ impl LayoutEngine {
     }
 }
 
+fn validate_layout_peak(
+    image: &RgbImage,
+    security_limits: &crate::extractors::security::SecurityLimits,
+) -> crate::Result<()> {
+    validate_layout_batch_peak(&[image], security_limits)
+}
+
+fn layout_model_workspace_bytes() -> crate::Result<u64> {
+    crate::extraction::image_decode::decoded_byte_count(
+        LAYOUT_MODEL_MAX_INPUT_SIDE,
+        LAYOUT_MODEL_MAX_INPUT_SIDE,
+        LAYOUT_MODEL_FLOAT_RGB_BYTES_PER_PIXEL + LAYOUT_MODEL_RESIZED_RGB_BYTES_PER_PIXEL,
+    )
+}
+
+pub(crate) fn validate_layout_inference_peak(
+    width: u32,
+    height: u32,
+    current_live_bytes: u64,
+    inference_page_count: usize,
+    security_limits: &crate::extractors::security::SecurityLimits,
+) -> crate::Result<()> {
+    let workspace = layout_model_workspace_bytes()?
+        .checked_mul(u64::try_from(inference_page_count).unwrap_or(u64::MAX))
+        .ok_or_else(|| crate::extraction::image_decode::image_dimension_error(width, height, u64::MAX, u64::MAX))?;
+    crate::extraction::image_decode::validate_image_live_bytes(
+        width,
+        height,
+        current_live_bytes,
+        workspace,
+        security_limits,
+    )
+}
+
+#[cfg(all(feature = "pdf", feature = "layout-detection"))]
+pub(crate) fn layout_inference_batch_capacity(
+    width: u32,
+    height: u32,
+    current_live_bytes: u64,
+    candidate_count: usize,
+    security_limits: &crate::extractors::security::SecurityLimits,
+) -> crate::Result<usize> {
+    if candidate_count == 0 {
+        return Ok(0);
+    }
+    let maximum_live_bytes = u64::try_from(security_limits.max_content_size).unwrap_or(u64::MAX);
+    let available = maximum_live_bytes.saturating_sub(current_live_bytes);
+    let capacity = usize::try_from(available / layout_model_workspace_bytes()?).unwrap_or(usize::MAX);
+    if capacity == 0 {
+        validate_layout_inference_peak(width, height, current_live_bytes, 1, security_limits)?;
+    }
+    Ok(capacity.min(candidate_count).max(1))
+}
+
+pub(crate) fn validate_layout_batch_peak(
+    images: &[&RgbImage],
+    security_limits: &crate::extractors::security::SecurityLimits,
+) -> crate::Result<()> {
+    let (width, height) = images.first().map_or((1, 1), |image| image.dimensions());
+    let current = images.iter().try_fold(0_u64, |total, image| {
+        let bytes = u64::try_from(image.as_raw().len())
+            .map_err(|_| crate::extraction::image_decode::image_dimension_error(width, height, u64::MAX, u64::MAX))?;
+        total
+            .checked_add(bytes)
+            .ok_or_else(|| crate::extraction::image_decode::image_dimension_error(width, height, u64::MAX, u64::MAX))
+    })?;
+    validate_layout_inference_peak(width, height, current, images.len(), security_limits)
+}
+
+#[cfg(all(test, feature = "pdf", feature = "layout-detection"))]
+mod layout_peak_tests {
+    use super::*;
+
+    #[test]
+    fn default_limits_split_eight_letter_pages_into_valid_subbatches() {
+        const PAGE_COUNT: usize = 8;
+        const PAGE_WIDTH: u32 = 1_275;
+        const PAGE_HEIGHT: u32 = 1_650;
+        let page_bytes = crate::extraction::image_decode::decoded_byte_count(PAGE_WIDTH, PAGE_HEIGHT, 3)
+            .expect("letter raster size");
+        let current_live_bytes = page_bytes.checked_mul(PAGE_COUNT as u64).expect("eight page rasters");
+        let limits = crate::extractors::security::SecurityLimits::default();
+
+        let capacity =
+            layout_inference_batch_capacity(PAGE_WIDTH, PAGE_HEIGHT, current_live_bytes, PAGE_COUNT, &limits)
+                .expect("default limits must support at least one inference page");
+
+        assert_eq!(capacity, 2);
+        validate_layout_inference_peak(PAGE_WIDTH, PAGE_HEIGHT, current_live_bytes, capacity, &limits)
+            .expect("the selected subbatch must fit default limits");
+    }
+}
+
 #[cfg(test)]
 mod cache_key_tests {
     use super::*;
     use crate::core::config::acceleration::{AccelerationConfig, ExecutionProviderType};
+
+    struct NeverCalledModel;
+
+    impl LayoutModel for NeverCalledModel {
+        fn detect(&mut self, _img: &RgbImage) -> Result<Vec<crate::layout::types::LayoutDetection>, LayoutError> {
+            panic!("oversized image must be rejected before layout inference")
+        }
+
+        fn detect_with_threshold(
+            &mut self,
+            _img: &RgbImage,
+            _threshold: f32,
+        ) -> Result<Vec<crate::layout::types::LayoutDetection>, LayoutError> {
+            panic!("oversized image must be rejected before layout inference")
+        }
+
+        fn name(&self) -> &str {
+            "never-called"
+        }
+    }
+
+    #[test]
+    fn detect_image_bytes_rejects_oversized_dimensions_before_inference() {
+        let mut engine = LayoutEngine {
+            model: Box::new(NeverCalledModel),
+            config: LayoutEngineConfig::default(),
+            #[cfg(feature = "layout-detection")]
+            thread_budget: 1,
+        };
+        let bytes = crate::extraction::image_decode::bmp_with_declared_dimensions(6000, 6000);
+
+        let error = engine
+            .detect_image_bytes(&bytes)
+            .expect_err("layout decoding must apply the default security budget");
+
+        assert!(error.to_string().contains("6000x6000"));
+        assert!(error.to_string().contains("security_limits.max_content_size"));
+    }
 
     #[test]
     fn engine_config_equality_covers_every_session_and_output_setting() {

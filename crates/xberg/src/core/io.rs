@@ -4,7 +4,9 @@
 //! For large files (> 1 MiB) on non-WASM platforms, memory-mapped I/O is used to avoid
 //! heap-allocating the entire file contents, reducing memory pressure and syscall overhead.
 
-use crate::{Result, XbergError};
+use crate::Result;
+#[cfg(test)]
+use crate::XbergError;
 use std::path::Path;
 
 /// Size threshold above which memory-mapped I/O is preferred over `read()`.
@@ -144,38 +146,6 @@ pub(crate) fn read_file_sync(path: impl AsRef<Path>) -> Result<Vec<u8>> {
     std::fs::read(path.as_ref()).map_err(crate::XbergError::from)
 }
 
-/// Check if a file exists.
-///
-/// # Arguments
-///
-/// * `path` - Path to check
-///
-/// # Returns
-///
-/// `true` if the file exists, `false` otherwise.
-pub(crate) fn file_exists(path: impl AsRef<Path>) -> bool {
-    path.as_ref().exists()
-}
-
-/// Validate that a file exists.
-///
-/// # Arguments
-///
-/// * `path` - Path to validate
-///
-/// # Errors
-///
-/// Returns `XbergError::Io` if file doesn't exist.
-pub(crate) fn validate_file_exists(path: impl AsRef<Path>) -> Result<()> {
-    if !file_exists(&path) {
-        return Err(XbergError::from(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("File does not exist: {}", path.as_ref().display()),
-        )));
-    }
-    Ok(())
-}
-
 /// Traverse a directory and return all file paths matching a pattern.
 ///
 /// # Arguments
@@ -309,26 +279,6 @@ mod tests {
 
         let content = read_file_sync(&file_path).unwrap();
         assert_eq!(content, b"test content");
-    }
-
-    #[test]
-    fn test_file_exists() {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("test.txt");
-        File::create(&file_path).unwrap();
-
-        assert!(file_exists(&file_path));
-        assert!(!file_exists(dir.path().join("nonexistent.txt")));
-    }
-
-    #[test]
-    fn test_validate_file_exists() {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("test.txt");
-        File::create(&file_path).unwrap();
-
-        assert!(validate_file_exists(&file_path).is_ok());
-        assert!(validate_file_exists(dir.path().join("nonexistent.txt")).is_err());
     }
 
     #[test]

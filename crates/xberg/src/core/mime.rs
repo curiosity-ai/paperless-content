@@ -6,14 +6,19 @@
 //! Format information is centralized in the `FORMATS` registry. All extension-to-MIME
 //! mappings and supported MIME type validation are derived from this single source of truth.
 
-#[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+#[cfg(any(
+    feature = "office",
+    feature = "hwpx",
+    feature = "iwork",
+    feature = "archives",
+    feature = "hwp",
+    feature = "email"
+))]
 use crate::extractors::security::SecurityLimits;
 use crate::{Result, XbergError};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
-#[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
-use std::io::{Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -29,9 +34,23 @@ pub struct SupportedFormat {
     pub mime_type: String,
 }
 
-#[cfg(feature = "api")]
 pub(crate) const OCTET_STREAM_MIME_TYPE: &str = "application/octet-stream";
 pub(crate) const HTML_MIME_TYPE: &str = "text/html";
+const MIME_SNIFF_LENGTH: usize = 4096;
+const SQLITE_APPLICATION_ID_OFFSET: usize = 68;
+const SQLITE_APPLICATION_ID_LENGTH: usize = 4;
+const GEOPACKAGE_APPLICATION_ID: &[u8; SQLITE_APPLICATION_ID_LENGTH] = b"GPKG";
+const GEOPACKAGE_LEGACY_APPLICATION_ID: &[u8; SQLITE_APPLICATION_ID_LENGTH] = b"GP10";
+const J2C_CODESTREAM_MAGIC: &[u8; 4] = b"\xFF\x4F\xFF\x51";
+/// MS-CFB (compound binary file) signature, shared by legacy .doc/.xls/.ppt.
+#[cfg(any(feature = "office", feature = "hwp", feature = "email"))]
+const OLE2_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PackageInspection {
+    HeaderOnly,
+    FullArchive,
+}
 
 /// Element names that identify a markup fragment as HTML rather than generic XML.
 ///
@@ -145,7 +164,28 @@ fn xml_vocabulary(trimmed: &str) -> Option<&'static str> {
         }
     }
     let root = root_start_tag(trimmed)?;
-    root_is_in_namespace(root, "http://docbook.org/ns/docbook").then_some(DOCBOOK_MIME_TYPE)
+    if root_is_in_namespace(root, "http://docbook.org/ns/docbook") {
+        return Some(DOCBOOK_MIME_TYPE);
+    }
+    if root_has_name_in_namespace(root, "kml", "http://www.opengis.net/kml/2.2") {
+        return Some(KML_MIME_TYPE);
+    }
+    if root_has_name_in_namespace(root, "document", ODF_OFFICE_NAMESPACE)
+        && root_attribute_value(root, "office:mimetype") == Some(ODG_MIME_TYPE)
+    {
+        return Some(ODG_FLAT_MIME_TYPE);
+    }
+    root_has_name_in_namespace(root, "html", "http://www.w3.org/1999/xhtml").then_some("application/xhtml+xml")
+}
+
+fn root_has_name_in_namespace(root: &str, expected_name: &str, namespace: &str) -> bool {
+    let qualified_name = root
+        .trim_start_matches('<')
+        .split([' ', '\t', '\n', '\r', '>', '/'])
+        .next()
+        .unwrap_or_default();
+    let local_name = qualified_name.rsplit(':').next().unwrap_or_default();
+    local_name.eq_ignore_ascii_case(expected_name) && root_is_in_namespace(root, namespace)
 }
 
 /// Report whether the root element itself belongs to `namespace`.
@@ -160,17 +200,37 @@ fn root_is_in_namespace(root: &str, namespace: &str) -> bool {
         .next()
         .unwrap_or_default();
     let binding = match name.split_once(':') {
-        Some((prefix, _)) => format!("xmlns:{prefix}="),
-        None => "xmlns=".to_string(),
+        Some((prefix, _)) => format!("xmlns:{prefix}"),
+        None => "xmlns".to_string(),
     };
-    let Some(start) = root.find(&binding) else {
-        return false;
-    };
-    let value = &root[start + binding.len()..];
-    let Some(quote) = value.chars().next().filter(|c| *c == '"' || *c == '\'') else {
-        return false;
-    };
-    value[1..].split(quote).next().is_some_and(|uri| uri == namespace)
+    root_attribute_value(root, &binding).is_some_and(|uri| uri == namespace)
+}
+
+fn root_attribute_value<'a>(root: &'a str, expected_name: &str) -> Option<&'a str> {
+    let mut rest = root.trim_start_matches('<');
+    rest = &rest[rest.find(|character: char| character.is_ascii_whitespace())?..];
+    loop {
+        rest = rest.trim_start();
+        if rest.starts_with('>') || rest.starts_with('/') {
+            return None;
+        }
+        let name_length = rest
+            .find(|character: char| character.is_ascii_whitespace() || matches!(character, '=' | '>' | '/'))
+            .unwrap_or(rest.len());
+        let (name, after_name) = rest.split_at(name_length);
+        rest = after_name.trim_start();
+        rest = rest.strip_prefix('=')?.trim_start();
+        let quote = rest
+            .chars()
+            .next()
+            .filter(|character| matches!(character, '"' | '\''))?;
+        let value = &rest[quote.len_utf8()..];
+        let end = value.find(quote)?;
+        if name == expected_name {
+            return Some(&value[..end]);
+        }
+        rest = &value[end + quote.len_utf8()..];
+    }
 }
 
 /// Return the text of the first declaration that opens with `opener`.
@@ -218,11 +278,20 @@ pub(crate) const POWER_POINT_MIME_TYPE: &str =
 pub(crate) const DOCX_MIME_TYPE: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 pub(crate) const LEGACY_WORD_MIME_TYPE: &str = "application/msword";
 pub(crate) const LEGACY_POWERPOINT_MIME_TYPE: &str = "application/vnd.ms-powerpoint";
+/// Only reachable from `detect_ole2_package`, which is gated on the feature set that pulls in
+/// the `cfb` crate; without one of those features nothing names this constant and `-D warnings`
+/// rejects it as dead code. Gate must track that function's. ~keep
+#[cfg(any(feature = "office", feature = "hwp", feature = "email"))]
+pub(crate) const LEGACY_EXCEL_MIME_TYPE: &str = "application/vnd.ms-excel";
 
 pub(crate) const PST_MIME_TYPE: &str = "application/vnd.ms-outlook-pst";
 pub(crate) const WPD_MIME_TYPE: &str = "application/vnd.wordperfect";
 pub(crate) const JSON_MIME_TYPE: &str = "application/json";
+pub(crate) const GEOJSON_MIME_TYPE: &str = "application/geo+json";
+pub(crate) const SQLITE_MIME_TYPE: &str = "application/vnd.sqlite3";
+pub(crate) const GEOPACKAGE_MIME_TYPE: &str = "application/geopackage+sqlite3";
 pub(crate) const XML_MIME_TYPE: &str = "application/xml";
+pub(crate) const KML_MIME_TYPE: &str = "application/vnd.google-earth.kml+xml";
 #[cfg(feature = "tree-sitter")]
 pub(crate) const SOURCE_CODE_MIME_TYPE: &str = "text/x-source-code";
 
@@ -230,6 +299,18 @@ pub(crate) const EXCEL_MIME_TYPE: &str = "application/vnd.openxmlformats-officed
 pub(crate) const ODT_MIME_TYPE: &str = "application/vnd.oasis.opendocument.text";
 pub(crate) const ODP_MIME_TYPE: &str = "application/vnd.oasis.opendocument.presentation";
 pub(crate) const ODS_MIME_TYPE: &str = "application/vnd.oasis.opendocument.spreadsheet";
+pub(crate) const ODG_MIME_TYPE: &str = "application/vnd.oasis.opendocument.graphics";
+/// Flat single-file XML variant of [`ODG_MIME_TYPE`] (`.fodg`): the whole
+/// package's `content.xml` inlined as one document, with no ZIP layer. The
+/// packaged MIME type is carried inside it as the root element's
+/// `office:mimetype` attribute rather than as a separate file, so content
+/// detection reads that attribute (see `xml_vocabulary`) instead of sniffing
+/// a ZIP signature. ~keep
+pub(crate) const ODG_FLAT_MIME_TYPE: &str = "application/vnd.oasis.opendocument.graphics-flat-xml";
+/// ODF namespace bound to the `office:` prefix, used to confirm the root
+/// element of a flat ODF document is actually `office:document` before
+/// trusting its `office:mimetype` attribute. ~keep
+const ODF_OFFICE_NAMESPACE: &str = "urn:oasis:names:tc:opendocument:xmlns:office:1.0";
 #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
 const ZIP_MIME_TYPE: &str = "application/zip";
 
@@ -330,7 +411,7 @@ static FORMATS: &[FormatEntry] = &[
         aliases: &["text/x-mdx"],
     },
     FormatEntry {
-        extensions: &["djot"],
+        extensions: &["djot", "dj"],
         mime_type: "text/x-djot",
         aliases: &["text/djot"],
     },
@@ -347,7 +428,12 @@ static FORMATS: &[FormatEntry] = &[
     FormatEntry {
         extensions: &["html", "htm"],
         mime_type: "text/html",
-        aliases: &["application/xhtml+xml"],
+        aliases: &[],
+    },
+    FormatEntry {
+        extensions: &["xhtml", "xht"],
+        mime_type: "application/xhtml+xml",
+        aliases: &[],
     },
     FormatEntry {
         extensions: &["docx"],
@@ -410,7 +496,7 @@ static FORMATS: &[FormatEntry] = &[
         aliases: &[],
     },
     FormatEntry {
-        extensions: &["ppt", "pot"],
+        extensions: &["ppt", "pot", "pps"],
         mime_type: "application/vnd.ms-powerpoint",
         aliases: &[],
     },
@@ -425,7 +511,7 @@ static FORMATS: &[FormatEntry] = &[
         aliases: &[],
     },
     FormatEntry {
-        extensions: &["xls", "xlt"],
+        extensions: &["xls", "xlt", "xla"],
         mime_type: "application/vnd.ms-excel",
         aliases: &[],
     },
@@ -442,10 +528,10 @@ static FORMATS: &[FormatEntry] = &[
     FormatEntry {
         extensions: &["xlam"],
         mime_type: "application/vnd.ms-excel.addin.macroEnabled.12",
-        aliases: &[],
+        aliases: &["application/vnd.ms-excel.addin.macroEnabled"],
     },
     FormatEntry {
-        extensions: &["xla"],
+        extensions: &["xltm"],
         mime_type: "application/vnd.ms-excel.template.macroEnabled.12",
         aliases: &[],
     },
@@ -455,9 +541,24 @@ static FORMATS: &[FormatEntry] = &[
         aliases: &[],
     },
     FormatEntry {
+        extensions: &["fodg"],
+        mime_type: ODG_FLAT_MIME_TYPE,
+        aliases: &[],
+    },
+    FormatEntry {
         extensions: &["dbf"],
-        mime_type: "application/x-dbf",
-        aliases: &["application/dbase"],
+        mime_type: "application/vnd.dbf",
+        aliases: &["application/x-dbf", "application/dbase"],
+    },
+    FormatEntry {
+        extensions: &["sqlite", "sqlite3", "db"],
+        mime_type: SQLITE_MIME_TYPE,
+        aliases: &["application/x-sqlite3"],
+    },
+    FormatEntry {
+        extensions: &["gpkg", "gpkx"],
+        mime_type: GEOPACKAGE_MIME_TYPE,
+        aliases: &[],
     },
     FormatEntry {
         extensions: &["hwp"],
@@ -467,7 +568,7 @@ static FORMATS: &[FormatEntry] = &[
     FormatEntry {
         extensions: &["hwpx"],
         mime_type: "application/haansofthwpx",
-        aliases: &[],
+        aliases: &["application/hwp+zip"],
     },
     FormatEntry {
         extensions: &["wpd", "wp", "wp5", "wp6"],
@@ -505,23 +606,13 @@ static FORMATS: &[FormatEntry] = &[
         aliases: &[],
     },
     FormatEntry {
-        extensions: &["jp2", "j2k", "j2c"],
+        extensions: &["jp2", "jpg2"],
         mime_type: "image/jp2",
         aliases: &[],
     },
     FormatEntry {
-        extensions: &["jpx"],
-        mime_type: "image/jpx",
-        aliases: &[],
-    },
-    FormatEntry {
-        extensions: &["jpm"],
-        mime_type: "image/jpm",
-        aliases: &[],
-    },
-    FormatEntry {
-        extensions: &["mj2"],
-        mime_type: "image/mj2",
+        extensions: &["j2c", "j2k", "jpc"],
+        mime_type: "image/j2c",
         aliases: &[],
     },
     FormatEntry {
@@ -530,14 +621,24 @@ static FORMATS: &[FormatEntry] = &[
         aliases: &[],
     },
     FormatEntry {
-        extensions: &["heic", "heics"],
+        extensions: &["heic"],
         mime_type: "image/heic",
-        aliases: &["image/heic-sequence"],
+        aliases: &[],
     },
     FormatEntry {
-        extensions: &["heif"],
+        extensions: &["heics"],
+        mime_type: "image/heic-sequence",
+        aliases: &[],
+    },
+    FormatEntry {
+        extensions: &["heif", "hif"],
         mime_type: "image/heif",
-        aliases: &["image/heif-sequence"],
+        aliases: &[],
+    },
+    FormatEntry {
+        extensions: &["heifs"],
+        mime_type: "image/heif-sequence",
+        aliases: &[],
     },
     FormatEntry {
         extensions: &["avif"],
@@ -585,6 +686,11 @@ static FORMATS: &[FormatEntry] = &[
         aliases: &["text/json"],
     },
     FormatEntry {
+        extensions: &["geojson"],
+        mime_type: GEOJSON_MIME_TYPE,
+        aliases: &["application/vnd.geo+json"],
+    },
+    FormatEntry {
         extensions: &[],
         mime_type: "application/csl+json",
         aliases: &[],
@@ -596,8 +702,8 @@ static FORMATS: &[FormatEntry] = &[
     },
     FormatEntry {
         extensions: &["yaml", "yml"],
-        mime_type: "application/x-yaml",
-        aliases: &["text/yaml", "text/x-yaml", "application/yaml"],
+        mime_type: "application/yaml",
+        aliases: &["application/x-yaml", "text/yaml", "text/x-yaml"],
     },
     FormatEntry {
         extensions: &["toml"],
@@ -608,6 +714,11 @@ static FORMATS: &[FormatEntry] = &[
         extensions: &["xml"],
         mime_type: "application/xml",
         aliases: &["text/xml"],
+    },
+    FormatEntry {
+        extensions: &["kml"],
+        mime_type: KML_MIME_TYPE,
+        aliases: &[],
     },
     FormatEntry {
         extensions: &["svg"],
@@ -651,13 +762,13 @@ static FORMATS: &[FormatEntry] = &[
     },
     FormatEntry {
         extensions: &["rst"],
-        mime_type: "text/x-rst",
-        aliases: &["text/prs.fallenstein.rst"],
+        mime_type: "text/prs.fallenstein.rst",
+        aliases: &["text/x-rst"],
     },
     FormatEntry {
         extensions: &["org"],
-        mime_type: "text/x-org",
-        aliases: &["text/org", "application/x-org"],
+        mime_type: "text/org",
+        aliases: &["text/x-org", "application/x-org"],
     },
     FormatEntry {
         extensions: &["epub"],
@@ -721,8 +832,8 @@ static FORMATS: &[FormatEntry] = &[
     },
     FormatEntry {
         extensions: &["typst", "typ"],
-        mime_type: "application/x-typst",
-        aliases: &["text/x-typst"],
+        mime_type: "text/vnd.typst",
+        aliases: &["text/x-typst", "application/x-typst"],
     },
     FormatEntry {
         extensions: &["pages"],
@@ -760,16 +871,79 @@ static FORMATS: &[FormatEntry] = &[
         aliases: &["video/webm"],
     },
     FormatEntry {
-        extensions: &["mp4", "mpeg"],
+        extensions: &["mp4", "mpg4", "mp4v", "m4v"],
         mime_type: "video/mp4",
-        aliases: &["video/mpeg"],
+        aliases: &[],
+    },
+    FormatEntry {
+        extensions: &["mpeg", "mpg", "mpe", "m1v", "m2v"],
+        mime_type: "video/mpeg",
+        aliases: &[],
     },
     FormatEntry {
         extensions: &[],
         mime_type: "text/x-source-code",
-        aliases: &[],
+        aliases: &["text/x-python", "text/x-r-source", "text/x-julia"],
     },
 ];
+
+const fn extensions_equal(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut index = 0;
+    while index < left.len() {
+        if left[index] != right[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+const fn count_unique_extensions() -> usize {
+    let mut count = 0;
+    let mut format_index = 0;
+    while format_index < FORMATS.len() {
+        let mut extension_index = 0;
+        while extension_index < FORMATS[format_index].extensions.len() {
+            let extension = FORMATS[format_index].extensions[extension_index];
+            let mut duplicate = false;
+            let mut earlier_format = 0;
+            while earlier_format <= format_index {
+                let limit = if earlier_format == format_index {
+                    extension_index
+                } else {
+                    FORMATS[earlier_format].extensions.len()
+                };
+                let mut earlier_extension = 0;
+                while earlier_extension < limit {
+                    if extensions_equal(extension, FORMATS[earlier_format].extensions[earlier_extension]) {
+                        duplicate = true;
+                    }
+                    earlier_extension += 1;
+                }
+                earlier_format += 1;
+            }
+            if !duplicate {
+                count += 1;
+            }
+            extension_index += 1;
+        }
+        format_index += 1;
+    }
+    count
+}
+
+/// Number of formats in Xberg's static MIME registry. ~keep
+#[cfg_attr(alef, alef(skip))]
+pub const SUPPORTED_FORMAT_COUNT: usize = FORMATS.len();
+
+/// Number of unique file extensions in Xberg's static MIME registry. ~keep
+#[cfg_attr(alef, alef(skip))]
+pub const SUPPORTED_EXTENSION_COUNT: usize = count_unique_extensions();
 
 /// Extension to MIME type mapping, derived from [`FORMATS`].
 static EXT_TO_MIME: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
@@ -874,25 +1048,20 @@ pub fn detect_mime_type(path: impl AsRef<Path>, check_exists: bool) -> Result<St
 /// Returns `XbergError::UnsupportedFormat` if not supported.
 #[cfg_attr(alef, alef(skip))]
 pub fn validate_mime_type(mime_type: &str) -> Result<String> {
-    if SUPPORTED_MIME_TYPES.contains(mime_type) {
-        tracing::trace!(mime_type = %mime_type, "MIME type validated (exact match)");
-        return Ok(mime_type.to_string());
+    let parsed = mime_type.trim().parse::<mime::Mime>().map_err(|_| {
+        tracing::debug!(mime_type = %mime_type, "MIME type has invalid syntax");
+        XbergError::UnsupportedFormat(mime_type.to_string())
+    })?;
+    let essence = parsed.essence_str();
+    if let Some(supported) = SUPPORTED_MIME_TYPES
+        .iter()
+        .find(|supported| supported.eq_ignore_ascii_case(essence))
+    {
+        tracing::trace!(mime_type = %mime_type, matched = %supported, "MIME type validated by essence");
+        return Ok((*supported).to_string());
     }
 
-    if mime_type.starts_with("image/") {
-        tracing::trace!(mime_type = %mime_type, "MIME type validated (image prefix)");
-        return Ok(mime_type.to_string());
-    }
-
-    let lower = mime_type.to_ascii_lowercase();
-    for supported in SUPPORTED_MIME_TYPES.iter() {
-        if supported.to_ascii_lowercase() == lower {
-            tracing::trace!(mime_type = %mime_type, matched = %supported, "MIME type validated (case-insensitive)");
-            return Ok(supported.to_string());
-        }
-    }
-
-    tracing::debug!(mime_type = %mime_type, "MIME type not in supported set");
+    tracing::debug!(mime_type = %mime_type, essence, "MIME type not in supported set");
     Err(XbergError::UnsupportedFormat(mime_type.to_string()))
 }
 
@@ -908,21 +1077,15 @@ pub fn validate_mime_type(mime_type: &str) -> Result<String> {
 /// # Returns
 ///
 /// The validated MIME type string.
+#[cfg(test)]
 pub(crate) fn detect_or_validate(path: Option<&str>, mime_type: Option<&str>) -> Result<String> {
     if let Some(mime) = mime_type {
         tracing::debug!(mime_type = %mime, "validating caller-provided MIME type");
         validate_mime_type(mime)
     } else if let Some(p) = path.map(Path::new) {
-        let detected = detect_mime_type(p, true)?;
-        let resolved = match magic_override(p, &detected) {
-            Some(from_magic) => {
-                tracing::debug!(path = %p.display(), extension_mime = %detected, magic_mime = %from_magic,
-                    "extension/content MIME disagree; preferring content");
-                from_magic
-            }
-            None => detected,
-        };
-        validate_mime_type(&resolved)
+        let detected = detect_mime_type(p, true);
+        let mut file = std::fs::File::open(p).ok();
+        resolve_file_mime(p, detected, file.as_mut())
     } else {
         Err(XbergError::validation(
             "Must provide either path or mime_type".to_string(),
@@ -930,38 +1093,177 @@ pub(crate) fn detect_or_validate(path: Option<&str>, mime_type: Option<&str>) ->
     }
 }
 
+pub(crate) fn detect_or_validate_file(
+    path: &Path,
+    file: &mut std::fs::File,
+    mime_type: Option<&str>,
+    policy: crate::core::config::MimeDetectionPolicy,
+) -> Result<String> {
+    if let Some(mime) = mime_type.filter(|mime| *mime != OCTET_STREAM_MIME_TYPE) {
+        tracing::debug!(mime_type = %mime, "validating caller-provided MIME type");
+        return validate_mime_type(mime);
+    }
+
+    use crate::core::config::MimeDetectionPolicy;
+
+    match policy {
+        MimeDetectionPolicy::PreferContent => resolve_file_mime(path, detect_mime_type(path, false), Some(file)),
+        MimeDetectionPolicy::TrustExtension => {
+            let extension = detect_mime_type(path, false);
+            if let Ok(ref detected) = extension
+                && let Ok(validated) = validate_mime_type(detected)
+            {
+                return Ok(validated);
+            }
+            resolve_file_mime(path, extension, Some(file))
+        }
+        MimeDetectionPolicy::ContentOnly => detect_mime_type_from_file_content(file, PackageInspection::FullArchive)
+            .ok_or_else(|| XbergError::validation("Could not detect MIME type from file content".to_string()))
+            .and_then(|detected| validate_mime_type(&detected)),
+    }
+}
+
+pub(crate) fn detect_or_validate_bytes(
+    content: &[u8],
+    filename: Option<&str>,
+    mime_type: Option<&str>,
+    policy: crate::core::config::MimeDetectionPolicy,
+) -> Result<String> {
+    if let Some(mime) = mime_type {
+        tracing::debug!(mime_type = %mime, "validating caller-provided MIME type");
+        return validate_mime_type(mime);
+    }
+
+    use crate::core::config::MimeDetectionPolicy;
+    match policy {
+        MimeDetectionPolicy::TrustExtension => {
+            let extension = filename.and_then(|name| detect_mime_type(name, false).ok());
+            if let Some(ref detected) = extension
+                && let Ok(validated) = validate_mime_type(detected)
+            {
+                return Ok(validated);
+            }
+            detect_mime_type_from_bytes(content).and_then(|detected| validate_mime_type(&detected))
+        }
+        MimeDetectionPolicy::ContentOnly => {
+            detect_mime_type_from_bytes(content).and_then(|detected| validate_mime_type(&detected))
+        }
+        MimeDetectionPolicy::PreferContent => {
+            let extension = filename.and_then(|name| detect_mime_type(name, false).ok());
+            let from_content = detect_mime_type_from_bytes(content);
+            match (extension, from_content) {
+                (Some(extension), Ok(content_mime)) => prefer_content_mime(&extension, &content_mime),
+                (Some(extension), Err(_)) => validate_mime_type(&extension),
+                (None, Ok(content_mime)) => validate_mime_type(&content_mime),
+                (None, Err(error)) => Err(error),
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+pub(crate) async fn resolve_owned_bytes_mime(
+    content: Vec<u8>,
+    filename: Option<String>,
+    mime_type: Option<String>,
+    policy: crate::core::config::MimeDetectionPolicy,
+) -> Result<(Vec<u8>, String)> {
+    if let Some(explicit) = mime_type.as_deref().filter(|mime| *mime != OCTET_STREAM_MIME_TYPE) {
+        return validate_mime_type(explicit).map(|validated| (content, validated));
+    }
+    if policy == crate::core::config::MimeDetectionPolicy::TrustExtension
+        && let Some(filename) = filename.as_deref()
+        && let Ok(detected) = detect_mime_type(filename, false)
+        && let Ok(validated) = validate_mime_type(&detected)
+    {
+        return Ok((content, validated));
+    }
+
+    tokio::task::spawn_blocking(move || {
+        let explicit = mime_type.as_deref().filter(|mime| *mime != OCTET_STREAM_MIME_TYPE);
+        let detected = detect_or_validate_bytes(&content, filename.as_deref(), explicit, policy)?;
+        Ok((content, detected))
+    })
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, "byte MIME detection task failed");
+        XbergError::Other("Byte MIME detection task failed".to_string())
+    })?
+}
+
+#[cfg(any(not(feature = "tokio-runtime"), target_arch = "wasm32"))]
+pub(crate) async fn resolve_owned_bytes_mime(
+    content: Vec<u8>,
+    filename: Option<String>,
+    mime_type: Option<String>,
+    policy: crate::core::config::MimeDetectionPolicy,
+) -> Result<(Vec<u8>, String)> {
+    let explicit = mime_type.as_deref().filter(|mime| *mime != OCTET_STREAM_MIME_TYPE);
+    let detected = detect_or_validate_bytes(&content, filename.as_deref(), explicit, policy)?;
+    Ok((content, detected))
+}
+
+fn prefer_content_mime(extension_mime: &str, content_mime: &str) -> Result<String> {
+    let extension_supported = SUPPORTED_MIME_TYPES.contains(extension_mime);
+    if extension_supported
+        && (content_mime == PLAIN_TEXT_MIME_TYPE
+            || (is_generic_xml_mime(content_mime) && is_specific_xml_mime(extension_mime))
+            || (content_mime == JSON_MIME_TYPE && is_specific_json_mime(extension_mime))
+            || is_compatible_ooxml_mime(extension_mime, content_mime))
+    {
+        return validate_mime_type(extension_mime);
+    }
+    validate_mime_type(content_mime).or_else(|_| validate_mime_type(extension_mime))
+}
+
+fn resolve_file_mime(path: &Path, path_detection: Result<String>, file: Option<&mut std::fs::File>) -> Result<String> {
+    let detected = match path_detection {
+        Ok(detected) => detected,
+        Err(path_error) => {
+            if let Some(from_content) =
+                file.and_then(|file| detect_mime_type_from_file_content(file, PackageInspection::HeaderOnly))
+                && let Ok(validated) = validate_mime_type(&from_content)
+            {
+                tracing::debug!(path = %path.display(), mime_type = %validated,
+                        "path MIME unavailable; matched via content");
+                return Ok(validated);
+            }
+            return Err(path_error);
+        }
+    };
+    let resolved = match file.and_then(|file| magic_override(file, &detected)) {
+        Some(from_magic) => {
+            tracing::debug!(path = %path.display(), extension_mime = %detected, magic_mime = %from_magic,
+                    "extension/content MIME disagree; preferring content");
+            from_magic
+        }
+        None => detected,
+    };
+    validate_mime_type(&resolved)
+}
+
 /// If the file's magic bytes confidently indicate a different supported MIME
 /// type than the extension did, return it. Returns `None` when the content has
 /// no signature, the read fails, or content and extension agree.
-fn magic_override(path: &Path, extension_mime: &str) -> Option<String> {
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut header = vec![0u8; 4096];
-    let n = file.read(&mut header).ok()?;
-    header.truncate(n);
-    if header.is_empty() {
-        return None;
-    }
+fn magic_override(file: &mut std::fs::File, extension_mime: &str) -> Option<String> {
+    let from_magic = detect_mime_type_from_file_content(file, PackageInspection::FullArchive)?;
 
-    let from_magic = detect_mime_type_from_bytes(&header).ok()?;
-    #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
-    if from_magic == ZIP_MIME_TYPE || from_magic.starts_with("application/vnd.oasis.opendocument.") {
-        // The header holds only the first entries of the archive, and a real
-        // document names its main part far later: `ppt/presentation.xml` sits
-        // 107 KB into a 27-slide deck. The archive directory finds the part
-        // wherever it is, so the document is not mistaken for a plain ZIP. One
-        // open answers both questions.
-        if let Some(package_mime) = detect_zip_package(std::fs::File::open(path).ok()?) {
-            return (package_mime != extension_mime).then(|| package_mime.to_string());
-        }
-    }
-
-    if from_magic == PLAIN_TEXT_MIME_TYPE {
+    if from_magic == PLAIN_TEXT_MIME_TYPE && SUPPORTED_MIME_TYPES.contains(extension_mime) {
         return None;
     }
-    if is_generic_xml_mime(&from_magic) && is_specific_xml_mime(extension_mime) {
+    if is_generic_xml_mime(&from_magic)
+        && is_specific_xml_mime(extension_mime)
+        && SUPPORTED_MIME_TYPES.contains(extension_mime)
+    {
         return None;
     }
-    if from_magic == JSON_MIME_TYPE && is_specific_json_mime(extension_mime) {
+    if from_magic == JSON_MIME_TYPE
+        && is_specific_json_mime(extension_mime)
+        && SUPPORTED_MIME_TYPES.contains(extension_mime)
+    {
+        return None;
+    }
+    if is_compatible_ooxml_mime(extension_mime, &from_magic) {
         return None;
     }
     if from_magic != extension_mime && validate_mime_type(&from_magic).is_ok() {
@@ -969,6 +1271,77 @@ fn magic_override(path: &Path, extension_mime: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+fn detect_mime_type_from_file_content(
+    file: &mut std::fs::File,
+    package_inspection: PackageInspection,
+) -> Option<String> {
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let mut header = [0_u8; MIME_SNIFF_LENGTH];
+    let bytes_read = file.read(&mut header).ok()?;
+    if bytes_read == 0 {
+        return None;
+    }
+
+    let header = &header[..bytes_read];
+    let content_continues = bytes_read == MIME_SNIFF_LENGTH
+        && file
+            .metadata()
+            .ok()
+            .is_some_and(|metadata| metadata.len() > bytes_read as u64);
+    let json_candidate = header_may_start_json(file, header, content_continues);
+    let mut from_magic = match detect_mime_type_from_bytes_with_inspection(header, package_inspection) {
+        Ok(detected) => detected,
+        Err(_) if json_candidate => JSON_MIME_TYPE.to_string(),
+        Err(_) => {
+            // An MS-CFB compound document (.doc/.xls/.ppt) cannot be typed from a
+            // fixed-size prefix: identifying it means following the FAT sector
+            // chain to the root directory entry, and a truncated buffer references
+            // sectors that are not present in `header` (#1590). Escape to a
+            // structure-aware read over the file the same way the ZIP branch below
+            // escapes to `detect_zip_package` for an inconclusive archive header. ~keep
+            #[cfg(any(feature = "office", feature = "hwp", feature = "email"))]
+            if package_inspection == PackageInspection::FullArchive && header.starts_with(&OLE2_MAGIC[..]) {
+                return detect_ole2_package(&mut *file, &SecurityLimits::default());
+            }
+            return None;
+        }
+    };
+    if matches!(from_magic.as_str(), PLAIN_TEXT_MIME_TYPE | OCTET_STREAM_MIME_TYPE) && json_candidate {
+        from_magic = JSON_MIME_TYPE.to_string();
+    }
+    #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+    if package_inspection == PackageInspection::FullArchive
+        && (from_magic == ZIP_MIME_TYPE || from_magic.starts_with("application/vnd.oasis.opendocument."))
+        && let Some(package_mime) = detect_zip_package(&mut *file)
+    {
+        return Some(package_mime.to_string());
+    }
+
+    Some(from_magic)
+}
+
+fn header_may_start_json(file: &mut std::fs::File, header: &[u8], content_continues: bool) -> bool {
+    if let Some(byte) = header
+        .iter()
+        .copied()
+        .find(|byte| !matches!(byte, b' ' | b'\n' | b'\r' | b'\t'))
+    {
+        return content_continues && matches!(byte, b'{' | b'[');
+    }
+    if !content_continues {
+        return false;
+    }
+
+    let mut continuation = [0_u8; MIME_SNIFF_LENGTH];
+    let bytes_read = file.read(&mut continuation).unwrap_or_default();
+    let _ = file.seek(SeekFrom::Start(header.len() as u64));
+    continuation[..bytes_read]
+        .iter()
+        .copied()
+        .find(|byte| !matches!(byte, b' ' | b'\n' | b'\r' | b'\t'))
+        .is_some_and(|byte| matches!(byte, b'{' | b'['))
 }
 
 /// Generic XML signatures cannot distinguish specialized XML vocabularies.
@@ -993,6 +1366,36 @@ fn is_specific_json_mime(mime_type: &str) -> bool {
             ))
 }
 
+fn is_compatible_ooxml_mime(extension_mime: &str, content_mime: &str) -> bool {
+    match content_mime {
+        DOCX_MIME_TYPE => matches!(
+            extension_mime,
+            DOCX_MIME_TYPE
+                | "application/vnd.ms-word.document.macroEnabled.12"
+                | "application/vnd.openxmlformats-officedocument.wordprocessingml.template"
+                | "application/vnd.ms-word.template.macroEnabled.12"
+        ),
+        POWER_POINT_MIME_TYPE => matches!(
+            extension_mime,
+            POWER_POINT_MIME_TYPE
+                | "application/vnd.ms-powerpoint.presentation.macroEnabled.12"
+                | "application/vnd.openxmlformats-officedocument.presentationml.slideshow"
+                | "application/vnd.openxmlformats-officedocument.presentationml.template"
+                | "application/vnd.ms-powerpoint.template.macroEnabled.12"
+        ),
+        EXCEL_MIME_TYPE => matches!(
+            extension_mime,
+            EXCEL_MIME_TYPE
+                | "application/vnd.ms-excel.sheet.macroEnabled.12"
+                | "application/vnd.ms-excel.addin.macroEnabled.12"
+                | "application/vnd.ms-excel.template.macroEnabled.12"
+                | "application/vnd.ms-excel.sheet.binary.macroEnabled.12"
+                | "application/vnd.openxmlformats-officedocument.spreadsheetml.template"
+        ),
+        _ => false,
+    }
+}
+
 /// Detect MIME type from raw file bytes.
 ///
 /// Uses magic byte signatures to detect file type from content.
@@ -1013,18 +1416,44 @@ fn is_specific_json_mime(mime_type: &str) -> bool {
 ///
 /// Returns `XbergError::UnsupportedFormat` if MIME type cannot be determined.
 pub fn detect_mime_type_from_bytes(content: &[u8]) -> Result<String> {
+    detect_mime_type_from_bytes_with_inspection(content, PackageInspection::FullArchive)
+}
+
+fn detect_mime_type_from_bytes_with_inspection(
+    content: &[u8],
+    package_inspection: PackageInspection,
+) -> Result<String> {
+    if content.starts_with(b"SQLite format 3\0") {
+        let application_id =
+            content.get(SQLITE_APPLICATION_ID_OFFSET..SQLITE_APPLICATION_ID_OFFSET + SQLITE_APPLICATION_ID_LENGTH);
+        if application_id.is_some_and(|identifier| {
+            identifier == GEOPACKAGE_APPLICATION_ID || identifier == GEOPACKAGE_LEGACY_APPLICATION_ID
+        }) {
+            return Ok(GEOPACKAGE_MIME_TYPE.to_string());
+        }
+    }
+    if content.starts_with(b"SQLite format 3\0") {
+        return Ok(SQLITE_MIME_TYPE.to_string());
+    }
+    if content.starts_with(J2C_CODESTREAM_MAGIC) {
+        return Ok("image/j2c".to_string());
+    }
+
     if let Some(kind) = infer::get(content) {
         let mime_type = kind.mime_type();
 
         #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
         if mime_type.starts_with("application/vnd.oasis.opendocument.") {
+            if package_inspection == PackageInspection::HeaderOnly {
+                return Ok(ZIP_MIME_TYPE.to_string());
+            }
             return Ok(detect_zip_package(std::io::Cursor::new(content))
                 .unwrap_or(ZIP_MIME_TYPE)
                 .to_string());
         }
 
         if mime_type == "application/zip"
-            && let Some(office_mime) = detect_office_format_from_zip(content)
+            && let Some(office_mime) = detect_office_format_from_zip(content, package_inspection)
         {
             return Ok(office_mime.to_string());
         }
@@ -1059,9 +1488,14 @@ pub fn detect_mime_type_from_bytes(content: &[u8]) -> Result<String> {
         let trimmed = text.trim_start();
 
         if (trimmed.starts_with('{') || trimmed.starts_with('['))
-            && serde_json::from_str::<serde_json::Value>(text).is_ok()
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
         {
-            return Ok(JSON_MIME_TYPE.to_string());
+            let mime_type = if is_geojson(&value) {
+                GEOJSON_MIME_TYPE
+            } else {
+                JSON_MIME_TYPE
+            };
+            return Ok(mime_type.to_string());
         }
 
         // The HTML checks must precede the generic `<` fallback. They used to follow it,
@@ -1097,6 +1531,21 @@ pub fn detect_mime_type_from_bytes(content: &[u8]) -> Result<String> {
     ))
 }
 
+fn is_geojson(value: &serde_json::Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    match object.get("type").and_then(serde_json::Value::as_str) {
+        Some("Feature") => object.contains_key("geometry") && object.contains_key("properties"),
+        Some("FeatureCollection") => object.get("features").is_some_and(serde_json::Value::is_array),
+        Some("GeometryCollection") => object.get("geometries").is_some_and(serde_json::Value::is_array),
+        Some("Point" | "MultiPoint" | "LineString" | "MultiLineString" | "Polygon" | "MultiPolygon") => {
+            object.get("coordinates").is_some_and(serde_json::Value::is_array)
+        }
+        _ => false,
+    }
+}
+
 /// Detect Office Open XML format from ZIP content by scanning for marker files.
 ///
 /// Office Open XML formats (DOCX, XLSX, PPTX) are ZIP archives containing specific
@@ -1112,7 +1561,7 @@ pub fn detect_mime_type_from_bytes(content: &[u8]) -> Result<String> {
 ///
 /// This function scans the ZIP's local file headers without fully parsing the archive,
 /// making it efficient for MIME type detection.
-fn detect_office_format_from_zip(content: &[u8]) -> Option<&'static str> {
+fn detect_office_format_from_zip(content: &[u8], _package_inspection: PackageInspection) -> Option<&'static str> {
     const DOCX_MARKER: &[u8] = b"word/document.xml";
     const XLSX_MARKER: &[u8] = b"xl/workbook.xml";
     const PPTX_MARKER: &[u8] = b"ppt/presentation.xml";
@@ -1124,8 +1573,8 @@ fn detect_office_format_from_zip(content: &[u8]) -> Option<&'static str> {
     #[cfg(feature = "hwpx")]
     const HWPX_MARKER: &[u8] = b"Contents/content.hpf";
     #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
-    if let Some(package_mime) = detect_zip_package(std::io::Cursor::new(content)) {
-        return Some(package_mime);
+    if _package_inspection == PackageInspection::FullArchive {
+        return detect_zip_package(std::io::Cursor::new(content));
     }
 
     #[cfg(feature = "hwpx")]
@@ -1208,6 +1657,37 @@ fn detect_office_format_from_archive<R: Read + Seek>(archive: &mut zip::ZipArchi
     None
 }
 
+/// Identify a legacy MS-CFB compound document (.doc/.xls/.ppt) from its root
+/// storage CLSID.
+///
+/// Mirrors the CLSID table `infer`'s `ole2()` matcher uses, but reads through
+/// a `Read + Seek` source instead of a fixed byte slice. A compound file
+/// cannot be typed from a truncated prefix: locating the root directory entry
+/// means following the FAT sector chain, and a chain built from a partial
+/// read references sectors the buffer does not contain (#1590).
+/// `cfb::CompoundFile::open` seeks and reads only the header, FAT, and
+/// directory sectors it needs, so this does not load the file into memory —
+/// the same shape `detect_zip_package` uses for a ZIP-based package.
+/// `limits.max_archive_size` still bounds the file this is attempted
+/// against, mirroring the bound `zip_central_directory_within_limits` applies
+/// before it opens a ZIP central directory.
+#[cfg(any(feature = "office", feature = "hwp", feature = "email"))]
+fn detect_ole2_package<R: Read + Seek>(mut reader: R, limits: &SecurityLimits) -> Option<String> {
+    let length = reader.seek(SeekFrom::End(0)).ok()?;
+    if length > limits.max_archive_size as u64 {
+        return None;
+    }
+    reader.seek(SeekFrom::Start(0)).ok()?;
+    let compound_file = cfb::CompoundFile::open(reader).ok()?;
+    let mime_type = match compound_file.root_entry().clsid().to_string().as_str() {
+        "00020810-0000-0000-c000-000000000046" | "00020820-0000-0000-c000-000000000046" => LEGACY_EXCEL_MIME_TYPE,
+        "00020906-0000-0000-c000-000000000046" => LEGACY_WORD_MIME_TYPE,
+        "64818d10-4f9b-11cf-86ea-00aa00b929e8" => LEGACY_POWERPOINT_MIME_TYPE,
+        _ => return None,
+    };
+    Some(mime_type.to_string())
+}
+
 #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
 fn detect_zip_package<R: Read + Seek>(mut reader: R) -> Option<&'static str> {
     let limits = SecurityLimits::default();
@@ -1217,8 +1697,115 @@ fn detect_zip_package<R: Read + Seek>(mut reader: R) -> Option<&'static str> {
     reader.seek(SeekFrom::Start(0)).ok()?;
     let mut archive = zip::ZipArchive::new(reader).ok()?;
 
-    // The package's own declaration wins, and its main part answers otherwise.
-    detect_zip_mimetype_entry(&mut archive).or_else(|| detect_office_format_from_archive(&mut archive))
+    let declared = detect_zip_mimetype_entry(&mut archive);
+    #[cfg(feature = "office")]
+    let declared = declared.or_else(|| detect_ooxml_content_type(&mut archive));
+    declared.or_else(|| detect_office_format_from_archive(&mut archive))
+}
+
+#[cfg(feature = "office")]
+fn detect_ooxml_content_type<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Option<&'static str> {
+    const CONTENT_TYPES_PATH: &str = "[Content_Types].xml";
+    const MAX_CONTENT_TYPES_LENGTH: u64 = 64 * 1024;
+
+    let mut content_types_index = None;
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).ok()?;
+        if entry.name() == CONTENT_TYPES_PATH && content_types_index.replace(index).is_some() {
+            return None;
+        }
+    }
+
+    let file = archive.by_index(content_types_index?).ok()?;
+    if file.size() > MAX_CONTENT_TYPES_LENGTH {
+        return None;
+    }
+    let mut xml = String::with_capacity(file.size() as usize);
+    file.take(MAX_CONTENT_TYPES_LENGTH + 1).read_to_string(&mut xml).ok()?;
+    let document = roxmltree::Document::parse(&xml).ok()?;
+    let mut detected = None;
+    for node in document.descendants().filter(|node| node.has_tag_name("Override")) {
+        let part_name = node.attribute("PartName")?;
+        let content_type = node.attribute("ContentType")?;
+        if let Some(mime_type) = ooxml_package_mime(part_name, content_type)
+            && detected.replace(mime_type).is_some()
+        {
+            return None;
+        }
+    }
+    detected
+}
+
+#[cfg(feature = "office")]
+fn ooxml_package_mime(part_name: &str, content_type: &str) -> Option<&'static str> {
+    match part_name {
+        "/word/document.xml" => wordprocessing_package_mime(content_type),
+        "/ppt/presentation.xml" => presentation_package_mime(content_type),
+        "/xl/workbook.xml" | "/xl/workbook.bin" => spreadsheet_package_mime(content_type),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "office")]
+fn wordprocessing_package_mime(content_type: &str) -> Option<&'static str> {
+    match content_type {
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml" => Some(DOCX_MIME_TYPE),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.template.main+xml" => {
+            Some("application/vnd.openxmlformats-officedocument.wordprocessingml.template")
+        }
+        "application/vnd.ms-word.document.macroEnabled.main+xml" => {
+            Some("application/vnd.ms-word.document.macroEnabled.12")
+        }
+        "application/vnd.ms-word.template.macroEnabledTemplate.main+xml" => {
+            Some("application/vnd.ms-word.template.macroEnabled.12")
+        }
+        _ => None,
+    }
+}
+
+#[cfg(feature = "office")]
+fn presentation_package_mime(content_type: &str) -> Option<&'static str> {
+    match content_type {
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml" => {
+            Some(POWER_POINT_MIME_TYPE)
+        }
+        "application/vnd.openxmlformats-officedocument.presentationml.slideshow.main+xml" => {
+            Some("application/vnd.openxmlformats-officedocument.presentationml.slideshow")
+        }
+        "application/vnd.openxmlformats-officedocument.presentationml.template.main+xml" => {
+            Some("application/vnd.openxmlformats-officedocument.presentationml.template")
+        }
+        "application/vnd.ms-powerpoint.presentation.macroEnabled.main+xml" => {
+            Some("application/vnd.ms-powerpoint.presentation.macroEnabled.12")
+        }
+        "application/vnd.ms-powerpoint.template.macroEnabled.main+xml" => {
+            Some("application/vnd.ms-powerpoint.template.macroEnabled.12")
+        }
+        _ => None,
+    }
+}
+
+#[cfg(feature = "office")]
+fn spreadsheet_package_mime(content_type: &str) -> Option<&'static str> {
+    match content_type {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml" => Some(EXCEL_MIME_TYPE),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml" => {
+            Some("application/vnd.openxmlformats-officedocument.spreadsheetml.template")
+        }
+        "application/vnd.ms-excel.sheet.macroEnabled.main+xml" => {
+            Some("application/vnd.ms-excel.sheet.macroEnabled.12")
+        }
+        "application/vnd.ms-excel.template.macroEnabled.main+xml" => {
+            Some("application/vnd.ms-excel.template.macroEnabled.12")
+        }
+        "application/vnd.ms-excel.addin.macroEnabled.main+xml" => {
+            Some("application/vnd.ms-excel.addin.macroEnabled.12")
+        }
+        "application/vnd.ms-excel.sheet.binary.macroEnabled.main" => {
+            Some("application/vnd.ms-excel.sheet.binary.macroEnabled.12")
+        }
+        _ => None,
+    }
 }
 
 /// Read the `mimetype` entry a ZIP-based document package declares.
@@ -1480,13 +2067,10 @@ pub fn list_supported_formats() -> Vec<SupportedFormat> {
 mod tests {
     use super::*;
     use std::fs::File;
-    #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
     use std::io::{Cursor, Write};
     use tempfile::tempdir;
-    #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
     use zip::write::FileOptions;
 
-    #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
     fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
         let options = FileOptions::<'_, ()>::default().compression_method(zip::CompressionMethod::Stored);
@@ -1765,6 +2349,51 @@ mod tests {
         .await;
     }
 
+    #[cfg(all(feature = "xml", feature = "tokio-runtime", not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn should_route_kml_through_the_xml_extractor() {
+        let content = r#"<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Placemark><name>Berlin</name></Placemark>
+</kml>"#;
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("placemark.kml");
+        std::fs::write(&path, content).unwrap();
+        let config = crate::core::config::ExtractionConfig {
+            use_cache: false,
+            ..Default::default()
+        };
+
+        let result = crate::core::extractor::extract_file(&path, None, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(result.mime_type, "application/vnd.google-earth.kml+xml");
+        assert_eq!(result.content, "kml\n  Placemark\n    name\n    Berlin");
+    }
+
+    #[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn should_route_geojson_through_the_structured_extractor() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("point.geojson");
+        std::fs::write(&path, br#"{"type":"Point","coordinates":[13.4,52.5]}"#).unwrap();
+        let config = crate::core::config::ExtractionConfig {
+            use_cache: false,
+            geojson: Some(crate::core::config::GeoJsonExtractionConfig {
+                include_full_coordinates: true,
+            }),
+            ..Default::default()
+        };
+
+        let result = crate::core::extractor::extract_file(&path, None, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(result.mime_type, "application/geo+json");
+        assert_eq!(result.content, "type: Point\n\ncoordinates\n13.4\n52.5");
+    }
+
     #[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
     #[tokio::test]
     async fn should_route_benchmark_text_extensions_to_plain_text_extractor() {
@@ -1867,7 +2496,7 @@ mod tests {
 
         let test_cases = vec![
             ("test.json", JSON_MIME_TYPE),
-            ("test.yaml", "application/x-yaml"),
+            ("test.yaml", "application/yaml"),
             ("test.toml", "application/toml"),
             ("test.xml", XML_MIME_TYPE),
             ("test.csv", "text/csv"),
@@ -1934,8 +2563,31 @@ mod tests {
         assert!(validate_mime_type("image/png").is_ok());
         assert!(validate_mime_type("image/gif").is_ok());
         assert!(validate_mime_type("image/webp").is_ok());
+        assert!(validate_mime_type("image/custom-format").is_err());
+    }
 
-        assert!(validate_mime_type("image/custom-format").is_ok());
+    #[test]
+    fn should_validate_parameterized_mime_by_its_well_formed_essence() {
+        assert_eq!(
+            validate_mime_type("Application/JSON; Charset=UTF-8").unwrap(),
+            "application/json"
+        );
+        assert_eq!(
+            validate_mime_type(" application/geo+json; charset=utf-8 ").unwrap(),
+            GEOJSON_MIME_TYPE
+        );
+    }
+
+    #[test]
+    fn should_reject_malformed_mime_syntax_before_registry_lookup() {
+        for malformed in [
+            "application//json",
+            "application/json; charset",
+            "application/json, text/plain",
+            "application/json; charset=\"unterminated",
+        ] {
+            assert!(validate_mime_type(malformed).is_err(), "accepted {malformed:?}");
+        }
     }
 
     #[test]
@@ -1951,6 +2603,59 @@ mod tests {
         assert!(validate_mime_type("audio/webm").is_ok());
         assert!(validate_mime_type("video/mp4").is_ok());
         assert!(validate_mime_type("video/webm").is_ok());
+    }
+
+    #[test]
+    fn audited_extensions_resolve_to_registered_canonical_mime_types() {
+        let expected = [
+            ("file.dj", "text/x-djot"),
+            ("file.pps", LEGACY_POWERPOINT_MIME_TYPE),
+            ("file.xltm", "application/vnd.ms-excel.template.macroEnabled.12"),
+            ("file.xla", "application/vnd.ms-excel"),
+            ("file.sqlite3", SQLITE_MIME_TYPE),
+            ("file.gpkx", GEOPACKAGE_MIME_TYPE),
+            ("file.xhtml", "application/xhtml+xml"),
+            ("file.xht", "application/xhtml+xml"),
+            ("file.heics", "image/heic-sequence"),
+            ("file.heifs", "image/heif-sequence"),
+            ("file.j2c", "image/j2c"),
+            ("file.j2k", "image/j2c"),
+            ("file.jpc", "image/j2c"),
+            ("file.jpg2", "image/jp2"),
+            ("file.hif", "image/heif"),
+            ("file.mpeg", "video/mpeg"),
+            ("file.mpg", "video/mpeg"),
+            ("file.mpe", "video/mpeg"),
+            ("file.m1v", "video/mpeg"),
+            ("file.m2v", "video/mpeg"),
+            ("file.mpg4", "video/mp4"),
+            ("file.mp4v", "video/mp4"),
+            ("file.m4v", "video/mp4"),
+            ("file.typ", "text/vnd.typst"),
+        ];
+
+        for (path, mime_type) in expected {
+            assert_eq!(detect_mime_type(path, false).unwrap(), mime_type, "failed for {path}");
+        }
+        let motion_jpeg_2000 = detect_mime_type("file.mj2", false).unwrap();
+        assert!(validate_mime_type(&motion_jpeg_2000).is_err());
+    }
+
+    #[test]
+    fn registered_mime_types_are_canonical_and_compatibility_names_are_aliases() {
+        let expected = [
+            "application/vnd.dbf",
+            "application/yaml",
+            "text/prs.fallenstein.rst",
+            "text/org",
+            "text/vnd.typst",
+            "application/vnd.geo+json",
+            "application/hwp+zip",
+        ];
+        for mime_type in expected {
+            assert_eq!(validate_mime_type(mime_type).unwrap(), mime_type);
+        }
+        assert!(validate_mime_type("application/geopackage+vnd.sqlite3").is_err());
     }
 
     #[test]
@@ -1984,6 +2689,63 @@ mod tests {
         let result = detect_or_validate(file_path.to_str(), None);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "application/pdf");
+    }
+
+    #[test]
+    fn should_detect_content_when_extension_is_unknown() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("document.unknown");
+        std::fs::write(&file_path, b"%PDF-1.7\n").unwrap();
+
+        assert_eq!(detect_or_validate(file_path.to_str(), None).unwrap(), PDF_MIME_TYPE);
+    }
+
+    #[test]
+    fn should_detect_content_when_path_has_no_extension() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("document");
+        std::fs::write(&file_path, b"%PDF-1.7\n").unwrap();
+
+        assert_eq!(detect_or_validate(file_path.to_str(), None).unwrap(), PDF_MIME_TYPE);
+    }
+
+    #[test]
+    fn should_preserve_unknown_extension_error_when_content_is_unrecognized() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("document.unknown");
+        File::create(&file_path).unwrap();
+
+        let error = detect_or_validate(file_path.to_str(), None).unwrap_err();
+        assert!(matches!(
+            error,
+            XbergError::UnsupportedFormat(message) if message == "Unknown extension: .unknown"
+        ));
+    }
+
+    #[test]
+    fn should_preserve_path_error_when_extensionless_content_is_unrecognized() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("document");
+        File::create(&file_path).unwrap();
+
+        let error = detect_or_validate(file_path.to_str(), None).unwrap_err();
+        assert!(matches!(
+            error,
+            XbergError::Validation { message, .. }
+                if message == format!("Could not determine MIME type from file path: {}", file_path.display())
+        ));
+    }
+
+    #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+    #[test]
+    fn should_limit_unknown_zip_fallback_to_the_bounded_header() {
+        const PADDING: &[u8] = &[b'x'; MIME_SNIFF_LENGTH + 1];
+        let archive = build_zip(&[("padding.bin", PADDING), ("word/document.xml", b"<document/>")]);
+        let directory = tempdir().unwrap();
+        let file_path = directory.path().join("document.unknown");
+        std::fs::write(&file_path, archive).unwrap();
+
+        assert_eq!(detect_or_validate(file_path.to_str(), None).unwrap(), ZIP_MIME_TYPE);
     }
 
     /// Regression for #1223: a file whose content is a DOCX but whose extension
@@ -2033,6 +2795,212 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_specialized_xml_extension_does_not_override_supported_content() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("feed.atom");
+        std::fs::write(&path, br#"<?xml version="1.0"?><feed/>"#).unwrap();
+
+        assert_eq!(detect_or_validate(path.to_str(), None).unwrap(), "text/xml");
+    }
+
+    #[test]
+    fn unsupported_specialized_json_extension_does_not_override_supported_content() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("model.gltf");
+        std::fs::write(&path, br#"{"asset":{"version":"2.0"}}"#).unwrap();
+
+        assert_eq!(detect_or_validate(path.to_str(), None).unwrap(), JSON_MIME_TYPE);
+    }
+
+    #[test]
+    fn prefer_content_bytes_falls_back_from_unsupported_specialized_extension_to_plain_text() {
+        let detected = detect_or_validate_bytes(
+            b"ordinary prose without markup",
+            Some("feed.atom"),
+            None,
+            crate::core::config::MimeDetectionPolicy::PreferContent,
+        )
+        .unwrap();
+
+        assert_eq!(detected, PLAIN_TEXT_MIME_TYPE);
+    }
+
+    #[test]
+    fn prefer_content_file_falls_back_from_unsupported_specialized_extension_to_plain_text() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("feed.atom");
+        std::fs::write(&path, b"ordinary prose without markup").unwrap();
+        let mut file = File::open(&path).unwrap();
+
+        let detected = detect_or_validate_file(
+            &path,
+            &mut file,
+            None,
+            crate::core::config::MimeDetectionPolicy::PreferContent,
+        )
+        .unwrap();
+
+        assert_eq!(detected, PLAIN_TEXT_MIME_TYPE);
+    }
+
+    #[test]
+    fn content_only_bytes_ignores_a_supported_filename_extension() {
+        let detected = detect_or_validate_bytes(
+            br#"{"kind":"content"}"#,
+            Some("document.txt"),
+            None,
+            crate::core::config::MimeDetectionPolicy::ContentOnly,
+        )
+        .unwrap();
+
+        assert_eq!(detected, JSON_MIME_TYPE);
+    }
+
+    #[test]
+    fn content_only_file_ignores_a_supported_filename_extension() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("document.txt");
+        std::fs::write(&path, br#"{"kind":"content"}"#).unwrap();
+        let mut file = File::open(&path).unwrap();
+
+        let detected = detect_or_validate_file(
+            &path,
+            &mut file,
+            None,
+            crate::core::config::MimeDetectionPolicy::ContentOnly,
+        )
+        .unwrap();
+
+        assert_eq!(detected, JSON_MIME_TYPE);
+    }
+
+    /// Build an in-memory MS-CFB compound document with the given root storage
+    /// CLSID, padded with a stream large enough to push the file past
+    /// `MIME_SNIFF_LENGTH`. Mirrors `build_test_ppt_ole` in `extraction/ppt/mod.rs`.
+    #[cfg(feature = "office")]
+    fn build_test_ole2_document(clsid: &str, padding_len: usize) -> Vec<u8> {
+        let cursor = Cursor::new(Vec::new());
+        let mut compound_file = cfb::CompoundFile::create(cursor).expect("create in-memory OLE container");
+        compound_file
+            .set_storage_clsid("/", uuid::Uuid::parse_str(clsid).expect("valid CLSID literal"))
+            .expect("set root storage CLSID");
+        compound_file
+            .create_stream("/Padding")
+            .expect("create padding stream")
+            .write_all(&vec![0_u8; padding_len])
+            .expect("write padding stream");
+        compound_file.into_inner().into_inner()
+    }
+
+    #[cfg(feature = "office")]
+    #[test]
+    fn content_only_bytes_and_file_agree_on_a_legacy_ole2_document_past_the_sniff_window() {
+        // Before the fix: `detect_or_validate_bytes` (whole buffer) detected
+        // these correctly via `infer`'s `ole2()` matcher, while
+        // `detect_or_validate_file` (bounded MIME_SNIFF_LENGTH prefix) failed
+        // outright with "Could not detect MIME type from file content" — a
+        // compound file cannot be typed from a truncated prefix because the FAT
+        // sector chain that locates the root directory entry references
+        // sectors the prefix does not contain (#1590). Same bytes, different
+        // answer; a real Word/Excel/PowerPoint document is essentially always
+        // larger than the 4096-byte sniff window. ~keep
+        use crate::core::config::MimeDetectionPolicy;
+
+        let cases = [
+            ("00020906-0000-0000-c000-000000000046", LEGACY_WORD_MIME_TYPE),
+            ("00020810-0000-0000-c000-000000000046", LEGACY_EXCEL_MIME_TYPE),
+            ("64818d10-4f9b-11cf-86ea-00aa00b929e8", LEGACY_POWERPOINT_MIME_TYPE),
+        ];
+
+        for (clsid, expected_mime) in cases {
+            let content = build_test_ole2_document(clsid, MIME_SNIFF_LENGTH * 2);
+            assert!(
+                content.len() > MIME_SNIFF_LENGTH,
+                "fixture for {clsid} must exceed the sniff window to exercise #1590"
+            );
+
+            let from_bytes = detect_or_validate_bytes(&content, None, None, MimeDetectionPolicy::ContentOnly)
+                .unwrap_or_else(|error| panic!("bytes API failed to detect {clsid}: {error}"));
+            assert_eq!(from_bytes, expected_mime, "bytes API mismatch for {clsid}");
+
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("legacy.bin");
+            std::fs::write(&path, &content).unwrap();
+            let mut file = File::open(&path).unwrap();
+            let from_file = detect_or_validate_file(&path, &mut file, None, MimeDetectionPolicy::ContentOnly)
+                .unwrap_or_else(|error| panic!("path API failed to detect {clsid}: {error}"));
+            assert_eq!(from_file, expected_mime, "path API mismatch for {clsid}");
+
+            assert_eq!(
+                from_bytes, from_file,
+                "bytes and path APIs must agree on identical content for {clsid}"
+            );
+        }
+    }
+
+    #[test]
+    fn octet_stream_file_hint_falls_back_to_each_detection_policy() {
+        use crate::core::config::MimeDetectionPolicy;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("document.txt");
+        std::fs::write(&path, br#"{"kind":"content"}"#).unwrap();
+
+        for (policy, expected) in [
+            (MimeDetectionPolicy::PreferContent, JSON_MIME_TYPE),
+            (MimeDetectionPolicy::TrustExtension, PLAIN_TEXT_MIME_TYPE),
+            (MimeDetectionPolicy::ContentOnly, JSON_MIME_TYPE),
+        ] {
+            let mut file = File::open(&path).unwrap();
+            let detected = detect_or_validate_file(&path, &mut file, Some(OCTET_STREAM_MIME_TYPE), policy).unwrap();
+            assert_eq!(detected, expected, "unexpected MIME for {policy:?}");
+        }
+    }
+
+    #[test]
+    fn content_detection_parses_complete_json_beyond_the_header() {
+        use crate::core::config::MimeDetectionPolicy;
+
+        let dir = tempdir().unwrap();
+        let prefix = r#"{"payload":""#;
+        let split_multibyte = format!("{}{}é\"}}", prefix, "x".repeat(MIME_SNIFF_LENGTH - prefix.len() - 1));
+        let cases = [
+            format!(r#"{{"payload":"{}"}}"#, "x".repeat(MIME_SNIFF_LENGTH)),
+            format!("{}{{\"payload\":true}}", " ".repeat(MIME_SNIFF_LENGTH + 1)),
+            split_multibyte,
+        ];
+
+        for (index, content) in cases.iter().enumerate() {
+            let path = dir.path().join(format!("document-{index}.txt"));
+            std::fs::write(&path, content).unwrap();
+            for policy in [MimeDetectionPolicy::PreferContent, MimeDetectionPolicy::ContentOnly] {
+                let mut file = File::open(&path).unwrap();
+                let detected = detect_or_validate_file(&path, &mut file, None, policy).unwrap();
+                assert_eq!(
+                    detected, JSON_MIME_TYPE,
+                    "unexpected MIME for case {index} with {policy:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn content_detection_does_not_treat_whitespace_prefixed_prose_as_json() {
+        use crate::core::config::MimeDetectionPolicy;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("document.txt");
+        let content = format!("{}ordinary prose", " ".repeat(MIME_SNIFF_LENGTH));
+        std::fs::write(&path, content).unwrap();
+
+        for policy in [MimeDetectionPolicy::PreferContent, MimeDetectionPolicy::ContentOnly] {
+            let mut file = File::open(&path).unwrap();
+            let detected = detect_or_validate_file(&path, &mut file, None, policy).unwrap();
+            assert_eq!(detected, PLAIN_TEXT_MIME_TYPE, "unexpected MIME for {policy:?}");
+        }
+    }
+
+    #[test]
     fn test_detect_or_validate_neither() {
         let result = detect_or_validate(None, None);
         assert!(result.is_err());
@@ -2055,34 +3023,22 @@ mod tests {
 
     #[test]
     fn test_detect_office_format_from_zip_bytes() {
-        let docx_bytes: &[u8] = &[
-            0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, b'w', b'o', b'r', b'd', b'/', b'd',
-            b'o', b'c', b'u', b'm', b'e', b'n', b't', b'.', b'x', b'm', b'l',
-        ];
-        let mime = detect_mime_type_from_bytes(docx_bytes).unwrap();
+        let docx_bytes = build_zip(&[("word/document.xml", b"document")]);
+        let mime = detect_mime_type_from_bytes(&docx_bytes).unwrap();
         assert_eq!(
             mime, DOCX_MIME_TYPE,
             "Should detect DOCX from ZIP with word/document.xml"
         );
 
-        let xlsx_bytes: &[u8] = &[
-            0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x00, b'x', b'l', b'/', b'w', b'o', b'r',
-            b'k', b'b', b'o', b'o', b'k', b'.', b'x', b'm', b'l',
-        ];
-        let mime = detect_mime_type_from_bytes(xlsx_bytes).unwrap();
+        let xlsx_bytes = build_zip(&[("xl/workbook.xml", b"workbook")]);
+        let mime = detect_mime_type_from_bytes(&xlsx_bytes).unwrap();
         assert_eq!(
             mime, EXCEL_MIME_TYPE,
             "Should detect XLSX from ZIP with xl/workbook.xml"
         );
 
-        let pptx_bytes: &[u8] = &[
-            0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, b'p', b'p', b't', b'/', b'p', b'r',
-            b'e', b's', b'e', b'n', b't', b'a', b't', b'i', b'o', b'n', b'.', b'x', b'm', b'l',
-        ];
-        let mime = detect_mime_type_from_bytes(pptx_bytes).unwrap();
+        let pptx_bytes = build_zip(&[("ppt/presentation.xml", b"presentation")]);
+        let mime = detect_mime_type_from_bytes(&pptx_bytes).unwrap();
         assert_eq!(
             mime, POWER_POINT_MIME_TYPE,
             "Should detect PPTX from ZIP with ppt/presentation.xml"
@@ -2104,6 +3060,120 @@ mod tests {
         ];
         let mime = detect_mime_type_from_bytes(plain_zip_bytes).unwrap();
         assert_eq!(mime, "application/zip", "Plain ZIP should remain as application/zip");
+    }
+
+    #[test]
+    fn should_detect_jpeg_2000_codestream_magic_as_j2c() {
+        let codestream = [0xFF, 0x4F, 0xFF, 0x51, 0x00, 0x2F, 0x00, 0x00];
+        assert_eq!(detect_mime_type_from_bytes(&codestream).unwrap(), "image/j2c");
+    }
+
+    #[test]
+    fn should_detect_specialized_formats_only_from_unambiguous_content() {
+        let mut geopackage = vec![0_u8; 100];
+        geopackage[..16].copy_from_slice(b"SQLite format 3\0");
+        geopackage[68..72].copy_from_slice(b"GPKG");
+        assert_eq!(detect_mime_type_from_bytes(&geopackage).unwrap(), GEOPACKAGE_MIME_TYPE);
+
+        let kml = br#"<?xml version="1.0"?><kml xmlns="http://www.opengis.net/kml/2.2"><Placemark/></kml>"#;
+        assert_eq!(detect_mime_type_from_bytes(kml).unwrap(), KML_MIME_TYPE);
+
+        let xhtml = br#"<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><body/></html>"#;
+        assert_eq!(detect_mime_type_from_bytes(xhtml).unwrap(), "application/xhtml+xml");
+        let decoy_xhtml = br#"<?xml version="1.0"?><html notxmlns="http://www.w3.org/1999/xhtml"><body/></html>"#;
+        assert_eq!(detect_mime_type_from_bytes(decoy_xhtml).unwrap(), "text/xml");
+
+        let geojson = br#"{"type":"Point","coordinates":[13.4,52.5]}"#;
+        assert_eq!(detect_mime_type_from_bytes(geojson).unwrap(), GEOJSON_MIME_TYPE);
+        assert_eq!(
+            detect_mime_type_from_bytes(br#"{"type":"Point"}"#).unwrap(),
+            JSON_MIME_TYPE
+        );
+    }
+
+    #[test]
+    fn should_detect_large_geojson_feature_collection() {
+        let padding = "x".repeat(MIME_SNIFF_LENGTH + 1);
+        let content = format!(r#"{{"type":"FeatureCollection","features":[],"metadata":"{padding}"}}"#);
+
+        assert_eq!(
+            detect_mime_type_from_bytes(content.as_bytes()).unwrap(),
+            GEOJSON_MIME_TYPE
+        );
+    }
+
+    #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+    #[test]
+    fn full_zip_inspection_does_not_treat_payload_text_as_an_office_part() {
+        let archive = build_zip(&[("notes.txt", b"the string word/document.xml is not a part name")]);
+        assert_eq!(detect_mime_type_from_bytes(&archive).unwrap(), ZIP_MIME_TYPE);
+    }
+
+    #[cfg(feature = "office")]
+    #[test]
+    fn ooxml_content_types_preserve_document_subtypes() {
+        let cases = [
+            (
+                "/word/document.xml",
+                "application/vnd.ms-word.document.macroEnabled.main+xml",
+                "application/vnd.ms-word.document.macroEnabled.12",
+            ),
+            (
+                "/word/document.xml",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.template.main+xml",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.template",
+            ),
+            (
+                "/ppt/presentation.xml",
+                "application/vnd.openxmlformats-officedocument.presentationml.slideshow.main+xml",
+                "application/vnd.openxmlformats-officedocument.presentationml.slideshow",
+            ),
+            (
+                "/ppt/presentation.xml",
+                "application/vnd.ms-powerpoint.presentation.macroEnabled.main+xml",
+                "application/vnd.ms-powerpoint.presentation.macroEnabled.12",
+            ),
+            (
+                "/xl/workbook.xml",
+                "application/vnd.ms-excel.template.macroEnabled.main+xml",
+                "application/vnd.ms-excel.template.macroEnabled.12",
+            ),
+            (
+                "/xl/workbook.bin",
+                "application/vnd.ms-excel.sheet.binary.macroEnabled.main",
+                "application/vnd.ms-excel.sheet.binary.macroEnabled.12",
+            ),
+        ];
+
+        for (part_name, content_type, expected) in cases {
+            let content_types = format!(
+                r#"<?xml version="1.0"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Override PartName="{part_name}" ContentType="{content_type}"/>
+</Types>"#
+            );
+            let archive = build_zip(&[
+                ("[Content_Types].xml", content_types.as_bytes()),
+                (part_name.trim_start_matches('/'), b"<main/>"),
+            ]);
+            assert_eq!(detect_mime_type_from_bytes(&archive).unwrap(), expected);
+        }
+    }
+
+    #[cfg(feature = "office")]
+    #[test]
+    fn compatible_extension_preserves_ooxml_subtype_when_declaration_is_missing() {
+        let archive = build_zip(&[("word/document.xml", b"<w:document/>")]);
+        assert_eq!(
+            detect_or_validate_bytes(
+                &archive,
+                Some("report.docm"),
+                None,
+                crate::core::config::MimeDetectionPolicy::PreferContent,
+            )
+            .unwrap(),
+            "application/vnd.ms-word.document.macroEnabled.12"
+        );
     }
 
     #[test]
@@ -2199,45 +3269,15 @@ mod tests {
         assert!(!formats.is_empty(), "Supported formats list should not be empty");
     }
 
-    /// The headline "N formats · M file extensions" is hand-typed in the README
-    /// templates and the docs site, and nothing derived it from [`FORMATS`] — so it
-    /// drifted to "101 formats · 115 file extensions" against a table holding 100
-    /// entries and 120 extensions, and propagated into every generated README.
-    ///
-    /// Mirrors `core::formats::tests::test_known_formats_count`. If this fails because
-    /// a format was legitimately added or removed, update the numbers here **and** in
-    /// the copy listed below, which is where the published figures come from:
-    ///
-    /// - `templates/readme/root.md`, `cli.md`, `rust.md`,
-    ///   `templates/readme/partials/features.md.jinja`, `templates/docs/llms-body.md.jinja`
-    /// - `docs-site/src/content/docs/`: `index.mdx`, `features.mdx`, `ecosystem.md`,
-    ///   `cli/usage.mdx`, `guides/extraction.mdx`, `guides/rust-core-api.md`,
-    ///   `integrations/langchain.mdx`, `integrations/txtai.md`
-    ///
-    /// The generated READMEs (root `README.md`, `packages/*/README.md`, the crate
-    /// READMEs) pick the change up on the next alef regen -- do not hand-edit those.
     #[test]
-    fn format_and_extension_counts_match_the_published_headline() {
-        const PUBLISHED_FORMATS: usize = 100;
-        const PUBLISHED_EXTENSIONS: usize = 120;
-
+    fn supported_counts_are_derived_from_the_registry() {
         let extensions: HashSet<&str> = FORMATS
             .iter()
             .flat_map(|entry| entry.extensions.iter().copied())
             .collect();
 
-        assert_eq!(
-            FORMATS.len(),
-            PUBLISHED_FORMATS,
-            "FORMATS has {} entries but the docs advertise {PUBLISHED_FORMATS} formats",
-            FORMATS.len()
-        );
-        assert_eq!(
-            extensions.len(),
-            PUBLISHED_EXTENSIONS,
-            "FORMATS covers {} unique extensions but the docs advertise {PUBLISHED_EXTENSIONS}",
-            extensions.len()
-        );
+        assert_eq!(SUPPORTED_FORMAT_COUNT, FORMATS.len());
+        assert_eq!(SUPPORTED_EXTENSION_COUNT, extensions.len());
     }
 
     #[test]
@@ -2301,6 +3341,14 @@ mod tests {
     }
 
     #[test]
+    fn geographic_formats_use_their_canonical_mime_types() {
+        assert_eq!(EXT_TO_MIME.get("kml"), Some(&"application/vnd.google-earth.kml+xml"));
+        assert_eq!(EXT_TO_MIME.get("geojson"), Some(&"application/geo+json"));
+        assert!(SUPPORTED_MIME_TYPES.contains("application/vnd.google-earth.kml+xml"));
+        assert!(SUPPORTED_MIME_TYPES.contains("application/geo+json"));
+    }
+
+    #[test]
     fn test_formats_registry_aliases() {
         assert!(
             SUPPORTED_MIME_TYPES.contains("text/x-markdown"),
@@ -2318,6 +3366,9 @@ mod tests {
         );
         assert!(SUPPORTED_MIME_TYPES.contains("text/rtf"), "rtf alias");
         assert!(SUPPORTED_MIME_TYPES.contains("text/x-typst"), "typst alias");
+        assert!(SUPPORTED_MIME_TYPES.contains("text/x-python"), "Python source alias");
+        assert!(SUPPORTED_MIME_TYPES.contains("text/x-r-source"), "R source alias");
+        assert!(SUPPORTED_MIME_TYPES.contains("text/x-julia"), "Julia source alias");
     }
 
     /// Every alias in [`FORMATS`] must route to the same extractor as its canonical MIME

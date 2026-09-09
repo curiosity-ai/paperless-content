@@ -646,8 +646,13 @@ impl PdfDocument {
                 // a page number. ~keep
                 match self.parse_destination(dest_obj) {
                     Ok(destination) => Ok(LinkAction::GoTo(destination)),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "GoTo destination unresolvable");
+                    Err(error) => {
+                        tracing::warn!(
+                            operation = "resolve_goto_destination",
+                            error_code = error.telemetry_code(),
+                            error_offset = ?error.telemetry_offset(),
+                            "GoTo destination unresolvable"
+                        );
                         Ok(LinkAction::Other {
                             action_type: "GoTo".to_string(),
                         })

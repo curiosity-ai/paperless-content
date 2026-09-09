@@ -43,6 +43,7 @@ internal sealed class CompoundFile
         public uint Child = NOSTREAM;
         public uint StartSector;
         public ulong Size;
+        public Guid Clsid;
         public bool IsStorage => Type == 1 || Type == 5;
         public bool IsStream => Type == 2;
     }
@@ -95,6 +96,20 @@ internal sealed class CompoundFile
     }
 
     public bool Exists(string path) => Resolve(path) is not null;
+
+    /// <summary>
+    /// The root storage's class id, which is what tells one legacy Office binary format from
+    /// another — the container magic is shared by .doc, .xls, .ppt, .msg and .hwp alike.
+    /// Returns <see cref="Guid.Empty"/> when the container declares none.
+    /// </summary>
+    public Guid RootClsid
+    {
+        get
+        {
+            var root = _dir.FirstOrDefault(e => e.Type == 5) ?? (_dir.Length > 0 ? _dir[0] : null);
+            return root?.Clsid ?? Guid.Empty;
+        }
+    }
 
     /// <summary>Enumerate every entry (storages + streams) with a full '/'-prefixed path,
     /// depth-first, matching how the Rust callers use <c>comp.walk()</c>.</summary>
@@ -320,6 +335,7 @@ internal sealed class CompoundFile
         e.Child = U32(b, off + 76);
         e.StartSector = U32(b, off + 116);
         e.Size = U64(b, off + 120);
+        e.Clsid = off + 96 <= b.Length ? new Guid(b.AsSpan(off + 80, 16)) : Guid.Empty;
         return e;
     }
 

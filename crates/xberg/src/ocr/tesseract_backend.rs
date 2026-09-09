@@ -91,11 +91,13 @@ impl TesseractBackend {
     fn config_to_tesseract(&self, config: &OcrConfig) -> InternalTesseractConfig {
         let mut internal = match &config.tesseract_config {
             Some(tess_config) => InternalTesseractConfig::from(tess_config),
-            None => InternalTesseractConfig {
-                language: config.effective_languages().join("+"),
-                ..Default::default()
-            },
+            None => InternalTesseractConfig::default(),
         };
+        // `TesseractConfig::from` above takes its language from `tess_config.language`, which
+        // silently discards `OcrConfig.language` (#1572). Reconcile the two through the shared
+        // rule so an `OcrConfig(language=..., tesseract_config=...)` caller is not OCR'd in
+        // English regardless of which field they set.
+        internal.language = config.effective_tesseract_language().join("+");
         if internal.language.trim().is_empty() {
             internal.language = crate::core::config::ocr::DEFAULT_OCR_LANGUAGE.to_string();
         }
@@ -222,6 +224,7 @@ fn convert_ocr_table(index: usize, table: crate::types::OcrTable) -> crate::type
         bounding_box,
         table_id: Some(format!("table-{}", index + 1)),
         columns,
+        cell_styles: Vec::new(),
     }
 }
 
@@ -607,6 +610,9 @@ const WORD_ITERATOR_SKIPPED_COUNT_METADATA_KEY: &str = "word_iterator_skipped_co
 /// never ran. Mirrors the literal written in `ocr::processor::execution::perform_ocr`.
 const AUTO_ROTATE_UNAVAILABLE_METADATA_KEY: &str = "auto_rotate_unavailable";
 
+/// Metadata key carrying the exact number of hOCR lines removed by dictionary filtering. ~keep
+const DICTIONARY_FILTERED_LINE_COUNT_METADATA_KEY: &str = "dictionary_filtered_line_count";
+
 /// Metadata key `perform_ocr` sets when it rebuilds `content` with inline
 /// table markdown at each table's original vertical position (see
 /// `perform_ocr`'s `build_content_with_inline_tables` step). Promoted to
@@ -691,6 +697,21 @@ fn warnings_from_ocr_metadata(
         );
     }
 
+    if let Some(filtered_lines) = metadata
+        .get(DICTIONARY_FILTERED_LINE_COUNT_METADATA_KEY)
+        .and_then(serde_json::Value::as_u64)
+        && filtered_lines > 0
+    {
+        crate::core::diagnostics::push_warning(
+            &mut warnings,
+            "tesseract",
+            format!(
+                "Tesseract removed {filtered_lines} OCR line(s) because their dictionary-checkable words were mostly \
+                 not real words"
+            ),
+        );
+    }
+
     warnings
 }
 
@@ -711,6 +732,7 @@ fn warnings_from_ocr_metadata(
 fn strip_ocr_scratch_metadata_keys(metadata: &mut std::collections::HashMap<String, serde_json::Value>) {
     metadata.remove(WORD_ITERATOR_SKIPPED_COUNT_METADATA_KEY);
     metadata.remove(AUTO_ROTATE_UNAVAILABLE_METADATA_KEY);
+    metadata.remove(DICTIONARY_FILTERED_LINE_COUNT_METADATA_KEY);
 }
 
 fn compact_cjk_horizontal_spacing(text: &str) -> String {
@@ -947,7 +969,7 @@ mod tests {
         let backend = TesseractBackend::new();
         let custom_tess_config = crate::types::TesseractConfig {
             language: vec!["fra".to_string()],
-            psm: 6,
+            psm: Some(6),
             enable_table_detection: true,
             ..Default::default()
         };
@@ -963,6 +985,43 @@ mod tests {
         assert_eq!(tess_config.language, "fra");
         assert_eq!(tess_config.psm, 6);
         assert!(tess_config.enable_table_detection);
+    }
+
+    /// #1572: supplying ANY `TesseractConfig` used to discard `OcrConfig.language` entirely,
+    /// because the `Some` arm read the public struct's own `language` field -- which defaults to
+    /// `["eng"]`, so a German document silently OCR'd in English. `["eng"]` is not empty, so the
+    /// existing empty-string guard never caught it. The neighbouring test above covers the
+    /// opposite precedence (an explicitly-set `tesseract_config.language` still wins); this one
+    /// pins the reported case, where only `OcrConfig.language` was set. ~keep
+    #[test]
+    fn config_to_tesseract_keeps_ocr_config_language_when_tesseract_config_is_default() {
+        let backend = TesseractBackend::new();
+        let ocr_config = OcrConfig {
+            backend: "tesseract".to_string(),
+            language: vec!["deu".to_string()],
+            tesseract_config: Some(crate::types::TesseractConfig::default()),
+            ..Default::default()
+        };
+
+        let tess_config = backend.config_to_tesseract(&ocr_config);
+        assert_eq!(
+            tess_config.language, "deu",
+            "OcrConfig.language must survive a default TesseractConfig"
+        );
+    }
+
+    /// #1572, multi-language form: the join must use the configured list, not fall back to "eng".
+    #[test]
+    fn config_to_tesseract_joins_multiple_ocr_config_languages_with_a_default_tesseract_config() {
+        let backend = TesseractBackend::new();
+        let ocr_config = OcrConfig {
+            backend: "tesseract".to_string(),
+            language: vec!["deu".to_string(), "fra".to_string()],
+            tesseract_config: Some(crate::types::TesseractConfig::default()),
+            ..Default::default()
+        };
+
+        assert_eq!(backend.config_to_tesseract(&ocr_config).language, "deu+fra");
     }
 
     /// The `source_dpi` hint the PDF OCR route stamps per page must survive the crossing into
@@ -1100,7 +1159,7 @@ mod tests {
 
         let custom_tess_config = crate::types::TesseractConfig {
             language: vec!["eng".to_string()],
-            psm: 6,
+            psm: Some(6),
             output_format: "markdown".to_string(),
             oem: 1,
             min_confidence: 80.0,
@@ -1137,7 +1196,7 @@ mod tests {
     fn test_convert_config_type_conversions() {
         let public_config = crate::types::TesseractConfig {
             language: vec!["eng".to_string()],
-            psm: 6,
+            psm: Some(6),
             oem: 3,
             table_column_threshold: 100,
             ..Default::default()
@@ -1169,6 +1228,23 @@ mod tests {
             warnings[0].message.contains("2 word(s)"),
             "message must name the exact skipped count: {}",
             warnings[0].message
+        );
+    }
+
+    #[test]
+    fn warnings_from_ocr_metadata_flags_dictionary_filtered_lines_with_exact_count() {
+        let metadata = std::collections::HashMap::from([(
+            "dictionary_filtered_line_count".to_string(),
+            serde_json::Value::Number(2.into()),
+        )]);
+
+        let warnings = warnings_from_ocr_metadata(&metadata);
+
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].source, "tesseract");
+        assert_eq!(
+            warnings[0].message,
+            "Tesseract removed 2 OCR line(s) because their dictionary-checkable words were mostly not real words"
         );
     }
 
@@ -1231,7 +1307,6 @@ mod tests {
             AUTO_ROTATE_UNAVAILABLE_METADATA_KEY.to_string(),
             serde_json::Value::Bool(true),
         );
-
         assert_eq!(warnings_from_ocr_metadata(&metadata).len(), 2);
     }
 
@@ -1253,6 +1328,10 @@ mod tests {
             AUTO_ROTATE_UNAVAILABLE_METADATA_KEY.to_string(),
             serde_json::Value::Bool(true),
         );
+        metadata.insert(
+            DICTIONARY_FILTERED_LINE_COUNT_METADATA_KEY.to_string(),
+            serde_json::Value::Number(3.into()),
+        );
 
         let serialized = rmp_serde::to_vec_named(&metadata).expect("metadata must serialize for the OCR cache");
         let round_tripped: std::collections::HashMap<String, serde_json::Value> =
@@ -1260,12 +1339,12 @@ mod tests {
 
         let before = warnings_from_ocr_metadata(&metadata);
         let after = warnings_from_ocr_metadata(&round_tripped);
-        assert_eq!(before.len(), 2);
-        assert_eq!(after.len(), 2);
-        assert_eq!(before[0].source, after[0].source);
-        assert_eq!(before[0].message, after[0].message);
-        assert_eq!(before[1].source, after[1].source);
-        assert_eq!(before[1].message, after[1].message);
+        assert_eq!(before.len(), 3);
+        assert_eq!(after.len(), 3);
+        for (before_warning, after_warning) in before.iter().zip(&after) {
+            assert_eq!(before_warning.source, after_warning.source);
+            assert_eq!(before_warning.message, after_warning.message);
+        }
     }
 
     /// #354: `word_iterator_skipped_count` is pipeline plumbing consumed by
@@ -1375,6 +1454,10 @@ mod tests {
         metadata.insert(
             AUTO_ROTATE_UNAVAILABLE_METADATA_KEY.to_string(),
             serde_json::Value::Bool(true),
+        );
+        metadata.insert(
+            DICTIONARY_FILTERED_LINE_COUNT_METADATA_KEY.to_string(),
+            serde_json::Value::Number(1.into()),
         );
 
         strip_ocr_scratch_metadata_keys(&mut metadata);

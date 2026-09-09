@@ -5,7 +5,7 @@ const output = await extractBatch([
   { kind: ExtractInputKind.Uri, uri: "document.pdf" },
   {
     kind: ExtractInputKind.Bytes,
-    bytes: Buffer.from("Hello from memory"),
+    bytes: new TextEncoder().encode("Hello from memory"),
     mimeType: "text/plain",
     filename: "note.txt",
   },

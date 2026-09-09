@@ -2466,12 +2466,63 @@ fn group_cells_into_tables(cells: &[IntersectionCell]) -> Vec<Vec<usize>> {
     groups
 }
 
+/// Minimum number of distinct columns a Y-cluster must carry independent text
+/// evidence in for a row split to be credible. A cluster below this bar is a
+/// single wrapped cell's continuation line, not a second logical row
+/// (xberg-io/xberg#1555). ~keep
+const MIN_ROW_SPLIT_EVIDENCE_COLUMNS: usize = 2;
+
+/// Minimum number of Y-clusters that must *independently* clear
+/// `MIN_ROW_SPLIT_EVIDENCE_COLUMNS` before a producer-drawn row band is treated as more than
+/// one row at all. One evidenced cluster is not enough: two unrelated single-column spans can
+/// land within `row_tolerance` of each other by pure chance (see the #1555 regression fixture
+/// `split_rows_by_text_positions_keeps_drawn_band_as_one_row_when_only_one_cell_wraps`, where a
+/// row-number span and an unrelated wrapped cell's middle baseline coincide on one Y value and
+/// nowhere else) and that single coincidence must not be enough to accept a split. A second,
+/// independently evidenced cluster is what tells a genuinely tabular band apart from one
+/// baseline that happened to line up (xberg-io/xberg#1565). ~keep
+const MIN_EVIDENCED_CLUSTERS_FOR_SPLIT: usize = 2;
+
 /// Split table rows that contain text spans at multiple distinct Y positions into sub-rows.
 ///
 /// This handles the hybrid case where column boundaries come from vertical lines but there
 /// are no horizontal lines between individual rows. In that scenario the intersection-based
 /// pipeline produces a single mega-row; this function detects multiple Y-clusters within
 /// each row and splits accordingly.
+///
+/// The only caller (`finalize_intersection_tables`) runs exclusively on grids the drawn
+/// geometry already delimited into rows (`detect_tables_from_intersections` via
+/// `build_grid_from_lines`), so every row entering here is a producer-drawn row band, and a
+/// split is a hypothesis about *sub*-dividing that band, not about discovering rows from
+/// scratch. The drawn band boundary is authoritative; text baselines inside it are only
+/// advisory.
+///
+/// The band is treated as more than one row only once at least
+/// `MIN_EVIDENCED_CLUSTERS_FOR_SPLIT` of its Y-clusters are *independently* evidenced in
+/// `MIN_ROW_SPLIT_EVIDENCE_COLUMNS` columns; see that constant's doc for why one evidenced
+/// cluster is not trusted on its own. Once the band clears that bar, each remaining deficient
+/// cluster (one that does not clear the evidence bar by itself) is resolved on its own terms
+/// instead of vetoing the whole band (xberg-io/xberg#1565: a band mixing multi-column data
+/// rows with single-column section headings, lead-ins, or wrapped continuations was previously
+/// collapsed back into one mega-row in full, and the headings disappeared into whatever cell
+/// absorbed them). A deficient cluster folds into the cluster directly above it in reading
+/// order — the adjacent Y-cluster with the *larger* y, since PDF space is y-up and "above" on
+/// the page means a larger y — only when the fold cannot manufacture evidence that was not
+/// already there: the deficient cluster's populated columns must already be a non-empty subset
+/// of the columns the cluster above populates. That is the signature of a wrapped
+/// continuation line, which only ever repeats content in a column the cell above was already
+/// using. A deficient cluster that fails this test — because it has no cluster above it at
+/// all, or because it carries text in a column the cluster above left empty — is kept as a row
+/// of its own, one cell wide: that is what a heading or lead-in line inside a ruled band
+/// actually is.
+///
+/// The evidence bar is capped at the band's own column count
+/// (`MIN_ROW_SPLIT_EVIDENCE_COLUMNS.min(num_cols)`): a single-column band has no second
+/// column to ever produce corroborating evidence from, so requiring 2 there would reject
+/// every split unconditionally, including genuinely distinct rows sharing one drawn cell
+/// (e.g. a label/value pair). For `num_cols == 1` this restores the pre-#1555 behaviour of
+/// accepting any non-empty cluster as evidence; the #1555 guard itself only applies where
+/// it can be evaluated, at `num_cols >= 2`.
 fn split_rows_by_text_positions(
     table_rows: Vec<TableRow>,
     row_cell_span_indices: &[Vec<Vec<usize>>],
@@ -2516,11 +2567,92 @@ fn split_rows_by_text_positions(
             continue;
         }
 
-        y_clusters.sort_by(|a, b| crate::utils::safe_float_cmp(*b, *a));
-
         let num_cols = row.cells.len();
+        let nearest_cluster_value = |sy: f32| -> f32 {
+            *y_clusters
+                .iter()
+                .min_by_key(|&&cy| ((sy - cy).abs() * 1000.0) as i32)
+                .unwrap_or(&sy)
+        };
 
-        for &cluster_y in &y_clusters {
+        // Tally, per cluster, which columns have at least one span assigned to it. ~keep
+        let mut cluster_columns: Vec<Vec<bool>> = vec![vec![false; num_cols]; y_clusters.len()];
+        for (ci, col_spans) in cell_indices.iter().enumerate() {
+            for &idx in col_spans {
+                if let Some(s) = spans.get(idx) {
+                    let nearest = nearest_cluster_value(s.bbox.center().y);
+                    if let Some(cluster_idx) = y_clusters.iter().position(|&cy| (cy - nearest).abs() < 0.01) {
+                        cluster_columns[cluster_idx][ci] = true;
+                    }
+                }
+            }
+        }
+
+        // A single-column band (num_cols == 1) can never carry cross-column
+        // evidence at all — there is only one column to begin with, so the
+        // wrapped-cell-vs-genuine-row ambiguity #1555 targets is undecidable
+        // by this signal there. Requiring the full MIN_ROW_SPLIT_EVIDENCE_COLUMNS
+        // in that case would make the gate reject every split on a
+        // single-column grid unconditionally, including genuinely distinct
+        // rows (e.g. label/value pairs sharing one drawn cell). Scale the
+        // requirement down to the band's own column count so a single-column
+        // band keeps its pre-#1555 behaviour (any non-empty cluster counts as
+        // evidence) while a multi-column band still needs the full bar
+        // (xberg-io/xberg#1555). ~keep
+        let required_evidence_columns = MIN_ROW_SPLIT_EVIDENCE_COLUMNS.min(num_cols.max(1));
+        let is_evidenced: Vec<bool> = cluster_columns
+            .iter()
+            .map(|cols| cols.iter().filter(|&&present| present).count() >= required_evidence_columns)
+            .collect();
+        let evidenced_cluster_count = is_evidenced.iter().filter(|&&evidenced| evidenced).count();
+
+        if evidenced_cluster_count < MIN_EVIDENCED_CLUSTERS_FOR_SPLIT {
+            result.push(row);
+            continue;
+        }
+
+        // Resolve a fold target for every deficient cluster: it folds into the cluster
+        // directly above it (ascending index + 1, i.e. the next-larger y) only when doing so
+        // introduces no column the cluster above didn't already have. Evidenced clusters never
+        // fold — they are anchors in their own right. Fold targets strictly increase (i can
+        // only point to i + 1), so following the chain in `resolve_group` always terminates
+        // without needing cycle protection. ~keep
+        let mut fold_into: Vec<Option<usize>> = vec![None; y_clusters.len()];
+        for i in 0..y_clusters.len().saturating_sub(1) {
+            if is_evidenced[i] {
+                continue;
+            }
+            let is_wrapped_continuation = cluster_columns[i]
+                .iter()
+                .zip(cluster_columns[i + 1].iter())
+                .all(|(&here, &above)| !here || above);
+            if is_wrapped_continuation {
+                fold_into[i] = Some(i + 1);
+            }
+        }
+
+        let resolve_group = |mut idx: usize| -> usize {
+            while let Some(next) = fold_into[idx] {
+                idx = next;
+            }
+            idx
+        };
+
+        let mut group_members: Vec<Vec<usize>> = vec![Vec::new(); y_clusters.len()];
+        for i in 0..y_clusters.len() {
+            group_members[resolve_group(i)].push(i);
+        }
+
+        // Emit one output row per non-empty group, topmost (largest y) first. A group's
+        // resolved anchor index always carries the largest y in the group, since folding only
+        // ever points toward a larger-y neighbor. ~keep
+        let mut group_order: Vec<usize> = (0..y_clusters.len())
+            .filter(|&g| !group_members[g].is_empty())
+            .collect();
+        group_order.sort_by(|&a, &b| crate::utils::safe_float_cmp(y_clusters[b], y_clusters[a]));
+
+        for group_idx in group_order {
+            let members = &group_members[group_idx];
             let mut new_row = TableRow::new(row.is_header);
             for ci in 0..num_cols {
                 let matching_indices: Vec<usize> = cell_indices[ci]
@@ -2530,11 +2662,8 @@ fn split_rows_by_text_positions(
                         spans
                             .get(idx)
                             .map(|s| {
-                                let sy = s.bbox.center().y;
-                                y_clusters
-                                    .iter()
-                                    .min_by_key(|&&cy| ((sy - cy).abs() * 1000.0) as i32)
-                                    .is_some_and(|&nearest| (nearest - cluster_y).abs() < 0.01)
+                                let nearest = nearest_cluster_value(s.bbox.center().y);
+                                members.iter().any(|&m| (y_clusters[m] - nearest).abs() < 0.01)
                             })
                             .unwrap_or(false)
                     })
@@ -2690,12 +2819,12 @@ fn detect_tables_from_intersections(
     lines: &[crate::elements::PathContent],
     config: &TableDetectionConfig,
 ) -> Vec<Table> {
-    let groups = build_grid_from_lines(lines, config);
+    let (groups, v_edges, cells_are_intersections) = build_grid_from_lines(lines, config);
 
     let mut tables = Vec::new();
     for (group_cells, xs, ys, num_cols) in &groups {
         let Some((table_rows, row_cell_span_indices)) =
-            assign_spans_to_intersection_grid(group_cells, xs, ys, *num_cols, spans)
+            assign_spans_to_intersection_grid(group_cells, xs, ys, *num_cols, spans, &v_edges, cells_are_intersections)
         else {
             continue;
         };
@@ -2730,17 +2859,19 @@ fn detect_tables_from_intersections(
 /// Steps 1-4: extract edges, find intersections, build cells, and group them
 /// into per-table cell groups with their grid boundaries.
 ///
-/// Returns one `(group_cells, xs, ys, num_cols)` tuple per table group.
+/// Returns one `(group_cells, xs, ys, num_cols)` tuple per table group, plus the V edges used
+/// to build the cells and whether they came from real crossings (`cells_are_intersections`) —
+/// both needed downstream by `band_column_groups` (xberg-io/xberg#1580).
 fn build_grid_from_lines(
     lines: &[crate::elements::PathContent],
     config: &TableDetectionConfig,
-) -> Vec<(Vec<IntersectionCell>, Vec<f32>, Vec<f32>, usize)> {
+) -> (Vec<(Vec<IntersectionCell>, Vec<f32>, Vec<f32>, usize)>, Vec<Edge>, bool) {
     let (mut h_edges, mut v_edges) = extract_edges(lines);
     snap_and_merge(&mut h_edges);
     snap_and_merge(&mut v_edges);
 
     if h_edges.len() < 2 || v_edges.len() < 2 {
-        return Vec::new();
+        return (Vec::new(), v_edges, false);
     }
 
     let intersections = find_intersections(&h_edges, &v_edges);
@@ -2752,26 +2883,31 @@ fn build_grid_from_lines(
     if intersections.len() < 4 {
         filter_edges_by_coverage(&mut h_edges, &mut v_edges);
         if h_edges.len() < 2 || v_edges.len() < 2 {
-            return Vec::new();
+            return (Vec::new(), v_edges, false);
         }
     }
 
-    let cells = if intersections.len() >= 4 {
+    // `cells_are_intersections` records whether `cells` came from real crossings
+    // (`build_cells_from_intersections`) rather than the projected `build_extended_grid_cells`
+    // grid. Only real crossings license `band_column_groups` to merge a band's columns
+    // (xberg-io/xberg#1580) — an extended grid has no V edge that ever spans any band, so
+    // merging there would collapse every row to one cell instead of narrowing a phantom cut.
+    let (cells, cells_are_intersections) = if intersections.len() >= 4 {
         let c = build_cells_from_intersections(&intersections);
         if c.is_empty() {
             // Lines exist but don't form real intersection cells — try extended grid. ~keep
-            build_extended_grid_cells(&h_edges, &v_edges)
+            (build_extended_grid_cells(&h_edges, &v_edges), false)
         } else {
-            c
+            (c, true)
         }
     } else {
         // H and V lines don't physically cross (e.g. Census table: H-lines in
         // header area, V tick marks in data area). Build a virtual grid by
         // projecting all V-line X positions across all H-line Y positions. ~keep
-        build_extended_grid_cells(&h_edges, &v_edges)
+        (build_extended_grid_cells(&h_edges, &v_edges), false)
     };
     if cells.is_empty() {
-        return Vec::new();
+        return (Vec::new(), v_edges, cells_are_intersections);
     }
 
     let table_groups = group_cells_into_tables(&cells);
@@ -2807,7 +2943,70 @@ fn build_grid_from_lines(
 
         result.push((group_cells, xs, ys, num_cols));
     }
-    result
+    (result, v_edges, cells_are_intersections)
+}
+
+/// Tolerance for judging whether a V edge spans a row band's full height.
+///
+/// This is a CONTAINMENT tolerance ("does this edge actually run through the band?"), which
+/// answers a different question than `SNAP_TOL`, an IDENTITY tolerance ("are these two
+/// coordinates the same coordinate?"). Reusing `SNAP_TOL` let an edge fall up to 3pt short of
+/// the band at *each* end and still count as spanning it, so a band up to 6pt shorter than the
+/// rule beside it was cut at a column position the drawn rule does not justify. The regression
+/// test below fails at 3.0 and passes at 1.0 on exactly that shape.
+///
+/// The phantom boundary is what lets a band of prose inside a drawn frame split into two or
+/// more cells instead of staying one wide cell, which is how such a region comes to satisfy the
+/// downstream minimums for being accepted as a table at all. GH#1588 reports page text going
+/// missing as a result; the precise downstream path is not asserted here, because the two
+/// analyses of it disagreed and this constant's own behaviour is provable without settling it.
+///
+/// Keep this constant independent of `SNAP_TOL` even if their values happen to coincide again
+/// in the future — they measure different things and must be free to diverge. ~keep
+const BAND_RULE_SPAN_TOL: f32 = 1.0;
+
+/// Group a row band's columns into contiguous runs that no V rule actually divides.
+///
+/// `build_cells_from_intersections` accepts a cell as soon as its four corners are crossing
+/// points, but four corners are not four sides (xberg-io/xberg#1580). When a producer stacks
+/// ruled bands around an unruled full-width strip (a section heading), the strip's internal
+/// column "boundaries" exist only because the neighbouring bands' V rules happen to terminate
+/// on the strip's own H rules — no V rule actually runs through the strip itself. This counts
+/// a column boundary at `xs[c + 1]` only when some edge in `v_edges` truly spans the band
+/// `[y_lo, y_hi]` (within `BAND_RULE_SPAN_TOL`), and returns the resulting `(first_col,
+/// last_col)` groups of adjacent columns no rule separates.
+///
+/// `cells_are_intersections` gates the whole check off for grids built by
+/// `build_extended_grid_cells`: that grid exists precisely because H and V lines never cross,
+/// so no V edge would ever be judged as spanning any band, and every band would collapse into
+/// a single column. Only grids built from real crossings (`build_cells_from_intersections`)
+/// may be narrowed this way; `false` returns one group per column, unchanged from before this
+/// function existed.
+fn band_column_groups(
+    xs: &[f32],
+    y_lo: f32,
+    y_hi: f32,
+    num_cols: usize,
+    v_edges: &[Edge],
+    cells_are_intersections: bool,
+) -> Vec<(usize, usize)> {
+    let boundary_is_drawn = |x: f32| -> bool {
+        v_edges.iter().any(|edge| {
+            (edge.coord - x).abs() <= SNAP_TOL
+                && edge.start <= y_lo + BAND_RULE_SPAN_TOL
+                && edge.end >= y_hi - BAND_RULE_SPAN_TOL
+        })
+    };
+
+    let mut groups = Vec::new();
+    let mut start = 0usize;
+    for c in 0..num_cols {
+        if c + 1 == num_cols || !cells_are_intersections || boundary_is_drawn(xs[c + 1]) {
+            groups.push((start, c));
+            start = c + 1;
+        }
+    }
+    groups
 }
 
 /// Assign text spans to grid cells and build table rows with per-cell span
@@ -2818,6 +3017,8 @@ fn assign_spans_to_intersection_grid(
     ys: &[f32],
     num_cols: usize,
     spans: &[TextSpan],
+    v_edges: &[Edge],
+    cells_are_intersections: bool,
 ) -> Option<(Vec<TableRow>, Vec<Vec<Vec<usize>>>)> {
     let num_rows = if ys.len() >= 2 {
         ys.len() - 1
@@ -2863,33 +3064,43 @@ fn assign_spans_to_intersection_grid(
     for &ri in &row_order {
         let mut row = TableRow::new(false);
         let mut cell_indices_for_row: Vec<Vec<usize>> = Vec::new();
-        for ci in 0..num_cols {
-            if !grid_has_cell[ri][ci] {
-                // Still emit empty cell so column count stays consistent. ~keep
+        let groups = band_column_groups(xs, ys[ri], ys[ri + 1], num_cols, v_edges, cells_are_intersections);
+        for (first_col, last_col) in groups {
+            let colspan = (last_col - first_col + 1) as u32;
+            let group_bbox = crate::geometry::Rect::new(
+                xs[first_col],
+                ys[ri],
+                xs[last_col + 1] - xs[first_col],
+                ys[ri + 1] - ys[ri],
+            );
+            let group_has_cell = (first_col..=last_col).any(|ci| grid_has_cell[ri][ci]);
+            if !group_has_cell {
+                // Still emit empty cell so the group is accounted for. ~keep
                 row.cells.push(TableCell {
                     text: String::new(),
                     spans: Vec::new(),
-                    colspan: 1,
+                    colspan,
                     rowspan: 1,
                     mcids: Vec::new(),
-                    bbox: Some(crate::geometry::Rect::new(
-                        xs[ci],
-                        ys[ri],
-                        xs[ci + 1] - xs[ci],
-                        ys[ri + 1] - ys[ri],
-                    )),
+                    bbox: Some(group_bbox),
                     is_header: false,
                 });
                 cell_indices_for_row.push(Vec::new());
                 continue;
             }
-            let cell_text = extract_cell_text(&grid_spans[ri][ci], spans);
-            let mcids: Vec<u32> = grid_spans[ri][ci]
+
+            // Concatenate columns left-to-right so spans on one visual line stay in reading
+            // order: `extract_cell_text` only re-sorts by Y, and each column's own span list
+            // is already confined to that column's X range. ~keep
+            let group_span_indices: Vec<usize> = (first_col..=last_col)
+                .flat_map(|ci| grid_spans[ri][ci].iter().copied())
+                .collect();
+            let cell_text = extract_cell_text(&group_span_indices, spans);
+            let mcids: Vec<u32> = group_span_indices
                 .iter()
                 .filter_map(|&idx| spans.get(idx).and_then(|s| s.mcid))
                 .collect();
-            let cell_bbox = crate::geometry::Rect::new(xs[ci], ys[ri], xs[ci + 1] - xs[ci], ys[ri + 1] - ys[ri]);
-            let cell_spans = grid_spans[ri][ci]
+            let cell_spans = group_span_indices
                 .iter()
                 .filter_map(|&idx| spans.get(idx).cloned())
                 .collect::<Vec<_>>();
@@ -2897,13 +3108,13 @@ fn assign_spans_to_intersection_grid(
             row.cells.push(TableCell {
                 text: cell_text,
                 spans: cell_spans,
-                colspan: 1,
+                colspan,
                 rowspan: 1,
                 mcids,
-                bbox: Some(cell_bbox),
+                bbox: Some(group_bbox),
                 is_header: false,
             });
-            cell_indices_for_row.push(grid_spans[ri][ci].clone());
+            cell_indices_for_row.push(group_span_indices);
         }
         table_rows.push(row);
         row_cell_span_indices.push(cell_indices_for_row);
@@ -4378,15 +4589,179 @@ mod tests {
             create_test_span("2", 66.0, 5.0, 2.0, 6.0),
             create_test_span("Europe", 66.0, 5.0, 10.0, 10.0),
         ];
+        // A real ruled grid: column dividers span the row's full height, so
+        // `band_column_groups` must not merge any of the three columns.
+        let v_edges = [
+            Edge {
+                coord: 40.0,
+                start: 0.0,
+                end: 20.0,
+            },
+            Edge {
+                coord: 70.0,
+                start: 0.0,
+                end: 20.0,
+            },
+        ];
 
-        let (rows, _) =
-            assign_spans_to_intersection_grid(&group_cells, &[0.0, 40.0, 70.0, 100.0], &[0.0, 20.0], 3, &spans)
-                .expect("synthetic grid should be valid");
+        let (rows, _) = assign_spans_to_intersection_grid(
+            &group_cells,
+            &[0.0, 40.0, 70.0, 100.0],
+            &[0.0, 20.0],
+            3,
+            &spans,
+            &v_edges,
+            true,
+        )
+        .expect("synthetic grid should be valid");
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].cells[0].text, "2731");
         assert_eq!(rows[0].cells[1].text, "832");
         assert_eq!(rows[0].cells[2].text, "Europe");
+    }
+
+    // xberg-io/xberg#1580: an unruled full-width strip (a section heading) stacked between
+    // two ruled 3-column bands is still cut at the ruled bands' column positions, because its
+    // four corners exist as crossings (the neighbours' V rules happen to end on the strip's own
+    // H rules) even though no V rule actually runs through the strip. Geometry matches the
+    // issue's own reproducer: `xs = [44.8, 289.2, 317.6, 551.5]`, unruled band `y[465.4, 525.9]`.
+    #[test]
+    fn unruled_band_between_ruled_bands_is_not_cut_at_phantom_columns() {
+        let group_cells = [
+            // Ruled band y[525.9, 585.9]: real column dividers at x=289.2 and x=317.6.
+            IntersectionCell {
+                x1: 44.8,
+                y1: 525.9,
+                x2: 289.2,
+                y2: 585.9,
+            },
+            IntersectionCell {
+                x1: 289.2,
+                y1: 525.9,
+                x2: 317.6,
+                y2: 585.9,
+            },
+            IntersectionCell {
+                x1: 317.6,
+                y1: 525.9,
+                x2: 551.5,
+                y2: 585.9,
+            },
+            // Unruled band y[465.4, 525.9]: same corner grid, but no V rule spans it — the
+            // corners only exist because the ruled band above terminates its dividers there.
+            IntersectionCell {
+                x1: 44.8,
+                y1: 465.4,
+                x2: 289.2,
+                y2: 525.9,
+            },
+            IntersectionCell {
+                x1: 289.2,
+                y1: 465.4,
+                x2: 317.6,
+                y2: 525.9,
+            },
+            IntersectionCell {
+                x1: 317.6,
+                y1: 465.4,
+                x2: 551.5,
+                y2: 525.9,
+            },
+        ];
+        let xs = [44.8, 289.2, 317.6, 551.5];
+        let ys = [465.4, 525.9, 585.9];
+
+        // Ruled-band control row: one short word per column.
+        let mut spans = vec![
+            create_test_span("A", 140.0, 545.0, 20.0, 15.0),
+            create_test_span("B", 295.0, 545.0, 15.0, 15.0),
+            create_test_span("C", 400.0, 545.0, 20.0, 15.0),
+        ];
+        // Unruled heading strip: one continuous line, but the source spans happen to land at
+        // the same X positions as the ruled band's columns above — exactly what the issue
+        // reports for "8.2.7 Geen warmwater (alleen bij toepassing indirect gestookte boiler)".
+        spans.extend([
+            create_test_span(
+                "8.2.7 Geen warmwater (alleen bij toepassing indirect",
+                60.0,
+                490.0,
+                220.0,
+                15.0,
+            ),
+            create_test_span("gest", 295.0, 490.0, 20.0, 15.0),
+            create_test_span("ookte boiler)", 400.0, 490.0, 60.0, 15.0),
+        ]);
+
+        // The internal column dividers (x=289.2, x=317.6) span only the ruled band's height
+        // [525.9, 585.9] — they terminate exactly where the unruled strip begins, which is
+        // the geometry the issue reports (`build_grid_from_lines` would produce edges shaped
+        // like this: rules that end on the strip's own H rules, never crossing the strip).
+        let v_edges = [
+            Edge {
+                coord: 289.2,
+                start: 525.9,
+                end: 585.9,
+            },
+            Edge {
+                coord: 317.6,
+                start: 525.9,
+                end: 585.9,
+            },
+        ];
+
+        let (rows, _) = assign_spans_to_intersection_grid(&group_cells, &xs, &ys, 3, &spans, &v_edges, true)
+            .expect("synthetic grid should be valid");
+
+        assert_eq!(rows.len(), 2);
+        let ruled_row = &rows[0];
+        let unruled_row = &rows[1];
+
+        // Control: the ruled band keeps its three columns.
+        assert_eq!(ruled_row.cells.len(), 3, "ruled band must keep its three columns");
+        assert_eq!(ruled_row.cells[0].text, "A");
+        assert_eq!(ruled_row.cells[1].text, "B");
+        assert_eq!(ruled_row.cells[2].text, "C");
+
+        // Fix target: the unruled strip is one cell, not cut at the ruled band's column x's.
+        let unruled_texts: Vec<&str> = unruled_row.cells.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            unruled_texts.len(),
+            1,
+            "unruled band must not be split at phantom column positions, got {unruled_texts:?}"
+        );
+        assert!(
+            unruled_texts[0].contains("gest"),
+            "heading text should be reassembled as one run, got {unruled_texts:?}"
+        );
+    }
+
+    // xberg-io/xberg#1588: `BAND_RULE_SPAN_TOL` answers a CONTAINMENT question ("does this V
+    // edge actually run through the band?"), not the IDENTITY question `SNAP_TOL` answers
+    // ("are these two coordinates the same coordinate?"). Reusing `SNAP_TOL` (3.0) let an edge
+    // fall up to 3pt short of the band at each end and still count as a drawn boundary.
+    #[test]
+    fn should_not_count_a_rule_that_stops_short_of_the_band_as_a_boundary() {
+        let xs = [0.0, 40.0, 80.0];
+        let (y_lo, y_hi) = (0.0, 20.0);
+        let num_cols = 2;
+
+        // The divider at x=40.0 stops 2pt short of the band at each end: within the old
+        // `SNAP_TOL` (3.0) reuse, so it was wrongly counted as spanning; outside the fixed
+        // 1.0 containment tolerance, so it must no longer count.
+        let v_edges = [Edge {
+            coord: 40.0,
+            start: y_lo + 2.0,
+            end: y_hi - 2.0,
+        }];
+
+        let groups = band_column_groups(&xs, y_lo, y_hi, num_cols, &v_edges, true);
+
+        assert_eq!(
+            groups,
+            vec![(0, 1)],
+            "a rule that stops short of the band must not split it into separate column groups, got {groups:?}"
+        );
     }
 
     #[test]
@@ -7420,5 +7795,378 @@ mod tests {
         let prev = ts("Quarter ", 100.0, 200.0, 35.0, 10.0);
         let curr = ts("Total", 140.0, 200.0, 25.0, 10.0);
         assert_eq!(cell_span_separator(&prev, &curr), "");
+    }
+
+    /// Reproduces xberg-io/xberg#1555: a drawn row band whose baselines are
+    /// 288.7 (col0), 294.7/282.7 (col1, wraps to 2 lines) and
+    /// 300.7/288.7/276.7 (col2, wraps to 3 lines). Clustering naively at
+    /// `strict()`'s `row_tolerance` of 1.0 yields 5 Y-clusters, and only the
+    /// 288.7 cluster (col0 + col2's middle line) has evidence in >= 2
+    /// columns. The split must be rejected in full and the drawn band must
+    /// survive as the single row it was already built as. ~keep
+    #[test]
+    fn split_rows_by_text_positions_keeps_drawn_band_as_one_row_when_only_one_cell_wraps() {
+        let spans = vec![
+            create_test_span("1", 90.2, 288.7, 5.0, 0.0),
+            create_test_span("Versterking van het", 118.6, 294.7, 60.0, 0.0),
+            create_test_span("MKB-segment", 118.6, 282.7, 40.0, 0.0),
+            create_test_span("Ontwikkel gerichte campagnes", 246.1, 300.7, 90.0, 0.0),
+            create_test_span("een vereenvoudigde waardepropositie", 246.1, 288.7, 100.0, 0.0),
+            create_test_span("om de conversie te verhogen.", 246.1, 276.7, 90.0, 0.0),
+        ];
+
+        let row = TableRow {
+            cells: vec![
+                prose_cell("1"),
+                prose_cell("Versterking van het MKB-segment"),
+                prose_cell(
+                    "Ontwikkel gerichte campagnes een vereenvoudigde waardepropositie \
+                     om de conversie te verhogen.",
+                ),
+            ],
+            is_header: false,
+        };
+
+        let row_cell_span_indices = vec![vec![vec![0], vec![1, 2], vec![3, 4, 5]]];
+        let config = TableDetectionConfig::strict();
+
+        let result = split_rows_by_text_positions(vec![row], &row_cell_span_indices, &spans, &config);
+
+        assert_eq!(
+            result.len(),
+            1,
+            "one wrapped cell must not fracture the drawn band into extra rows"
+        );
+        assert_eq!(result[0].cells[0].text, "1");
+        assert_eq!(result[0].cells[1].text, "Versterking van het MKB-segment");
+    }
+
+    #[test]
+    fn split_rows_by_text_positions_keeps_single_column_split_behavior() {
+        let spans = vec![
+            create_test_span("Label", 10.0, 200.0, 30.0, 0.0),
+            create_test_span("Value", 10.0, 180.0, 30.0, 0.0),
+        ];
+        let row = TableRow {
+            cells: vec![prose_cell("Label Value")],
+            is_header: false,
+        };
+        let row_cell_span_indices = vec![vec![vec![0, 1]]];
+
+        let result = split_rows_by_text_positions(
+            vec![row],
+            &row_cell_span_indices,
+            &spans,
+            &TableDetectionConfig::strict(),
+        );
+
+        assert_eq!(
+            result.len(),
+            2,
+            "the two-column evidence floor must be capped for one-column bands"
+        );
+        assert_eq!(result[0].cells[0].text, "Label");
+        assert_eq!(result[1].cells[0].text, "Value");
+    }
+
+    /// Page-3-shaped downstream regression for #1555: one header band and three
+    /// data bands each contain 1/2/3-line cells on staggered baselines. Keeping
+    /// every drawn band whole must leave a four-row, three-column table that
+    /// clears the real-grid gate; the old sixteen-row expansion failed it at 4/16.
+    #[test]
+    fn wrapped_drawn_bands_remain_a_real_four_row_grid() {
+        let mut spans = vec![
+            create_test_span("#", 90.2, 330.0, 5.0, 0.0),
+            create_test_span("Aanbeveling", 118.6, 330.0, 60.0, 0.0),
+            create_test_span("Toelichting", 246.1, 330.0, 90.0, 0.0),
+        ];
+        let mut rows = vec![TableRow {
+            cells: vec![prose_cell("#"), prose_cell("Aanbeveling"), prose_cell("Toelichting")],
+            is_header: true,
+        }];
+        let mut row_cell_span_indices = vec![vec![vec![0], vec![1], vec![2]]];
+
+        for (row_number, baseline) in [(1, 288.7), (2, 242.7), (3, 196.7)] {
+            let start = spans.len();
+            spans.extend([
+                create_test_span(&row_number.to_string(), 90.2, baseline, 5.0, 0.0),
+                create_test_span("Versterking van het", 118.6, baseline + 6.0, 60.0, 0.0),
+                create_test_span("MKB-segment", 118.6, baseline - 6.0, 40.0, 0.0),
+                create_test_span("Ontwikkel gerichte campagnes", 246.1, baseline + 12.0, 90.0, 0.0),
+                create_test_span("een vereenvoudigde waardepropositie", 246.1, baseline, 100.0, 0.0),
+                create_test_span("om de conversie te verhogen.", 246.1, baseline - 12.0, 90.0, 0.0),
+            ]);
+            rows.push(TableRow {
+                cells: vec![
+                    prose_cell(&row_number.to_string()),
+                    prose_cell("Versterking van het MKB-segment"),
+                    prose_cell(
+                        "Ontwikkel gerichte campagnes een vereenvoudigde waardepropositie \
+                         om de conversie te verhogen.",
+                    ),
+                ],
+                is_header: false,
+            });
+            row_cell_span_indices.push(vec![
+                vec![start],
+                vec![start + 1, start + 2],
+                vec![start + 3, start + 4, start + 5],
+            ]);
+        }
+
+        let rows = split_rows_by_text_positions(rows, &row_cell_span_indices, &spans, &TableDetectionConfig::strict());
+        let table = Table {
+            rows,
+            has_header: true,
+            col_count: 3,
+            bbox: None,
+        };
+
+        assert_eq!(table.rows.len(), 4, "four producer-drawn bands must remain four rows");
+        assert!(
+            table.is_real_grid(),
+            "the repaired table must survive the downstream real-grid gate"
+        );
+        assert_eq!(table.rows[1].cells[0].text, "1");
+        assert_eq!(table.rows[1].cells[1].text, "Versterking van het MKB-segment");
+        assert_eq!(table.rows[3].cells[0].text, "3");
+        assert_eq!(table.rows[3].cells[1].text, "Versterking van het MKB-segment");
+    }
+
+    /// The hybrid case `split_rows_by_text_positions` exists for: vertical
+    /// column lines exist but no horizontal rule separates two real rows
+    /// crammed into one intersection cell. Each candidate row has
+    /// independent text in both columns, so this split must be kept intact
+    /// and produce exactly 2 rows in page order. ~keep
+    #[test]
+    fn split_rows_by_text_positions_splits_genuine_multi_row_band_with_two_column_evidence() {
+        let spans = vec![
+            create_test_span("Alice", 10.0, 200.0, 30.0, 0.0),
+            create_test_span("30", 60.0, 200.0, 10.0, 0.0),
+            create_test_span("Bob", 10.0, 180.0, 30.0, 0.0),
+            create_test_span("25", 60.0, 180.0, 10.0, 0.0),
+        ];
+
+        let row = TableRow {
+            cells: vec![prose_cell("Alice Bob"), prose_cell("30 25")],
+            is_header: false,
+        };
+
+        let row_cell_span_indices = vec![vec![vec![0, 2], vec![1, 3]]];
+        let config = TableDetectionConfig::strict();
+
+        let result = split_rows_by_text_positions(vec![row], &row_cell_span_indices, &spans, &config);
+
+        assert_eq!(result.len(), 2, "two genuinely distinct rows must survive the split");
+        assert_eq!(result[0].cells[0].text, "Alice");
+        assert_eq!(result[0].cells[1].text, "30");
+        assert_eq!(result[1].cells[0].text, "Bob");
+        assert_eq!(result[1].cells[1].text, "25");
+    }
+
+    /// REGRESSION xberg-io/xberg#1565: a producer-drawn band mixing genuine multi-column data
+    /// rows with a single-column section lead-in ("Mogelijke oorzaken:") must not collapse
+    /// back into one mega-row just because the lead-in itself lacks two-column evidence. The
+    /// two data rows are independently evidenced, so the split is accepted; the lead-in shares
+    /// no column with anything to its left/right that it doesn't already have on its own — it
+    /// is the topmost cluster and has no cluster above it to fold into — so it must survive as
+    /// its own one-cell-wide row instead of being fused into a data row's cell. ~keep
+    #[test]
+    fn split_rows_by_text_positions_keeps_heading_line_separate_amid_multi_column_rows() {
+        let spans = vec![
+            create_test_span("Mogelijke oorzaken:", 10.0, 220.0, 100.0, 0.0),
+            create_test_span("Symptom A", 10.0, 200.0, 40.0, 0.0),
+            create_test_span("Cause A", 60.0, 200.0, 40.0, 0.0),
+            create_test_span("Symptom B", 10.0, 180.0, 40.0, 0.0),
+            create_test_span("Cause B", 60.0, 180.0, 40.0, 0.0),
+        ];
+
+        let row = TableRow {
+            cells: vec![
+                prose_cell("Mogelijke oorzaken: Symptom A Symptom B"),
+                prose_cell("Cause A Cause B"),
+            ],
+            is_header: false,
+        };
+
+        let row_cell_span_indices = vec![vec![vec![0, 1, 3], vec![2, 4]]];
+        let config = TableDetectionConfig::strict();
+
+        let result = split_rows_by_text_positions(vec![row], &row_cell_span_indices, &spans, &config);
+
+        assert_eq!(
+            result.len(),
+            3,
+            "the heading and both genuine data rows must each survive as their own row"
+        );
+        assert_eq!(result[0].cells[0].text, "Mogelijke oorzaken:");
+        assert_eq!(
+            result[0].cells[1].text, "",
+            "the heading must not be fused into a data row's cell text"
+        );
+        assert_eq!(result[1].cells[0].text, "Symptom A");
+        assert_eq!(result[1].cells[1].text, "Cause A");
+        assert_eq!(result[2].cells[0].text, "Symptom B");
+        assert_eq!(result[2].cells[1].text, "Cause B");
+    }
+
+    /// FINDING 2 (adversarial review): does the #1565 row-split fix create a new
+    /// single-cell-wide row shaped exactly like `strip_form_numbering_artifacts`'s Phase 1
+    /// numbering-artifact signature (every cell empty or a lone digit 1-9, with at least one
+    /// lone digit) out of what used to be a non-foldable single-column lead-in? Runs the
+    /// *whole* `finalize_intersection_tables` pipeline (split, then artifact-strip, then
+    /// empty-row table segmentation) rather than just `split_rows_by_text_positions`, since
+    /// that is the real caller order and Phase 1 runs immediately after the split.
+    ///
+    /// `min_table_cells` is deliberately set to 1 so the outer table-emission gate cannot
+    /// mask what happens to this one row -- the question under test is row-level survival,
+    /// not table-level acceptance.
+    #[test]
+    fn finalize_intersection_tables_deletes_lone_digit_lead_in_row() {
+        let spans = vec![
+            create_test_span("5", 10.0, 220.0, 5.0, 0.0),
+            create_test_span("Symptom A", 10.0, 200.0, 40.0, 0.0),
+            create_test_span("Cause A", 60.0, 200.0, 40.0, 0.0),
+            create_test_span("Symptom B", 10.0, 180.0, 40.0, 0.0),
+            create_test_span("Cause B", 60.0, 180.0, 40.0, 0.0),
+        ];
+
+        let row = TableRow {
+            cells: vec![prose_cell("5 Symptom A Symptom B"), prose_cell("Cause A Cause B")],
+            is_header: false,
+        };
+
+        let row_cell_span_indices = vec![vec![vec![0, 1, 3], vec![2, 4]]];
+        let config = TableDetectionConfig {
+            min_table_cells: 1,
+            ..TableDetectionConfig::strict()
+        };
+
+        // Confirm, as a checkpoint, that the split itself still isolates "5" into its own
+        // one-cell-wide row -- the same shape as the heading test above, just digit-shaped
+        // instead of alphabetic. If this checkpoint ever stops holding the rest of this test
+        // is testing a different mechanism than the one under review.
+        let split_only = split_rows_by_text_positions(vec![row.clone()], &row_cell_span_indices, &spans, &config);
+        assert_eq!(
+            split_only.len(),
+            3,
+            "checkpoint: split must isolate the lead-in as its own row"
+        );
+        assert_eq!(split_only[0].cells[0].text, "5");
+        assert_eq!(split_only[0].cells[1].text, "");
+
+        let tables = finalize_intersection_tables(vec![row], &row_cell_span_indices, &spans, &config, 2);
+
+        assert_eq!(tables.len(), 1, "the two evidenced data rows must still form one table");
+        let surviving_rows: Vec<Vec<&str>> = tables[0]
+            .rows
+            .iter()
+            .map(|r| r.cells.iter().map(|c| c.text.as_str()).collect())
+            .collect();
+
+        // Documents observed behavior: Phase 1 of `strip_form_numbering_artifacts` deletes
+        // this row whole. This is the same rule the module already pins for a row that was
+        // ALWAYS a standalone lone-digit row (`test_strip_form_numbering_artifacts` row 0):
+        // that rule is not new, and reachable-from-a-real-band content shaped exactly like a
+        // classic form row-number (a bare digit, sharing no column with any neighboring data)
+        // is indistinguishable, by any signal Phase 1 has, from the artifact it exists to
+        // remove. Judgment call: NOT a regression fix here -- see the finding-2 report for
+        // why a content-preserving change is not being made.
+        assert_eq!(
+            surviving_rows,
+            vec![vec!["Symptom A", "Cause A"], vec!["Symptom B", "Cause B"]],
+            "lone-digit lead-in row is removed by Phase 1, same as a pre-existing standalone artifact row"
+        );
+    }
+
+    /// "CLEARED" CLAIM 1 (adversarial review): a multi-hop fold chain must not manufacture
+    /// column evidence that was never actually present. Three-cluster band: the topmost and
+    /// bottommost clusters are each independently evidenced (2 columns), and a middle
+    /// deficient cluster carries text in only ONE of those two columns. The deficient
+    /// cluster's own column footprint ({0}) is a subset of the cluster above it ({0, 1}), so
+    /// it is allowed to fold -- but the emitted rows must still reflect only the columns each
+    /// physical cluster actually had text in; folding must never cause a group's rendered
+    /// column count, or the per-column text, to exceed what the real spans support.
+    #[test]
+    fn split_rows_by_text_positions_fold_chain_does_not_fabricate_column_evidence() {
+        let spans = vec![
+            // Bottom cluster (y=180): evidenced, both columns. ~keep
+            create_test_span("Alice", 10.0, 180.0, 30.0, 0.0),
+            create_test_span("30", 60.0, 180.0, 10.0, 0.0),
+            // Middle cluster (y=200): deficient, column 0 only -- a wrapped continuation of
+            // the row above it (y=220), not of the row below. ~keep
+            create_test_span("continued", 10.0, 200.0, 40.0, 0.0),
+            // Top cluster (y=220): evidenced, both columns. ~keep
+            create_test_span("Bob", 10.0, 220.0, 30.0, 0.0),
+            create_test_span("25", 60.0, 220.0, 10.0, 0.0),
+        ];
+
+        let row = TableRow {
+            cells: vec![prose_cell("Alice continued Bob"), prose_cell("30 25")],
+            is_header: false,
+        };
+
+        let row_cell_span_indices = vec![vec![vec![0, 2, 3], vec![1, 4]]];
+        let config = TableDetectionConfig::strict();
+
+        let result = split_rows_by_text_positions(vec![row], &row_cell_span_indices, &spans, &config);
+
+        assert_eq!(
+            result.len(),
+            2,
+            "the deficient middle cluster must fold, not survive alone"
+        );
+        // Top group (y=220 anchor with y=200 folded in): column 0 gets both lines, column 1
+        // only ever had "25" -- folding must not invent a "25 continued" or duplicate value. ~keep
+        assert_eq!(result[0].cells[0].text, "Bob\ncontinued");
+        assert_eq!(
+            result[0].cells[1].text, "25",
+            "folding a column-0-only cluster must not fabricate evidence in column 1"
+        );
+        assert_eq!(result[1].cells[0].text, "Alice");
+        assert_eq!(result[1].cells[1].text, "30");
+    }
+
+    /// "CLEARED" CLAIM 2 (adversarial review): every span fed into a deficient-cluster-heavy
+    /// band must land in exactly one output cell -- never duplicated across two groups, and
+    /// never silently dropped by the `members.iter().any(...)` filter in the final
+    /// cell-assembly pass. Uses the same fold-chain fixture as claim 1 and checks span
+    /// accounting by content rather than by trusting row/column counts alone.
+    #[test]
+    fn split_rows_by_text_positions_fold_chain_drops_no_span_and_duplicates_none() {
+        let spans = vec![
+            create_test_span("Alice", 10.0, 180.0, 30.0, 0.0),
+            create_test_span("30", 60.0, 180.0, 10.0, 0.0),
+            create_test_span("continued", 10.0, 200.0, 40.0, 0.0),
+            create_test_span("Bob", 10.0, 220.0, 30.0, 0.0),
+            create_test_span("25", 60.0, 220.0, 10.0, 0.0),
+        ];
+
+        let row = TableRow {
+            cells: vec![prose_cell("Alice continued Bob"), prose_cell("30 25")],
+            is_header: false,
+        };
+
+        let row_cell_span_indices = vec![vec![vec![0, 2, 3], vec![1, 4]]];
+        let config = TableDetectionConfig::strict();
+
+        let result = split_rows_by_text_positions(vec![row], &row_cell_span_indices, &spans, &config);
+
+        let mut seen_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for r in &result {
+            for c in &r.cells {
+                for word in c.text.split_whitespace() {
+                    *seen_counts.entry(word).or_insert(0) += 1;
+                }
+            }
+        }
+        for expected in ["Alice", "30", "continued", "Bob", "25"] {
+            assert_eq!(
+                seen_counts.get(expected).copied().unwrap_or(0),
+                1,
+                "span text {expected:?} must appear exactly once across all output cells, got {:?}",
+                seen_counts.get(expected)
+            );
+        }
     }
 }

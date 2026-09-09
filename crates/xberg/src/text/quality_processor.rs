@@ -1,7 +1,7 @@
 //! Quality processing post-processor.
 //!
-//! This module provides a PostProcessor plugin that performs quality assessment and
-//! text cleaning on extraction results.
+//! This module provides a PostProcessor plugin that performs quality assessment on
+//! extraction results.
 //!
 //! # Performance
 //!
@@ -18,13 +18,16 @@ use async_trait::async_trait;
 #[cfg(test)]
 use std::borrow::Cow;
 
-/// Post-processor that calculates quality score and cleans text.
+/// Post-processor that calculates a quality score.
 ///
 /// This processor:
 /// - Runs in the Early processing stage
 /// - Calculates quality score when `config.enable_quality_processing` is true
-/// - Stores quality score in `metadata.additional["quality_score"]`
-/// - Cleans and normalizes extracted text
+/// - Stores the text cleanliness/readability score in `ExtractedDocument::quality_score`
+///
+/// The score describes retained text, not extraction completeness or recall.
+/// Callers must inspect `ExtractedDocument::processing_warnings` separately for
+/// known omissions and degraded processing.
 ///
 /// # Example
 ///
@@ -126,6 +129,34 @@ mod tests {
         assert!(result.quality_score.is_some());
         let score = result.quality_score.unwrap();
         assert!((0.0..=1.0).contains(&score));
+    }
+
+    #[tokio::test]
+    async fn quality_score_does_not_hide_completeness_warning() {
+        let processor = QualityProcessor;
+        let config = ExtractionConfig {
+            enable_quality_processing: true,
+            ..Default::default()
+        };
+        let warning = crate::types::ProcessingWarning {
+            source: Cow::Borrowed("ocr"),
+            message: Cow::Borrowed("Page 4 was rejected and its text was discarded."),
+        };
+        let mut result = ExtractedDocument {
+            content:
+                "The retained paragraph is clean, readable prose with complete sentences and conventional punctuation."
+                    .to_string(),
+            mime_type: Cow::Borrowed("application/pdf"),
+            processing_warnings: vec![warning.clone()],
+            ..Default::default()
+        };
+
+        processor.process(&mut result, &config).await.unwrap();
+
+        assert_eq!(result.quality_score, Some(1.0));
+        assert_eq!(result.processing_warnings.len(), 1);
+        assert_eq!(result.processing_warnings[0].source, warning.source);
+        assert_eq!(result.processing_warnings[0].message, warning.message);
     }
 
     #[tokio::test]

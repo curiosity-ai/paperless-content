@@ -37,6 +37,9 @@ const SHA256: &str = "6b742aebce6f0f7f71f747931ac7becfc7c96c51641e14943b291eeb33
 
 const INPUT_SIZE: u32 = 224;
 const RESIZE_SHORT: u32 = 256;
+const ORIENTATION_CROP_COUNT: u64 = 3;
+const RGB_BYTES_PER_PIXEL: u64 = 3;
+const F32_BYTES: u64 = 4;
 const RGB_MEAN: [f32; 3] = [0.485 * 255.0, 0.456 * 255.0, 0.406 * 255.0];
 const RGB_NORM: [f32; 3] = [1.0 / (0.229 * 255.0), 1.0 / (0.224 * 255.0), 1.0 / (0.225 * 255.0)];
 
@@ -116,12 +119,11 @@ impl DocOrientationDetector {
     /// image bytes (PNG/JPEG/…) rather than a decoded [`RgbImage`] — notably the
     /// WASM bridge, which receives image bytes from JS.
     pub fn detect_image_bytes(&self, image_bytes: &[u8]) -> Result<OrientationResult> {
-        let image = image::load_from_memory(image_bytes)
-            .map_err(|e| XbergError::Ocr {
-                message: format!("Failed to decode image for orientation detection: {e}"),
-                source: None,
-            })?
-            .to_rgb8();
+        let image = crate::extraction::image_decode::decode_standard_rgb8_with_default_security_limits(image_bytes)
+            .map_err(|error| XbergError::Ocr {
+                message: format!("Failed to decode image for orientation detection: {error}"),
+                source: Some(Box::new(error)),
+            })?;
         self.detect(&image)
     }
 
@@ -130,8 +132,17 @@ impl DocOrientationDetector {
     /// Returns the detected orientation (0°, 90°, 180°, 270°) and confidence.
     /// Thread-safe: can be called concurrently from multiple pages.
     pub(crate) fn detect(&self, image: &RgbImage) -> Result<OrientationResult> {
+        self.detect_with_security_limits(image, &crate::extractors::security::SecurityLimits::default())
+    }
+
+    fn detect_with_security_limits(
+        &self,
+        image: &RgbImage,
+        security_limits: &crate::extractors::security::SecurityLimits,
+    ) -> Result<OrientationResult> {
+        validate_orientation_peak(image, security_limits)?;
         let session = self.get_or_init_session()?;
-        let [center, start, end] = preprocess_crops(image);
+        let [center, start, end] = preprocess_crops(image)?;
         let mut best_result = infer_orientation(session, &center)?;
         if best_result.confidence >= MIN_CONFIDENCE {
             return Ok(best_result);
@@ -200,6 +211,59 @@ impl DocOrientationDetector {
     }
 }
 
+fn validate_orientation_peak(
+    image: &RgbImage,
+    security_limits: &crate::extractors::security::SecurityLimits,
+) -> Result<()> {
+    let (width, height) = image.dimensions();
+    let (resized_width, resized_height) = orientation_resize_dimensions(width, height)?;
+    let current = crate::extraction::image_decode::decoded_byte_count(width, height, RGB_BYTES_PER_PIXEL)?;
+    let resized =
+        crate::extraction::image_decode::decoded_byte_count(resized_width, resized_height, RGB_BYTES_PER_PIXEL)?;
+    let crops = crate::extraction::image_decode::decoded_byte_count(INPUT_SIZE, INPUT_SIZE, RGB_BYTES_PER_PIXEL)?
+        .checked_mul(ORIENTATION_CROP_COUNT)
+        .ok_or_else(|| crate::extraction::image_decode::image_dimension_error(width, height, u64::MAX, u64::MAX))?;
+    let tensor =
+        crate::extraction::image_decode::decoded_byte_count(INPUT_SIZE, INPUT_SIZE, RGB_BYTES_PER_PIXEL * F32_BYTES)?;
+    let preprocessing = resized
+        .checked_add(crops)
+        .ok_or_else(|| crate::extraction::image_decode::image_dimension_error(width, height, u64::MAX, u64::MAX))?;
+    let inference = crops
+        .checked_add(tensor)
+        .ok_or_else(|| crate::extraction::image_decode::image_dimension_error(width, height, u64::MAX, u64::MAX))?;
+    crate::extraction::image_decode::validate_image_live_bytes(
+        width,
+        height,
+        current,
+        preprocessing.max(inference),
+        security_limits,
+    )
+}
+
+fn orientation_resize_dimensions(width: u32, height: u32) -> Result<(u32, u32)> {
+    if width == 0 || height == 0 {
+        return Err(crate::extraction::image_decode::image_dimension_error(
+            width, height, 0, 0,
+        ));
+    }
+    let (short, long) = if width < height {
+        (width, height)
+    } else {
+        (height, width)
+    };
+    let resized_long = u64::from(long)
+        .checked_mul(u64::from(RESIZE_SHORT))
+        .and_then(|scaled| scaled.checked_add(u64::from(short) / 2))
+        .map(|rounded| rounded / u64::from(short))
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| crate::extraction::image_decode::image_dimension_error(width, height, u64::MAX, u64::MAX))?;
+    Ok(if width < height {
+        (RESIZE_SHORT, resized_long)
+    } else {
+        (resized_long, RESIZE_SHORT)
+    })
+}
+
 fn infer_orientation(session: &dyn InferenceSession, image: &RgbImage) -> Result<OrientationResult> {
     let input_tensor = normalize(image);
 
@@ -246,15 +310,9 @@ pub(crate) fn resolve_cache_dir() -> PathBuf {
 ///
 /// The center crop is the model's official preprocessing path. Edge crops are low-confidence
 /// fallbacks for sparse pages whose text lies outside the center crop. ~keep
-fn preprocess_crops(image: &RgbImage) -> [RgbImage; 3] {
+fn preprocess_crops(image: &RgbImage) -> Result<[RgbImage; 3]> {
     let (width, height) = image.dimensions();
-    let (resized_width, resized_height) = if width < height {
-        let scale = RESIZE_SHORT as f32 / width as f32;
-        (RESIZE_SHORT, (height as f32 * scale).round() as u32)
-    } else {
-        let scale = RESIZE_SHORT as f32 / height as f32;
-        ((width as f32 * scale).round() as u32, RESIZE_SHORT)
-    };
+    let (resized_width, resized_height) = orientation_resize_dimensions(width, height)?;
     let resized = image::imageops::resize(
         image,
         resized_width,
@@ -266,14 +324,14 @@ fn preprocess_crops(image: &RgbImage) -> [RgbImage; 3] {
         let cross_axis_offset = (resized_height - INPUT_SIZE) / 2;
         let end_offset = resized_width - INPUT_SIZE;
         let center_offset = end_offset / 2;
-        [center_offset, 0, end_offset]
-            .map(|x| image::imageops::crop_imm(&resized, x, cross_axis_offset, INPUT_SIZE, INPUT_SIZE).to_image())
+        Ok([center_offset, 0, end_offset]
+            .map(|x| image::imageops::crop_imm(&resized, x, cross_axis_offset, INPUT_SIZE, INPUT_SIZE).to_image()))
     } else {
         let cross_axis_offset = (resized_width - INPUT_SIZE) / 2;
         let end_offset = resized_height - INPUT_SIZE;
         let center_offset = end_offset / 2;
-        [center_offset, 0, end_offset]
-            .map(|y| image::imageops::crop_imm(&resized, cross_axis_offset, y, INPUT_SIZE, INPUT_SIZE).to_image())
+        Ok([center_offset, 0, end_offset]
+            .map(|y| image::imageops::crop_imm(&resized, cross_axis_offset, y, INPUT_SIZE, INPUT_SIZE).to_image()))
     }
 }
 
@@ -351,7 +409,7 @@ mod tests {
             }
         }
 
-        let [center, start, end] = preprocess_crops(&image);
+        let [center, start, end] = preprocess_crops(&image).expect("valid crop dimensions");
 
         assert_eq!(center.dimensions(), (INPUT_SIZE, INPUT_SIZE));
         assert_eq!(
@@ -360,6 +418,16 @@ mod tests {
         );
         assert_eq!(*start.get_pixel(INPUT_SIZE / 2, 0), image::Rgb([255, 0, 0]));
         assert_eq!(*end.get_pixel(INPUT_SIZE / 2, INPUT_SIZE - 1), image::Rgb([0, 0, 255]));
+    }
+
+    #[test]
+    fn should_reject_extreme_aspect_resize_before_orientation_allocation() {
+        let image = RgbImage::from_pixel(1, 10_000, image::Rgb([255, 255, 255]));
+
+        let error = validate_orientation_peak(&image, &crate::extractors::security::SecurityLimits::default())
+            .expect_err("resize-short expansion must be bounded before allocation");
+
+        assert!(matches!(error, XbergError::Validation { .. }));
     }
 
     #[test]
@@ -391,6 +459,20 @@ mod tests {
         for probabilities in [vec![0.5, 0.5], vec![f32::NAN, 0.0, 0.0, 1.0], vec![0.5, 0.5, 0.5, 0.5]] {
             assert!(orientation_from_probabilities(&probabilities).is_err());
         }
+    }
+
+    #[test]
+    fn should_reject_oversized_declared_dimensions_before_orientation_inference() {
+        let detector = DocOrientationDetector::from_bytes(Vec::new(), None);
+        let bytes = crate::extraction::image_decode::bmp_with_declared_dimensions(6000, 6000);
+
+        let error = detector
+            .detect_image_bytes(&bytes)
+            .expect_err("orientation decode must reject the image before loading the model");
+
+        assert!(matches!(error, XbergError::Ocr { .. }));
+        assert!(error.to_string().contains("6000x6000"));
+        assert!(error.to_string().contains("security_limits.max_content_size"));
     }
 
     #[cfg(not(target_arch = "wasm32"))]

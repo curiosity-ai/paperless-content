@@ -244,9 +244,12 @@ pub struct ExtractedDocument {
     #[cfg(any(feature = "keywords-yake", feature = "keywords-rake"))]
     pub extracted_keywords: Option<Vec<crate::keywords::Keyword>>,
 
-    /// Document quality score from quality analysis.
+    /// Text cleanliness/readability score from quality analysis.
     ///
-    /// A value between 0.0 and 1.0 indicating the overall text quality.
+    /// A value between 0.0 and 1.0 describing the quality of the text that was
+    /// retained. This is not a completeness or recall score: clean text can score
+    /// highly even when an extractor omitted or rejected other content. Inspect
+    /// `processing_warnings` separately for known degraded or partial extraction.
     /// Previously stored in `metadata.additional["quality_score"]`.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
@@ -256,7 +259,8 @@ pub struct ExtractedDocument {
     ///
     /// Captures errors from optional pipeline features (embedding, chunking,
     /// language detection, output formatting) that don't prevent extraction
-    /// but may indicate degraded results.
+    /// but may indicate degraded or incomplete results. These warnings are
+    /// independent of `quality_score`, which assesses only retained text.
     /// Previously stored as individual keys in `metadata.additional`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
@@ -468,7 +472,8 @@ pub struct ArchiveEntry {
 /// A non-fatal warning from a processing pipeline stage.
 ///
 /// Captures errors from optional features that don't prevent extraction
-/// but may indicate degraded results.
+/// but may indicate degraded or incomplete results. Inspect these independently
+/// from `ExtractedDocument::quality_score`, which assesses retained text only.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
 pub struct ProcessingWarning {

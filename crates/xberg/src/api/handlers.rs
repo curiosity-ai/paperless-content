@@ -276,7 +276,7 @@ where
                     .bytes()
                     .await
                     .map_err(|e| ApiError::validation(crate::error::XbergError::validation(e.to_string())))?;
-                let mime_type = resolve_multipart_mime(content_type, file_name.as_deref());
+                let mime_type = resolve_multipart_mime(content_type);
 
                 inputs.push(ApiExtractInput::Bytes {
                     data,
@@ -350,15 +350,8 @@ where
     })
 }
 
-fn resolve_multipart_mime(content_type: Option<String>, file_name: Option<&str>) -> String {
-    let mut mime_type = content_type.unwrap_or_else(|| crate::core::mime::OCTET_STREAM_MIME_TYPE.to_string());
-    if mime_type == crate::core::mime::OCTET_STREAM_MIME_TYPE
-        && let Some(name) = file_name
-        && let Ok(detected) = crate::core::mime::detect_mime_type(name, false)
-    {
-        mime_type = detected;
-    }
-    mime_type
+fn resolve_multipart_mime(content_type: Option<String>) -> String {
+    content_type.unwrap_or_else(|| crate::core::mime::OCTET_STREAM_MIME_TYPE.to_string())
 }
 
 fn parse_urls_field(raw: &str) -> Result<Vec<ApiExtractInput>, ApiError> {
@@ -1430,6 +1423,89 @@ mod tests {
             .header("content-type", format!("multipart/form-data; boundary={boundary}"))
             .body(Body::from(body))
             .expect("valid multipart request")
+    }
+
+    fn multipart_file_request(
+        boundary: &str,
+        filename: &str,
+        content_type: &str,
+        data: &[u8],
+        config: Option<&str>,
+    ) -> Request<Body> {
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(data);
+        body.extend_from_slice(b"\r\n");
+        if let Some(config) = config {
+            body.extend_from_slice(
+                format!("--{boundary}\r\nContent-Disposition: form-data; name=\"config\"\r\n\r\n{config}\r\n")
+                    .as_bytes(),
+            );
+        }
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+        Request::builder()
+            .method("POST")
+            .uri("/extract")
+            .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+            .body(Body::from(body))
+            .expect("valid multipart request")
+    }
+
+    async fn extracted_mime_from_multipart(request: Request<Body>) -> String {
+        let parsed = UnifiedExtractRequest::from_request(request, &())
+            .await
+            .expect("multipart extraction request must parse");
+        let config = parsed.config.unwrap_or_default();
+        let result = extract_unified_inputs(parsed.inputs, config)
+            .await
+            .expect("multipart input must extract");
+        assert_eq!(result.results.len(), 1);
+        result.results[0].mime_type.to_string()
+    }
+
+    #[tokio::test]
+    async fn should_detect_multipart_json_content_despite_txt_filename_by_default() {
+        let request = multipart_file_request(
+            "prefercontentboundary",
+            "report.txt",
+            crate::core::mime::OCTET_STREAM_MIME_TYPE,
+            br#"{"kind":"report"}"#,
+            None,
+        );
+
+        assert_eq!(extracted_mime_from_multipart(request).await, "application/json");
+    }
+
+    #[tokio::test]
+    async fn should_detect_multipart_json_content_despite_txt_filename_in_content_only_mode() {
+        let request = multipart_file_request(
+            "contentonlyboundary",
+            "report.txt",
+            crate::core::mime::OCTET_STREAM_MIME_TYPE,
+            br#"{"kind":"report"}"#,
+            Some(r#"{"mime_detection_policy":"content_only"}"#),
+        );
+
+        assert_eq!(extracted_mime_from_multipart(request).await, "application/json");
+    }
+
+    #[tokio::test]
+    async fn should_keep_specific_multipart_content_type_authoritative() {
+        let request = multipart_file_request(
+            "explicitmimeboundary",
+            "report.json",
+            "text/plain",
+            br#"{"kind":"report"}"#,
+            Some(r#"{"mime_detection_policy":"content_only"}"#),
+        );
+
+        assert_eq!(extracted_mime_from_multipart(request).await, "text/plain");
     }
 
     #[test]

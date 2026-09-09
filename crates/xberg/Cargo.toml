@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
-description = "High-performance document intelligence library for Rust. Extract text, metadata, and structured data from PDFs, Office documents, images, and 101 formats and 371 programming languages via tree-sitter code intelligence with async/sync APIs."
+description = "High-performance document intelligence library for Rust. Extract text, metadata, and structured data from PDFs, Office documents, images, and 107 formats and 371 programming languages via tree-sitter code intelligence with async/sync APIs."
 license.workspace = true
 repository = "https://github.com/xberg-io/xberg"
 homepage = "https://xberg.io"
@@ -117,6 +117,7 @@ email = [
 html = ["dep:html-to-markdown-rs", "dep:v_htmlescape"]
 xml = ["dep:quick-xml", "dep:roxmltree"]
 archives = ["dep:zip", "dep:tar", "dep:sevenz-rust2", "dep:flate2"]
+sqlite = ["dep:rusqlite", "tokio-runtime"]
 mdx = []
 
 liter-llm = ["dep:liter-llm", "dep:minijinja", "dep:ureq", "dep:secrecy", "ocr-pipeline"]
@@ -320,7 +321,7 @@ sceptre-ocr-candle-metal = ["sceptre-ocr-candle", "sceptre/candle-metal"]
 sceptre-ocr-candle-cuda = ["sceptre-ocr-candle", "sceptre/candle-cuda"]
 # Opt-in browser engine used by the separate worker-backed WASM build. It
 # intentionally omits the async OCR registry and default `wasm-target`. ~keep
-sceptre-wasm = ["dep:sceptre", "sceptre/tract"]
+sceptre-wasm = ["dep:sceptre", "sceptre/tract", "image-encode"]
 # Dev default: downloads the pyke prebuilt ONNX Runtime (needs glibc >= 2.38 to run).
 # Release links Microsoft's runtime instead (system strategy) — see publish.yaml (#1284).
 ort-bundled = ["ort?/download-binaries", "ort?/tls-rustls", "xberg-gliner?/ort-bundled"]
@@ -664,8 +665,13 @@ prometheus = ["api", "otel", "dep:opentelemetry-prometheus", "dep:prometheus"]
 # Excluded:
 # - liter-llm: tokenizers → hf-hub → ureq 2.12.1 → rustls 0.23 + socks 0.3 (both wasm-incompatible).
 #   Added to android-target explicitly; WASM does not use LLM for now.
-# - hwpx: unhwp → zip → xz2 → lzma-sys (native C, missing wasm stdlib). Native-only;
-#   re-enabled in android-target.
+# hwpx is NOT excluded here: unhwp's own Cargo.toml target-gates its `zip` dependency —
+# non-wasm32 gets `zip = "2.2"` with default features (pulls xz2 → lzma-sys, native C), but
+# `cfg(target_arch = "wasm32")` gets `zip = "2.2", default-features = false, features =
+# ["deflate"]`, which never touches xz2/lzma-sys. unhwp's other deps (cfb, flate2, regex,
+# pulldown-cmark, quick-xml, serde, thiserror, unicode-normalization, uncore, unrefine) are
+# pure Rust and already compiled into this wasm-target build via `hwp`/base deps; `rayon` is
+# also `cfg(not(wasm32))`-gated out by unhwp itself. See `wasm-target` for the enabling flag.
 no-ort-target = [
     "pdf",
     "html",
@@ -736,6 +742,11 @@ wasm-target = [
     "layout-tract",
     "auto-rotate-tract",
     "ner-candle-wasm",
+    # unhwp gates its own `zip` dep to a deflate-only, lzma-free build under
+    # `cfg(target_arch = "wasm32")` (see the `no-ort-target` comment above); every other
+    # transitive dep is pure Rust and already compiled in via `hwp`/base deps. Small ZIP+XML
+    # format, no bundled data/grammar — expected to be a modest size add, unlike tree-sitter.
+    "hwpx",
 ]
 # android-target: no-ort-target plus native-Linux variants that work on Android ABI
 # (excel with tokio, native tree-sitter, Tesseract OCR, and API/MCP transport).
@@ -747,6 +758,7 @@ wasm-target = [
 # by the pure-Rust `paddle-ocr-tract` variant instead of the ORT-backed `paddle-ocr`.
 android-target = [
     "no-ort-target",
+    "sqlite",
     "excel",
     "tree-sitter",
     "ocr",
@@ -811,6 +823,7 @@ windows-target = [
     "html",
     "tree-sitter",
     "office",
+    "sqlite",
     # excel = [dep:calamine, tokio-runtime]: calamine is pure Rust (Windows-safe)
     # and tokio-runtime is already enabled above. Without this, the static format
     # registry still advertises XLSX (EXT_TO_MIME is ungated) but the excel
@@ -979,6 +992,7 @@ windows-gnu-target = [
     "html",
     "tree-sitter",
     "office",
+    "sqlite",
     "excel",
     "hwp",
     "hwpx",
@@ -1078,6 +1092,7 @@ formats = [
     "html",
     "xml",
     "archives",
+    "sqlite",
     "mdx",
     "svg",
     "heic",
@@ -1099,6 +1114,7 @@ formats-no-heic = [
     "html",
     "xml",
     "archives",
+    "sqlite",
     "mdx",
     "svg",
     "wordperfect",
@@ -1246,9 +1262,9 @@ codepage = "0.1.2"
 comrak = { workspace = true }
 crawlberg = { workspace = true, optional = true }
 dbase = { workspace = true, optional = true }
-dirs = "6"
+dirs = "7"
 either = { version = "1", optional = true }
-encoding_rs = { version = "0.8.35" }
+encoding_rs = { version = "0.8.40" }
 fast_image_resize = { version = "6.1.0", optional = true }
 flate2 = { version = "1.1", optional = true }
 hayro-jbig2 = { version = "0.3", default-features = false, features = ["std"], optional = true }
@@ -1269,11 +1285,11 @@ image = { workspace = true, default-features = false, features = [
     "rayon",
 ], optional = true }
 include_dir = { version = "0.7", optional = true }
-indexmap = "2.14.0"
+indexmap = "2.14.2"
 infer = "0.22.0"
 itertools = { workspace = true, optional = true }
 jotdown = "0.10"
-jsonschema = { version = "0.51", optional = true, default-features = false }
+jsonschema = { version = "0.55", optional = true, default-features = false }
 libc = { workspace = true }
 # lofty: pure-Rust audio tag reader (ID3v1/v2, MP4 atoms, Vorbis comments, FLAC, etc.)
 # MIT license. Used for metadata extraction independent of the inference backend.
@@ -1289,6 +1305,7 @@ mathemascii = { version = "0.4.0", optional = true }
 mel_spec = { version = "0.4", optional = true }
 memchr = "2.8.3"
 memmap2 = { workspace = true }
+mime = { workspace = true }
 mime_guess = "2.0"
 minijinja = { workspace = true, optional = true }
 moka = { version = "0.12", features = ["sync"], optional = true }
@@ -1332,7 +1349,7 @@ rake = { version = "0.3.6", optional = true }
 rayon = { workspace = true }
 regex = "1.13.1"
 resvg = { workspace = true, optional = true }
-rmcp = { version = "3.1.4", features = [
+rmcp = { version = "3.2.0", features = [
     "server",
     "macros",
     "base64",
@@ -1343,7 +1360,8 @@ rmcp = { version = "3.1.4", features = [
 rmp-serde = "1.3"
 
 roxmltree = { version = "0.21.1", optional = true }
-rqrr = { version = "0.10", optional = true }
+rqrr = { package = "rqrr-zeroize", version = "0.10.1", optional = true }
+rusqlite = { workspace = true, optional = true }
 sceptre = { workspace = true, optional = true }
 scrypt = { version = "0.12", optional = true, default-features = false, features = ["kdf"] }
 # Constructs the `SecretString` arguments liter-llm's managed credential providers (Azure AD,
@@ -1418,8 +1436,16 @@ uuid = { version = "1", features = ["v4"], optional = true }
 v_htmlescape = { version = "0.17", optional = true }
 whatlang = { version = "0.18.0", optional = true }
 xberg-gliner = { workspace = true, optional = true }
-xberg-libheif = { path = "../xberg-libheif", version = "1.1.0", optional = true }
-xberg-libwpd = { path = "../xberg-libwpd", version = "1.1.0", optional = true }
+# `default-features = false` + `v1_19`, pinned explicitly rather than inherited: the
+# prebuilt artifacts link libheif dynamically, so every symbol they reference must exist in the
+# oldest libheif a supported distro ships. Debian 13 (trixie, current stable) has 1.19.8 and
+# bookworm-backports only 1.19.7, so a `v1_20`+ floor makes the PHP/PIE extension unloadable
+# there -- `undefined symbol: heif_image_get_plane_readonly2`, which libheif added in 1.20
+# (xberg-io/xberg#1541). `xberg-libheif` gates every version-dependent call, including a
+# `#[cfg(not(feature = "v1_20"))]` fallback to `heif_image_get_plane_readonly`, so this only
+# gives up newer libheif APIs, not functionality. ~keep
+xberg-libheif = { path = "../xberg-libheif", version = "1.1.3", optional = true, default-features = false, features = ["v1_19"] }
+xberg-libwpd = { path = "../xberg-libwpd", version = "1.1.3", optional = true }
 xberg-native-pdf = { workspace = true, optional = true }
 # No `version` on this path-dep: xberg-tesseract carries `links =
 # "xberg_tesseract"`, and a versioned path-dep makes the maturin sdist
@@ -1479,10 +1505,10 @@ tokenizers = { version = "0.23", default-features = false, features = ["fancy-re
 # why `candle-vlm-ocr` is safe in `full`/`windows-target`. GPU acceleration (cudarc / metal) is
 # strictly opt-in via candle-cuda/metal/mkl/accelerate and must be enabled with platform awareness.
 # CI uses `--features full` which keeps GPU accel off.
-xberg-candle-ocr = { path = "../xberg-candle-ocr", version = "1.1.0", optional = true }
+xberg-candle-ocr = { path = "../xberg-candle-ocr", version = "1.1.3", optional = true }
 # PaddleOCR via ONNX Runtime or tract (vendored from paddle-ocr-rs). The backend is selected
 # by the enabling feature (`paddle-ocr-ort` / `paddle-ocr-tract`), never by a default.
-xberg-paddle-ocr = { path = "../xberg-paddle-ocr", version = "1.1.0", optional = true, default-features = false }
+xberg-paddle-ocr = { path = "../xberg-paddle-ocr", version = "1.1.3", optional = true, default-features = false }
 
 # Desktop / server hosts (Linux + macOS, NOT Android): xberg's direct `ureq` client uses
 # ring-backed rustls plus `platform-verifier`, which trusts the OS certificate store
@@ -1521,10 +1547,10 @@ ureq = { version = "3.4", default-features = false, features = [
     "json",
 ], optional = true }
 # Candle-based VLM OCR backends - pure-Rust transformer inference, not on WASM yet.
-xberg-candle-ocr = { path = "../xberg-candle-ocr", version = "1.1.0", optional = true }
+xberg-candle-ocr = { path = "../xberg-candle-ocr", version = "1.1.3", optional = true }
 # PaddleOCR via ONNX Runtime or tract (vendored from paddle-ocr-rs). The backend is selected
 # by the enabling feature (`paddle-ocr-ort` / `paddle-ocr-tract`), never by a default.
-xberg-paddle-ocr = { path = "../xberg-paddle-ocr", version = "1.1.0", optional = true, default-features = false }
+xberg-paddle-ocr = { path = "../xberg-paddle-ocr", version = "1.1.3", optional = true, default-features = false }
 
 # tokio OS features (every native target, including Android and Windows): `process`, `fs`, and
 # `rt-multi-thread` all fail to compile on wasm32 — tokio's own wasm32 gate only allows
@@ -1652,19 +1678,20 @@ criterion = { workspace = true }
 dotenvy = "0.15"
 filetime = "0.2"
 image = { workspace = true, default-features = false, features = ["png"] }
-# default-features=false drops jsonschema's `resolve-http` (reqwest→native-tls→openssl-sys);
-# tests validate local schemas only. Keeps the test build openssl-free.
-jsonschema = { version = "0.51", default-features = false }
+# Test retrieval features prove runtime compilation stays offline under Cargo feature unification. ~keep
+jsonschema = { version = "0.55", default-features = false, features = ["resolve-file", "resolve-http", "tls-ring"] }
 qrcode = { version = "0.14", default-features = false, features = ["image"] }
 # Test-only: builds an in-memory model2vec fixture (safetensors bytes) for the
 # static_engine unit tests, without a network fetch.
 safetensors = "0.8"
 serial_test = "3.5.0"
+syn = { version = "3", features = ["full", "visit"] }
 tar = "^0.4"
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "time"] }
 tokio-test = "0.4"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = "1"
 wiremock = "0.6"
 zip = { version = ">=7.0.0, <8.7.0", default-features = false, features = ["deflate-flate2"] }
 
@@ -1679,6 +1706,10 @@ required-features = ["structured"]
 [[test]]
 name = "structured_live"
 required-features = ["structured", "pdf"]
+
+[[test]]
+name = "sqlite_geopackage_extraction"
+required-features = ["sqlite"]
 
 [[bench]]
 name = "text_quality"

@@ -355,14 +355,6 @@ impl StreamDecoder for FlateDecoder {
                         // The stream is either corrupted or malicious, and should not be processed.
                         // ~keep
 
-                        tracing::error!(
-                            filter = "FlateDecode",
-                            zlib_error = %e,
-                            deflate_error = %deflate_err,
-                            "all recovery strategies failed; stream labeled as FlateDecode but \
-                             cannot be decompressed, which violates PDF spec"
-                        );
-
                         Err(Error::Decode(format!(
                             "FlateDecode decompression failed: stream is labeled as compressed but all decompression attempts failed. \
                             This violates PDF Spec ISO 32000-1:2008, Section 7.3.8.2. \

@@ -61,6 +61,13 @@ pub(crate) async fn process_images_with_ocr(
     let ocr_config = config.ocr.as_ref().unwrap();
     let output_format = config.output_format.clone();
     let acceleration = ocr_config.acceleration.clone();
+    // GH#1554: `OcrConfig::security_limits` has no other way to reach a caller's configured
+    // limits — the `OcrBackend::process_image` trait method takes only `OcrConfig`, not
+    // `ExtractionConfig` — so it must be copied onto each per-image clone here, mirroring
+    // `acceleration` immediately above. `ExtractionConfig::security_limits` is the source of
+    // truth; a backend seeing `None` here must fall back to `SecurityLimits::default()`,
+    // never disable the check. ~keep
+    let security_limits = config.security_limits.clone();
 
     use std::collections::VecDeque;
     use tokio::task::JoinSet;
@@ -77,6 +84,7 @@ pub(crate) async fn process_images_with_ocr(
         let mut ocr_config_clone = ocr_config.clone();
         ocr_config_clone.output_format = Some(output_format.clone());
         ocr_config_clone.acceleration = acceleration.clone();
+        ocr_config_clone.security_limits = security_limits.clone();
         pending.push_back((idx, image_data, ocr_config_clone));
     }
 
@@ -187,6 +195,101 @@ mod tests {
     struct GatedBackend {
         calls: Arc<AtomicUsize>,
         gate: Arc<Notify>,
+    }
+
+    const SECURITY_LIMITS_CAPTURE_BACKEND_NAME: &str = "security-limits-capture-test-backend";
+
+    /// Captures the `security_limits` on the `OcrConfig` it receives, so the test can assert
+    /// on what actually reached the backend rather than trusting the caller's intent.
+    struct SecurityLimitsCaptureBackend {
+        observed_max_content_size: Arc<std::sync::Mutex<Option<Option<usize>>>>,
+    }
+
+    impl Plugin for SecurityLimitsCaptureBackend {
+        fn name(&self) -> &str {
+            SECURITY_LIMITS_CAPTURE_BACKEND_NAME
+        }
+
+        fn version(&self) -> String {
+            "1.0.0".to_string()
+        }
+
+        fn initialize(&self) -> crate::Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&self) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl OcrBackend for SecurityLimitsCaptureBackend {
+        async fn process_image(&self, _image_bytes: &[u8], config: &OcrConfig) -> crate::Result<ExtractedDocument> {
+            let observed = config.security_limits.as_ref().map(|limits| limits.max_content_size);
+            *self.observed_max_content_size.lock().unwrap() = Some(observed);
+            Ok(ExtractedDocument::default())
+        }
+
+        fn supports_language(&self, _lang: &str) -> bool {
+            true
+        }
+
+        fn backend_type(&self) -> OcrBackendType {
+            OcrBackendType::Custom
+        }
+    }
+
+    /// GH#1554 regression: `ExtractionConfig::security_limits` must reach the `OcrConfig`
+    /// handed to `OcrBackend::process_image` for embedded-image OCR (DOCX/PPTX/etc.), the
+    /// same way `OcrConfig::acceleration` already does. Before this fix, `OcrConfig` had no
+    /// `security_limits` field at all, so a caller's configured, possibly higher, limit could
+    /// never reach a backend through this path — every backend silently decoded under
+    /// `SecurityLimits::default()` regardless of what the caller configured.
+    #[tokio::test]
+    async fn extraction_config_security_limits_reach_embedded_image_ocr_config() {
+        let observed_max_content_size = Arc::new(std::sync::Mutex::new(None));
+        crate::plugins::register_ocr_backend(Arc::new(SecurityLimitsCaptureBackend {
+            observed_max_content_size: Arc::clone(&observed_max_content_size),
+        }))
+        .expect("register security-limits capture OCR backend");
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = crate::plugins::unregister_ocr_backend(SECURITY_LIMITS_CAPTURE_BACKEND_NAME);
+            }
+        }
+        let _guard = Guard;
+
+        let configured_limit = 200 * 1024 * 1024;
+        let config = crate::core::config::ExtractionConfig {
+            ocr: Some(OcrConfig {
+                backend: SECURITY_LIMITS_CAPTURE_BACKEND_NAME.to_string(),
+                ..Default::default()
+            }),
+            security_limits: Some(crate::extractors::security::SecurityLimits {
+                max_content_size: configured_limit,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let images = vec![ExtractedImage {
+            data: Bytes::from_static(b"image"),
+            ..Default::default()
+        }];
+        let mut warnings = Vec::new();
+
+        process_images_with_ocr(images, &config, &mut warnings)
+            .await
+            .expect("embedded-image OCR must succeed");
+
+        assert!(warnings.is_empty());
+        let observed = observed_max_content_size.lock().unwrap();
+        assert_eq!(
+            *observed,
+            Some(Some(configured_limit)),
+            "OcrConfig::security_limits must carry the caller's ExtractionConfig::security_limits"
+        );
     }
 
     struct PolicyIgnoringBackend;

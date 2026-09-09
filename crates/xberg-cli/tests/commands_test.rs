@@ -27,6 +27,35 @@ fn get_test_file(relative_path: &str) -> String {
 }
 
 #[test]
+fn doctor_json_reports_sorted_ocr_capabilities_and_layout_checks() {
+    let output = Command::new(get_binary_path())
+        .args(["doctor", "--no-config-discovery", "--format", "json"])
+        .output()
+        .expect("failed to execute doctor command");
+    assert!(
+        output.status.success(),
+        "doctor failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("doctor stdout must be valid JSON");
+    let checks = report["checks"].as_array().expect("doctor JSON must contain checks");
+    let ocr_names: Vec<_> = checks
+        .iter()
+        .filter_map(|check| check["name"].as_str())
+        .filter(|name| name.starts_with("ocr."))
+        .collect();
+    let mut sorted = ocr_names.clone();
+    sorted.sort_unstable();
+    assert_eq!(ocr_names, sorted, "OCR capability checks must have deterministic order");
+    assert!(!ocr_names.is_empty(), "doctor must describe the OCR capability shape");
+    #[cfg(feature = "ocr")]
+    assert!(checks.iter().any(|check| check["name"] == "ocr.tesseract"));
+    #[cfg(feature = "layout-detection")]
+    assert!(checks.iter().any(|check| check["name"] == "layout.rtdetr"));
+}
+
+#[test]
 fn test_extract_text_file() {
     let test_file = get_test_file("text/simple.txt");
     if !PathBuf::from(&test_file).exists() {
@@ -352,6 +381,11 @@ fn test_batch_multiple_files() {
     );
     assert!(json["results"].is_array(), "'results' should be a JSON array");
     assert_eq!(json["results"].as_array().unwrap().len(), 2, "Should have 2 results");
+    assert_eq!(
+        json.get("errors"),
+        None,
+        "all-success output must keep the existing envelope shape"
+    );
 }
 
 #[test]
@@ -375,6 +409,178 @@ fn test_batch_with_missing_file() {
         stderr.contains("File not found") || stderr.contains("Invalid file"),
         "Error should mention file not found, got: {}",
         stderr
+    );
+}
+
+#[test]
+fn batch_json_should_preserve_successes_and_report_every_extraction_error() {
+    let directory = tempdir().expect("failed to create temporary directory");
+    let valid = directory.path().join("valid.txt");
+    let invalid_one = directory.path().join("invalid-one.pdf");
+    let invalid_two = directory.path().join("invalid-two.pdf");
+    std::fs::write(&valid, "successful batch input").expect("failed to write valid input");
+    std::fs::write(&invalid_one, b"%PDF-1.7\ninvalid one").expect("failed to write first invalid input");
+    std::fs::write(&invalid_two, b"%PDF-1.7\ninvalid two").expect("failed to write second invalid input");
+
+    let output = Command::new(get_binary_path())
+        .arg("batch")
+        .arg(&valid)
+        .arg(&invalid_one)
+        .arg(&invalid_two)
+        .args(["--format", "json"])
+        .output()
+        .expect("failed to execute batch command");
+
+    assert!(
+        !output.status.success(),
+        "a partial batch failure must return a non-zero status"
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("partial batch stdout must remain a valid JSON envelope");
+    let results = json["results"].as_array().expect("batch envelope must contain results");
+    assert_eq!(
+        results.len(),
+        1,
+        "the successful input must remain in the batch envelope"
+    );
+    assert_eq!(results[0]["content"], "successful batch input");
+
+    let timings = json["per_file_ms"]
+        .as_array()
+        .expect("batch envelope must contain per-input timings");
+    assert_eq!(timings.len(), 3, "timings must stay aligned with all requested inputs");
+    assert!(timings[0].is_number(), "the successful input must retain its timing");
+    assert_eq!(timings[1], serde_json::Value::Null);
+    assert_eq!(timings[2], serde_json::Value::Null);
+
+    let errors = json["errors"]
+        .as_array()
+        .expect("partial batch envelope must contain errors");
+    let actual_errors: Vec<(u64, &str)> = errors
+        .iter()
+        .map(|error| {
+            (
+                error["index"]
+                    .as_u64()
+                    .expect("error index must be an unsigned integer"),
+                error["source"].as_str().expect("error source must be a string"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        actual_errors,
+        vec![(1, invalid_one.to_str().unwrap()), (2, invalid_two.to_str().unwrap())],
+        "errors must retain input order and source attribution"
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr must be UTF-8");
+    assert!(
+        stderr.contains("input 1"),
+        "stderr must attribute the first failed input index"
+    );
+    assert!(
+        stderr.contains(invalid_one.to_str().unwrap()),
+        "stderr must attribute the first failed source"
+    );
+    assert!(
+        stderr.contains("input 2"),
+        "stderr must attribute the second failed input index"
+    );
+    assert!(
+        stderr.contains(invalid_two.to_str().unwrap()),
+        "stderr must attribute the second failed source"
+    );
+}
+
+#[test]
+fn batch_text_should_preserve_successes_and_report_every_extraction_error() {
+    let directory = tempdir().expect("failed to create temporary directory");
+    let valid = directory.path().join("valid.txt");
+    let invalid_one = directory.path().join("invalid-one.pdf");
+    let invalid_two = directory.path().join("invalid-two.pdf");
+    std::fs::write(&valid, "successful batch input").expect("failed to write valid input");
+    std::fs::write(&invalid_one, b"%PDF-1.7\ninvalid one").expect("failed to write first invalid input");
+    std::fs::write(&invalid_two, b"%PDF-1.7\ninvalid two").expect("failed to write second invalid input");
+
+    let output = Command::new(get_binary_path())
+        .arg("batch")
+        .arg(&valid)
+        .arg(&invalid_one)
+        .arg(&invalid_two)
+        .args(["--format", "text"])
+        .output()
+        .expect("failed to execute batch command");
+
+    assert!(
+        !output.status.success(),
+        "a partial batch failure must return a non-zero status"
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout must be UTF-8");
+    assert_eq!(
+        stdout.matches("successful batch input").count(),
+        1,
+        "the successful input must be emitted once"
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr must be UTF-8");
+    assert!(
+        stderr.contains("input 1"),
+        "stderr must attribute the first failed input index"
+    );
+    assert!(
+        stderr.contains(invalid_one.to_str().unwrap()),
+        "stderr must attribute the first failed source"
+    );
+    assert!(
+        stderr.contains("input 2"),
+        "stderr must attribute the second failed input index"
+    );
+    assert!(
+        stderr.contains(invalid_two.to_str().unwrap()),
+        "stderr must attribute the second failed source"
+    );
+}
+
+#[test]
+fn batch_toon_should_preserve_successes_and_report_every_extraction_error() {
+    let directory = tempdir().expect("failed to create temporary directory");
+    let valid = directory.path().join("valid.txt");
+    let invalid = directory.path().join("invalid.pdf");
+    std::fs::write(&valid, "successful batch input").expect("failed to write valid input");
+    std::fs::write(&invalid, b"%PDF-1.7\ninvalid").expect("failed to write invalid input");
+
+    let output = Command::new(get_binary_path())
+        .arg("batch")
+        .arg(&valid)
+        .arg(&invalid)
+        .args(["--format", "toon"])
+        .output()
+        .expect("failed to execute batch command");
+
+    assert!(
+        !output.status.success(),
+        "a partial batch failure must return a non-zero status"
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout must be UTF-8");
+    for expected in [
+        "results",
+        "successful batch input",
+        "per_file_ms",
+        "errors",
+        "index",
+        "source",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "partial batch TOON must contain {expected:?}; got {stdout:?}"
+        );
+    }
+    assert!(
+        stdout.contains(invalid.to_str().unwrap()),
+        "TOON error must retain source attribution"
     );
 }
 

@@ -159,6 +159,20 @@ public class PdfTextRepairTests
         Assert.Equal("Wow!", PdfTextRepair.RepairContextualLigatures("Wow!"));
         Assert.Equal("Hello! World", PdfTextRepair.RepairContextualLigatures("Hello! World"));
     }
+
+    /// <summary>
+    /// Upstream <c>fix(pdf): stop rewriting ':' and 'M' as t-ligatures</c> (xberg-io/xberg#1556).
+    /// The <c>:</c> → ti and <c>M</c> → tti arms were introduced behind a per-font broken-CMap
+    /// signal and left unconditional when it went away, so they corrupted ordinary text:
+    /// both characters occur constantly in ratios, times, URLs, units like "nM" and identifiers.
+    /// </summary>
+    [Theory]
+    [InlineData("aMb")]
+    [InlineData("ges:one")]
+    [InlineData("progeM")]
+    [InlineData("ratio:x")]
+    public void ColonAndUppercaseMAreNeverRewritten(string text) =>
+        Assert.Equal(text, PdfTextRepair.RepairContextualLigatures(text));
 }
 
 /// <summary>

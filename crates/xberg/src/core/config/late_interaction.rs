@@ -17,6 +17,7 @@ use std::path::PathBuf;
 /// local ONNX ColBERT model.
 ///
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LateInteractionConfig {
     /// The late-interaction model to use (defaults to the "gte-moderncolbert" preset).
     #[serde(
@@ -88,7 +89,7 @@ impl Default for LateInteractionConfig {
 /// Late-interaction model types supported by Xberg.
 ///
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LateInteractionModelType {
     /// Use a preset ColBERT model (recommended).
     Preset {
@@ -192,5 +193,11 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let back: LateInteractionConfig = serde_json::from_str(&json).unwrap();
         assert!(matches!(back.model, LateInteractionModelType::Custom { model_id, .. } if model_id == "org/colbert"));
+    }
+
+    #[test]
+    fn model_type_rejects_unknown_fields() {
+        let json = r#"{"type":"preset","name":"gte-moderncolbert","extra_name":"other"}"#;
+        assert!(serde_json::from_str::<LateInteractionModelType>(json).is_err());
     }
 }

@@ -26,20 +26,53 @@ use crate::types::{BoundingBox, PdfAnnotation, PdfAnnotationType, ProcessingWarn
 /// read (issue #72). When the document's page count itself cannot be determined,
 /// annotations are empty and a single warning is returned.
 pub(crate) fn extract_annotations(doc: &mut NativeDocument) -> (Vec<PdfAnnotation>, Vec<ProcessingWarning>) {
+    let (annotations, warnings, _) = extract_annotations_matching(doc, None, None, |_, _, _, _| true);
+    (annotations, warnings)
+}
+
+pub(crate) fn extract_visible_free_text_annotations(
+    doc: &mut NativeDocument,
+    eligible_pages: &[bool],
+) -> (Vec<PdfAnnotation>, Vec<ProcessingWarning>) {
+    let excluded_layers = xberg_native_pdf::optional_content::compute_default_off_ocgs(&doc.doc);
+    let (annotations, warnings, _) = extract_annotations_matching(
+        doc,
+        Some(excluded_layers),
+        Some(eligible_pages),
+        visible_free_text_annotation,
+    );
+    (annotations, warnings)
+}
+
+fn extract_annotations_matching(
+    doc: &mut NativeDocument,
+    excluded_layers: Option<std::collections::HashSet<String>>,
+    eligible_pages: Option<&[bool]>,
+    include: impl Fn(
+        &xberg_native_pdf::PdfDocument,
+        &xberg_native_pdf::Annotation,
+        Option<(f32, f32, f32, f32)>,
+        &std::collections::HashSet<String>,
+    ) -> bool,
+) -> (Vec<PdfAnnotation>, Vec<ProcessingWarning>, usize) {
     let page_count = match doc.doc.page_count() {
         Ok(count) => count,
         Err(e) => {
             tracing::debug!("xberg_native_pdf: failed to get page count for annotations: {e}");
-            return (Vec::new(), vec![page_count_failure_warning(&e)]);
+            return (Vec::new(), vec![page_count_failure_warning(&e)], 0);
         }
     };
 
     let mut annotations = Vec::new();
     let mut warnings = Vec::new();
+    let needs_visibility = excluded_layers.is_some();
+    let excluded_layers = excluded_layers.unwrap_or_default();
 
     for page_index in 0..page_count {
+        if eligible_pages.is_some_and(|pages| !pages.get(page_index).copied().unwrap_or(false)) {
+            continue;
+        }
         let page_number = (page_index + 1) as u32;
-
         let page_annotations = match doc.doc.get_annotations(page_index) {
             Ok(annots) => annots,
             Err(e) => {
@@ -48,12 +81,37 @@ pub(crate) fn extract_annotations(doc: &mut NativeDocument) -> (Vec<PdfAnnotatio
                 continue;
             }
         };
+        if page_annotations.is_empty() {
+            continue;
+        }
+
+        let visible_page_box = if needs_visibility {
+            match doc.doc.get_page_info(page_index) {
+                Ok(page) => {
+                    let visible = page.crop_box.unwrap_or(page.media_box);
+                    Some((
+                        visible.x,
+                        visible.y,
+                        visible.x + visible.width,
+                        visible.y + visible.height,
+                    ))
+                }
+                Err(error) => {
+                    warnings.push(page_geometry_failure_warning(page_number, &error));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
 
         for annot in page_annotations {
-            if matches!(
-                annot.subtype_enum,
-                xberg_native_pdf::AnnotationSubtype::Widget | xberg_native_pdf::AnnotationSubtype::Popup
-            ) {
+            if !include(&doc.doc, &annot, visible_page_box, &excluded_layers)
+                || matches!(
+                    annot.subtype_enum,
+                    xberg_native_pdf::AnnotationSubtype::Widget | xberg_native_pdf::AnnotationSubtype::Popup
+                )
+            {
                 continue;
             }
 
@@ -96,7 +154,79 @@ pub(crate) fn extract_annotations(doc: &mut NativeDocument) -> (Vec<PdfAnnotatio
         }
     }
 
-    (annotations, warnings)
+    (annotations, warnings, page_count)
+}
+
+fn visible_free_text_annotation(
+    doc: &xberg_native_pdf::PdfDocument,
+    annotation: &xberg_native_pdf::Annotation,
+    visible_page_box: Option<(f32, f32, f32, f32)>,
+    excluded_layers: &std::collections::HashSet<String>,
+) -> bool {
+    if annotation.subtype_enum != xberg_native_pdf::AnnotationSubtype::FreeText
+        || annotation.flags.is_invisible()
+        || annotation.flags.is_hidden()
+        || annotation.flags.contains(xberg_native_pdf::AnnotationFlags::NO_VIEW)
+        || annotation
+            .opacity
+            .is_some_and(|opacity| !opacity.is_finite() || opacity <= 0.0)
+    {
+        return false;
+    }
+
+    let (Some(rect), Some(visible_page_box)) = (annotation.rect, visible_page_box) else {
+        return false;
+    };
+    if !rect_has_visible_page_area(rect, visible_page_box) {
+        return false;
+    }
+
+    if annotation
+        .raw_dict
+        .as_ref()
+        .and_then(|dictionary| dictionary.get("OC"))
+        .is_some_and(|optional_content| {
+            xberg_native_pdf::optional_content::annotation_is_excluded(optional_content, doc, excluded_layers)
+        })
+    {
+        return false;
+    }
+
+    let Some(dictionary) = annotation.raw_dict.as_ref() else {
+        return true;
+    };
+    if !dictionary.contains_key("AP") {
+        return true;
+    }
+    let Some(contents) = annotation.contents.as_deref().map(normalize_annotation_text) else {
+        return false;
+    };
+    doc.extract_annotation_appearance_text(annotation, excluded_layers)
+        .as_deref()
+        .map(normalize_annotation_text)
+        .is_some_and(|appearance| appearance == contents)
+}
+
+fn normalize_annotation_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn rect_has_visible_page_area(rect: [f64; 4], visible_page_box: (f32, f32, f32, f32)) -> bool {
+    let [x0, y0, x1, y1] = rect;
+    let (page_x0, page_y0, page_x1, page_y1) = visible_page_box;
+    let page = [
+        f64::from(page_x0),
+        f64::from(page_y0),
+        f64::from(page_x1),
+        f64::from(page_y1),
+    ];
+    if !rect.into_iter().chain(page).all(f64::is_finite) || x1 == x0 || y1 == y0 {
+        return false;
+    }
+
+    let (left, right) = (x0.min(x1), x0.max(x1));
+    let (bottom, top) = (y0.min(y1), y0.max(y1));
+    left.max(page[0]) < right.min(page[2]) && bottom.max(page[1]) < top.min(page[3])
 }
 
 /// Whether an annotation subtype marks up existing page text via `/QuadPoints`
@@ -192,7 +322,7 @@ fn color_to_hex(components: &[f64]) -> Option<String> {
 
 /// Build the warning for issue #72's document-wide failure mode: the page count
 /// itself could not be determined, so no page could even be attempted.
-fn page_count_failure_warning(error: &xberg_native_pdf::Error) -> ProcessingWarning {
+pub(crate) fn page_count_failure_warning(error: &xberg_native_pdf::Error) -> ProcessingWarning {
     ProcessingWarning {
         source: std::borrow::Cow::Borrowed("pdf_annotations"),
         message: std::borrow::Cow::Owned(format!(
@@ -208,6 +338,16 @@ fn page_annotations_failure_warning(page_number: u32, error: &xberg_native_pdf::
         source: std::borrow::Cow::Borrowed("pdf_annotations"),
         message: std::borrow::Cow::Owned(format!(
             "annotation extraction failed for page {page_number}: {error}; annotations on this page were skipped"
+        )),
+    }
+}
+
+fn page_geometry_failure_warning(page_number: u32, error: &xberg_native_pdf::Error) -> ProcessingWarning {
+    ProcessingWarning {
+        source: std::borrow::Cow::Borrowed("pdf_annotations"),
+        message: std::borrow::Cow::Owned(format!(
+            "annotation visibility could not be determined for page {page_number}: {error}; \
+             annotations on this page were skipped"
         )),
     }
 }
@@ -288,6 +428,19 @@ mod tests {
         assert_eq!(
             warning.message.as_ref(),
             "annotation extraction failed for page 3: Invalid PDF: malformed /Annots array; \
+             annotations on this page were skipped"
+        );
+    }
+
+    #[test]
+    fn test_page_geometry_failure_warning_names_page() {
+        let error = xberg_native_pdf::Error::InvalidPdf("malformed /CropBox".to_string());
+        let warning = page_geometry_failure_warning(4, &error);
+
+        assert_eq!(warning.source.as_ref(), "pdf_annotations");
+        assert_eq!(
+            warning.message.as_ref(),
+            "annotation visibility could not be determined for page 4: Invalid PDF: malformed /CropBox; \
              annotations on this page were skipped"
         );
     }

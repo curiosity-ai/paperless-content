@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Configuration for email extraction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 #[derive(Default)]
 pub struct EmailConfig {
     /// Windows codepage number to use when an MSG file contains no codepage property.

@@ -11,7 +11,7 @@ Command-line interface for the Xberg document intelligence library.
 
 This crate provides a production-ready CLI tool for document extraction, MIME type detection, batch processing, embeddings, chunking, and cache management. It exposes the core extraction capabilities of the Xberg Rust library through an easy-to-use command-line interface.
 
-The CLI supports 100 file formats across 120 file extensions including PDF, DOCX, PPTX, XLSX, images, HTML, and more, with optional OCR support for scanned documents.
+The CLI supports 107 file formats across 141 file extensions including PDF, DOCX, PPTX, XLSX, images, HTML, and more, with optional OCR support for scanned documents.
 
 ## Architecture
 
@@ -70,6 +70,13 @@ Homebrew 6.0+ requires explicit trust for third-party taps. Trust once, then ins
 ```bash
 brew trust xberg-io/tap
 brew install xberg-io/tap/xberg
+```
+
+### Scoop (Windows)
+
+```powershell
+scoop bucket add xberg https://github.com/xberg-io/scoop-bucket
+scoop install xberg
 ```
 
 ### Cargo

@@ -49,6 +49,9 @@ _SCAFFOLDING = re.compile(
 )
 
 _MARKUP = re.compile(r"[#*_`>|]+")
+_MARKDOWN_ESCAPE = re.compile(r"""\\([!"#$%&'()*+,\-./:;<=>?@\[\]^_`{|}~\\])""")
+_BACKTICK_RUN = re.compile(r"`+")
+_FENCE_START = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 _LIST_MARKER = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
 _WS = re.compile(r"\s+")
 
@@ -64,9 +67,32 @@ def emit(message: str = "") -> None:
     print(message)  # noqa: T201 -- stdout IS this tool's output contract
 
 
-def normalise(text: str) -> str:
+def _unescape_markdown_outside_code(text: str) -> str:
+    """Remove Markdown escapes while preserving the contents of backtick code spans."""
+    parts: list[str] = []
+    cursor = 0
+    while opener := _BACKTICK_RUN.search(text, cursor):
+        delimiter = opener.group()
+        close_pattern = re.compile(rf"(?<!`)({re.escape(delimiter)})(?!`)")
+        closer = close_pattern.search(text, opener.end())
+        if closer is None:
+            break
+        parts.append(_MARKDOWN_ESCAPE.sub(r"\1", text[cursor : opener.start()]))
+        parts.append(text[opener.start() : closer.end()])
+        cursor = closer.end()
+    parts.append(_MARKDOWN_ESCAPE.sub(r"\1", text[cursor:]))
+    return "".join(parts)
+
+
+def normalise(text: str, *, unescape_markdown: bool = True) -> str:
     """Collapse a line to its comparable core: no markup, no case, single spaces."""
-    text = _LIST_MARKER.sub("", text)
+    if unescape_markdown:
+        text = _unescape_markdown_outside_code(text)
+    while True:
+        stripped = _LIST_MARKER.sub("", text, count=1)
+        if stripped == text:
+            break
+        text = stripped
     text = _MARKUP.sub(" ", text)
     text = _WS.sub(" ", text)
     return text.strip().casefold()
@@ -75,10 +101,21 @@ def normalise(text: str) -> str:
 def scorable_lines(raw: str) -> list[tuple[str, str]]:
     """Return (original, normalised) for lines carrying enough substance to score."""
     out: list[tuple[str, str]] = []
+    fence: str | None = None
     for line in raw.splitlines():
-        if _SCAFFOLDING.match(line):
+        inside_fence = fence is not None
+        if inside_fence:
+            if re.fullmatch(rf"\s{{0,3}}{re.escape(fence[0])}{{{len(fence)},}}\s*", line):
+                fence = None
+                continue
+            norm = normalise(line, unescape_markdown=False)
+        elif fence_match := _FENCE_START.match(line):
+            fence = fence_match.group(1)
             continue
-        norm = normalise(line)
+        else:
+            norm = normalise(line)
+        if not inside_fence and _SCAFFOLDING.match(line):
+            continue
         if len(norm) < MIN_SCORABLE_CHARS:
             continue
         if not any(character.isalpha() for character in norm):

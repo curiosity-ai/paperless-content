@@ -1,14 +1,11 @@
 //! Assert every e2e fixture's `config` block actually takes effect.
 //!
-//! Only two config structs carry `#[serde(deny_unknown_fields)]` — `ExtractionConfig`
-//! and `UrlExtractionConfig`. Every nested config silently ignores unknown keys, so
-//! `{"chunking":{"maxChars":500}}` deserializes cleanly, the setting never applies, and
-//! the generated e2e test still passes because it asserts on output that looks plausible
-//! either way. A typo'd nested key is invisible at every layer.
+//! Unknown nested keys must be rejected instead of silently doing nothing. The
+//! round-trip audit below provides a second line of defence for generated fixtures.
 //!
-//! This closes that hole without changing runtime behaviour: parse each fixture's config
-//! into the real `ExtractionConfig`, serialize it back, and assert every leaf the fixture
-//! asked for survives the round trip. A key that serde dropped is a key that did nothing.
+//! The fixture audit parses each config into the real `ExtractionConfig`, serializes it
+//! back, and asserts every requested leaf survives the round trip. A key that serde
+//! dropped is a key that did nothing.
 //!
 //! It also catches the subtler variant that bit a fixture-authoring pass: using the Rust
 //! field name where serde declares a different wire name. `ChunkingConfig::max_characters`
@@ -85,33 +82,45 @@ fn lookup<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json
     Some(current)
 }
 
-/// Prove the detector above actually detects — a check that cannot fail is not a check.
-///
-/// Uses a literal config rather than mutating a fixture on disk, because the fixture
-/// corpus is shared with other agents mid-run.
+fn canonical_wire_path(path: &str) -> &str {
+    match path {
+        "chunking.max_characters" => "chunking.max_chars",
+        "chunking.overlap" => "chunking.max_overlap",
+        _ => path,
+    }
+}
+
 #[test]
-fn a_typod_nested_key_is_reported_as_dropped() {
-    // `maxChars` is camelCase; the wire name is `max_chars`. ChunkingConfig does not
-    // deny unknown fields, so this parses cleanly and the setting never applies.
-    let typod = serde_json::json!({"chunking": {"chunker_type": "markdown", "maxChars": 500}});
-    let parsed: ExtractionConfig = serde_json::from_value(typod.clone()).expect("parses despite the typo");
-    let round_tripped = serde_json::to_value(&parsed).expect("serializes");
+fn nested_config_typos_are_rejected() {
+    let cases = [
+        ("chunking", serde_json::json!({"chunking": {"maxChars": 500}})),
+        (
+            "security_limits",
+            serde_json::json!({"security_limits": {"max_archive_bytes": 500}}),
+        ),
+        ("ocr", serde_json::json!({"ocr": {"backnd": "tesseract"}})),
+        (
+            "tesseract",
+            serde_json::json!({"ocr": {"tesseract_config": {"psn": 6}}}),
+        ),
+        (
+            "preprocessing",
+            serde_json::json!({"ocr": {"tesseract_config": {"preprocessing": {"deskeww": true}}}}),
+        ),
+        (
+            "pdf_options",
+            serde_json::json!({"pdf_options": {"pdf_backend": "pdfium"}}),
+        ),
+    ];
 
-    let mut requested = Vec::new();
-    leaves(&typod, "", &mut requested);
-
-    let dropped: Vec<&String> = requested
-        .iter()
-        .filter(|(path, wanted)| lookup(&round_tripped, path) != Some(wanted))
-        .map(|(path, _)| path)
-        .collect();
-
-    assert_eq!(
-        dropped,
-        vec!["chunking.maxChars"],
-        "the round-trip check must flag `chunking.maxChars` as dropped and leave the valid \
-         `chunker_type` alone; got {dropped:?}"
-    );
+    for (name, value) in cases {
+        let error = serde_json::from_value::<ExtractionConfig>(value)
+            .expect_err("a nested config typo must fail deserialization");
+        assert!(
+            error.to_string().contains("unknown field"),
+            "{name} typo returned the wrong error: {error}"
+        );
+    }
 }
 
 #[test]
@@ -159,7 +168,7 @@ fn every_fixture_config_key_survives_a_round_trip() {
         leaves(config_json, "", &mut requested);
 
         for (leaf_path, wanted) in requested {
-            match lookup(&round_tripped, &leaf_path) {
+            match lookup(&round_tripped, canonical_wire_path(&leaf_path)) {
                 Some(got) if got == &wanted => {}
                 Some(got) => failures.push(format!(
                     "{}: `{leaf_path}` round-tripped to {got} instead of {wanted}",

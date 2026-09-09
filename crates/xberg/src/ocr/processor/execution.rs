@@ -9,11 +9,17 @@ use super::validation::{
     resolve_all_installed_languages, resolve_tessdata_path, strip_control_characters, validate_language_and_traineddata,
 };
 use crate::core::config::ExtractionConfig;
+use crate::extractors::security::SecurityLimits;
 use crate::image::normalize_image_dpi_owned;
 use crate::ocr::cache::OcrCache;
 use crate::ocr::conversion::{TsvRow, iterator_word_to_element, tsv_row_to_element};
 use crate::ocr::error::OcrError;
-use crate::ocr::hocr_parser::{DictionaryLineFilter, parse_hocr_to_internal_document_with_page_offset};
+use crate::ocr::hocr_parser::{
+    DictionaryLineFilter, RetainedWordConfidenceStats, parse_hocr_to_internal_document_with_page_offset_and_stats,
+};
+use crate::ocr::preprocessing::preprocess_pix;
+#[cfg(test)]
+use crate::ocr::preprocessing::should_invert_for_polarity;
 #[cfg(feature = "pdf")]
 use crate::ocr::table::post_process_table;
 use crate::ocr::table::{extract_words_from_tsv, reconstruct_table, table_to_markdown};
@@ -378,6 +384,44 @@ fn flatten_hocr_elements_to_text(elements: &[crate::types::internal::InternalEle
         .join("\n\n")
 }
 
+/// Drop hOCR paragraph elements whose text was already claimed by a detected table (#1571).
+///
+/// `hocr_document` is parsed straight from the raw hOCR before table detection runs, so
+/// nothing ever removes a table's words from it once `tables` is computed: every consumer
+/// built from `internal_document` (the PDF mixed/OCR-only routes and the standalone image
+/// route) receives the table's text twice, once as ordinary paragraphs and once as the
+/// `OcrTable`. `build_content_with_inline_tables` already solves this for the rendered
+/// `content` string using a word-centre-in-bbox test; apply the same test here at the
+/// paragraph level, using the paragraph's own bbox centre, so `internal_document` agrees
+/// with `content` regardless of `output_format` (the string rebuild above is skipped for
+/// Plain/Djot output, but the duplication it was masking is not). ~keep
+fn filter_elements_covered_by_tables(
+    elements: Vec<crate::types::internal::InternalElement>,
+    tables: &[OcrTable],
+) -> Vec<crate::types::internal::InternalElement> {
+    let table_bboxes: Vec<_> = tables.iter().filter_map(|t| t.bounding_box.as_ref()).collect();
+    if table_bboxes.is_empty() {
+        return elements;
+    }
+
+    elements
+        .into_iter()
+        .filter(|element| {
+            let Some(bbox) = element.bbox.as_ref() else {
+                return true;
+            };
+            let center_x = (bbox.x0 + bbox.x1) / 2.0;
+            let center_y = (bbox.y0 + bbox.y1) / 2.0;
+            !table_bboxes.iter().any(|table_bbox| {
+                center_x >= table_bbox.left as f64
+                    && center_x <= table_bbox.right as f64
+                    && center_y >= table_bbox.top as f64
+                    && center_y <= table_bbox.bottom as f64
+            })
+        })
+        .collect()
+}
+
 /// Minimum confidence for accepting orientation detection results.
 ///
 /// Keep in sync with `doc_orientation::MIN_CONFIDENCE` (module is feature-gated,
@@ -389,36 +433,6 @@ const MIN_ORIENTATION_CONFIDENCE: f32 = 0.35;
 #[cfg(auto_rotate)]
 const _: () = assert!(MIN_ORIENTATION_CONFIDENCE == crate::doc_orientation::MIN_CONFIDENCE);
 
-/// Grayscale mean (0–255) below which the image is considered background-
-/// dark rather than background-light.
-///
-/// Scanned documents are background-dominated (background typically covers
-/// 85–95% of pixel area), so the grayscale mean tracks background tone far
-/// more than foreground text tone. A mean below this value means most of the
-/// image is dark, i.e. a plausible dark background.
-const DARK_BACKGROUND_MEAN_THRESHOLD: f64 = 100.0;
-
-/// Grayscale value (0–255) at or above which a pixel counts as "light" when
-/// computing the light-pixel fraction used to guard polarity auto-detection.
-const LIGHT_PIXEL_VALUE_THRESHOLD: u8 = 180;
-
-/// Minimum fraction of light pixels required, alongside a dark mean, before
-/// auto-detection treats an image as light-text-on-dark-background.
-///
-/// Without this guard, a naive `mean < threshold` check would also fire on
-/// uniformly dark, non-text images (e.g. a dark photograph or a heavily
-/// shadowed scan) where inverting would corrupt the image rather than fix
-/// it. Real text/foreground content typically covers at least a small
-/// fraction of a page, so requiring *some* light pixels alongside the dark
-/// mean distinguishes "light text on a dark background" from "uniformly
-/// dark image".
-const MIN_LIGHT_PIXEL_FRACTION_FOR_INVERT: f64 = 0.01;
-
-/// Sampling grid spacing (pixels) used when computing polarity statistics.
-/// Keeps polarity detection cheap on large scans while remaining
-/// representative.
-const POLARITY_SAMPLE_STRIDE: i32 = 4;
-
 /// Source resolution assumed when OCR receives the original image unchanged and the caller did
 /// not tell us what resolution it really is.
 ///
@@ -427,14 +441,27 @@ const POLARITY_SAMPLE_STRIDE: i32 = 4;
 const RAW_IMAGE_SOURCE_DPI: i32 = 72;
 /// Source resolution retained when explicit DPI normalization fails.
 const PREPROCESSING_FALLBACK_SOURCE_DPI: i32 = 300;
-/// Pixel stride used to classify whether an image resembles a clean document page.
+/// Pixel stride used by phase-sensitive classifier regression fixtures.
+#[cfg(test)]
 const DEFAULT_PREPROCESSING_SAMPLE_STRIDE: usize = 4;
 /// Minimum normalized mean luminance for automatic document-page preprocessing.
 const CLEAN_PAGE_MEAN_LUMINANCE_THRESHOLD: f64 = 0.90;
 /// Normalized luminance at which a sampled pixel counts as near-white.
 const CLEAN_PAGE_LIGHT_PIXEL_THRESHOLD: f64 = 0.90;
+/// Minimum summed RGB channel value equivalent to the light-pixel threshold.
+const CLEAN_PAGE_LIGHT_CHANNEL_SUM_THRESHOLD: u16 =
+    (CLEAN_PAGE_LIGHT_PIXEL_THRESHOLD * RGB_CHANNEL_MAX * RGB_CHANNEL_COUNT as f64).ceil() as u16;
 /// Minimum near-white sample fraction for automatic document-page preprocessing.
 const CLEAN_PAGE_LIGHT_PIXEL_FRACTION_THRESHOLD: f64 = 0.80;
+/// Minimum separation between background and foreground luminance modes. ~keep
+const CLEAN_PAGE_MIN_FOREGROUND_CONTRAST: f64 = 0.20;
+/// Minimum image fraction required before a lower foreground mode counts as significant. ~keep
+const CLEAN_PAGE_DARK_PIXEL_FRACTION_THRESHOLD: f64 = 0.005;
+/// Minimum population required for the lower foreground mode on small rasters. ~keep
+const CLEAN_PAGE_DARK_PIXEL_COUNT_THRESHOLD: usize = 8;
+const CLEAN_PAGE_TEXT_COMPONENT_MAX_FILL_NUMERATOR: usize = 3;
+const CLEAN_PAGE_TEXT_COMPONENT_MAX_FILL_DENOMINATOR: usize = 4;
+const CLEAN_PAGE_TEXT_COMPONENT_MIN_NARROW_ASPECT_RATIO: usize = 3;
 /// Maximum value of an 8-bit RGB channel.
 const RGB_CHANNEL_MAX: f64 = u8::MAX as f64;
 /// Number of channels in an RGB pixel.
@@ -446,6 +473,7 @@ struct PreparedOcrImage {
     height: u32,
     source_dpi: i32,
     apply_pix_preprocessing: bool,
+    preprocessing: Option<crate::types::ImagePreprocessingConfig>,
     image_preprocessing: Option<crate::types::ImagePreprocessingMetadata>,
 }
 
@@ -466,7 +494,7 @@ fn prepare_ocr_image(
     known_source_dpi: Option<f64>,
 ) -> PreparedOcrImage {
     let Some(preprocessing) = preprocessing else {
-        if should_apply_default_preprocessing(&rgb_data) {
+        if should_apply_default_preprocessing(&rgb_data, width, height) {
             return prepare_preprocessed_ocr_image(
                 rgb_data,
                 width,
@@ -485,6 +513,7 @@ fn prepare_ocr_image(
             // says it is; 72 remains the assumption only when nobody knows.
             source_dpi: known_source_dpi.map_or(RAW_IMAGE_SOURCE_DPI, |dpi| dpi.round() as i32),
             apply_pix_preprocessing: false,
+            preprocessing: None,
             image_preprocessing: None,
         };
     };
@@ -501,28 +530,225 @@ fn prepare_ocr_image(
 }
 
 /// Classify bright, page-like RGB images that benefit from the default OCR preprocessing path.
-fn should_apply_default_preprocessing(rgb_data: &[u8]) -> bool {
-    let mut luminance_sum = 0.0;
-    let mut light_pixels = 0usize;
-    let mut sample_count = 0usize;
-
-    for pixel in rgb_data
-        .chunks_exact(RGB_CHANNEL_COUNT)
-        .step_by(DEFAULT_PREPROCESSING_SAMPLE_STRIDE)
-    {
-        let luminance =
-            pixel.iter().map(|channel| f64::from(*channel)).sum::<f64>() / (RGB_CHANNEL_MAX * RGB_CHANNEL_COUNT as f64);
-        luminance_sum += luminance;
-        light_pixels += usize::from(luminance >= CLEAN_PAGE_LIGHT_PIXEL_THRESHOLD);
-        sample_count += 1;
-    }
-
-    if sample_count == 0 {
+fn should_apply_default_preprocessing(rgb_data: &[u8], width: u32, height: u32) -> bool {
+    let Some(pixel_count) = (width as usize).checked_mul(height as usize) else {
+        return false;
+    };
+    let Some(expected_len) = pixel_count.checked_mul(RGB_CHANNEL_COUNT) else {
+        return false;
+    };
+    if pixel_count == 0 || rgb_data.len() != expected_len {
         return false;
     }
-    let sample_count = sample_count as f64;
-    luminance_sum / sample_count >= CLEAN_PAGE_MEAN_LUMINANCE_THRESHOLD
-        && light_pixels as f64 / sample_count >= CLEAN_PAGE_LIGHT_PIXEL_FRACTION_THRESHOLD
+
+    let mut channel_sum = 0u128;
+    let mut light_channel_sum = 0u128;
+    let mut foreground_channel_sum = 0u128;
+    let mut light_pixels = 0usize;
+    let mut foreground_pixels = 0usize;
+    let mut foreground_histogram = [0usize; 256];
+
+    for pixel in rgb_data.chunks_exact(RGB_CHANNEL_COUNT) {
+        let pixel_channel_sum = u16::from(pixel[0]) + u16::from(pixel[1]) + u16::from(pixel[2]);
+        channel_sum += u128::from(pixel_channel_sum);
+        if pixel_channel_sum >= CLEAN_PAGE_LIGHT_CHANNEL_SUM_THRESHOLD {
+            light_channel_sum += u128::from(pixel_channel_sum);
+            light_pixels += 1;
+        } else {
+            foreground_channel_sum += u128::from(pixel_channel_sum);
+            foreground_pixels += 1;
+            foreground_histogram[((pixel_channel_sum + 1) / RGB_CHANNEL_COUNT as u16) as usize] += 1;
+        }
+    }
+    let pixel_count_f64 = pixel_count as f64;
+    let max_pixel_channel_sum = RGB_CHANNEL_MAX * RGB_CHANNEL_COUNT as f64;
+    if channel_sum as f64 / (pixel_count_f64 * max_pixel_channel_sum) < CLEAN_PAGE_MEAN_LUMINANCE_THRESHOLD
+        || light_pixels as f64 / pixel_count_f64 < CLEAN_PAGE_LIGHT_PIXEL_FRACTION_THRESHOLD
+    {
+        return false;
+    }
+    if foreground_pixels == 0 {
+        return true;
+    }
+
+    let background_luminance = light_channel_sum as f64 / (light_pixels as f64 * max_pixel_channel_sum);
+    let foreground_luminance = foreground_channel_sum as f64 / (foreground_pixels as f64 * max_pixel_channel_sum);
+    if background_luminance - foreground_luminance >= CLEAN_PAGE_MIN_FOREGROUND_CONTRAST {
+        return true;
+    }
+
+    let Some((lower_mode_max, lower_mode_pixels)) = foreground_lower_mode(&foreground_histogram) else {
+        return false;
+    };
+    lower_mode_pixels >= CLEAN_PAGE_DARK_PIXEL_COUNT_THRESHOLD
+        && lower_mode_pixels as f64 / pixel_count_f64 >= CLEAN_PAGE_DARK_PIXEL_FRACTION_THRESHOLD
+        && lower_mode_has_text_structure(
+            rgb_data,
+            width as usize,
+            height as usize,
+            lower_mode_max,
+            lower_mode_pixels,
+        )
+}
+
+fn foreground_lower_mode(histogram: &[usize; 256]) -> Option<(u8, usize)> {
+    let total_count: usize = histogram.iter().sum();
+    let total_weight: u128 = histogram
+        .iter()
+        .enumerate()
+        .map(|(value, count)| value as u128 * *count as u128)
+        .sum();
+    let mut lower_count = 0usize;
+    let mut lower_weight = 0u128;
+    let mut best: Option<(f64, u8, usize, f64, f64)> = None;
+
+    for (threshold, &count) in histogram.iter().enumerate().take(u8::MAX as usize) {
+        lower_count += count;
+        lower_weight += threshold as u128 * count as u128;
+        let upper_count = total_count - lower_count;
+        if lower_count == 0 || upper_count == 0 {
+            continue;
+        }
+        let lower_mean = lower_weight as f64 / lower_count as f64;
+        let upper_mean = (total_weight - lower_weight) as f64 / upper_count as f64;
+        let separation = upper_mean - lower_mean;
+        let between_class_variance = lower_count as f64 * upper_count as f64 * separation * separation;
+        if best
+            .as_ref()
+            .is_none_or(|(variance, ..)| between_class_variance > *variance)
+        {
+            best = Some((
+                between_class_variance,
+                threshold as u8,
+                lower_count,
+                lower_mean,
+                upper_mean,
+            ));
+        }
+    }
+
+    let (_, threshold, lower_count, lower_mean, upper_mean) = best?;
+    ((upper_mean - lower_mean) / RGB_CHANNEL_MAX >= CLEAN_PAGE_MIN_FOREGROUND_CONTRAST)
+        .then_some((threshold, lower_count))
+}
+
+fn lower_mode_has_text_structure(
+    rgb_data: &[u8],
+    width: usize,
+    height: usize,
+    lower_mode_max: u8,
+    lower_mode_pixels: usize,
+) -> bool {
+    let Some(pixel_count) = width.checked_mul(height) else {
+        return false;
+    };
+    let lower_mode_mask: Vec<bool> = rgb_data
+        .chunks_exact(RGB_CHANNEL_COUNT)
+        .map(|pixel| {
+            let channel_sum = u16::from(pixel[0]) + u16::from(pixel[1]) + u16::from(pixel[2]);
+            (channel_sum + 1) / RGB_CHANNEL_COUNT as u16 <= u16::from(lower_mode_max)
+        })
+        .collect();
+    if lower_mode_mask.len() != pixel_count {
+        return false;
+    }
+
+    let mut visited = vec![false; pixel_count];
+    let mut component_stack = Vec::new();
+    let mut structured_pixels = 0usize;
+    for start in 0..pixel_count {
+        if !lower_mode_mask[start] || visited[start] {
+            continue;
+        }
+        let component_pixels = structured_component_size(
+            &lower_mode_mask,
+            &mut visited,
+            &mut component_stack,
+            start,
+            width,
+            height,
+        );
+        let Some(total) = structured_pixels.checked_add(component_pixels) else {
+            return false;
+        };
+        structured_pixels = total;
+    }
+    structured_pixels >= lower_mode_pixels.div_ceil(2)
+}
+
+fn structured_component_size(
+    mask: &[bool],
+    visited: &mut [bool],
+    stack: &mut Vec<usize>,
+    start: usize,
+    width: usize,
+    height: usize,
+) -> usize {
+    stack.clear();
+    stack.push(start);
+    visited[start] = true;
+    let (mut min_x, mut max_x) = (start % width, start % width);
+    let (mut min_y, mut max_y) = (start / width, start / width);
+    let mut size = 0usize;
+
+    while let Some(index) = stack.pop() {
+        let Some(next_size) = size.checked_add(1) else {
+            return 0;
+        };
+        size = next_size;
+        let x = index % width;
+        let y = index / width;
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+        let left = x.checked_sub(1).and_then(|_| index.checked_sub(1));
+        let right = x
+            .checked_add(1)
+            .filter(|next_x| *next_x < width)
+            .and_then(|_| index.checked_add(1));
+        let above = y.checked_sub(1).and_then(|_| index.checked_sub(width));
+        let below = y
+            .checked_add(1)
+            .filter(|next_y| *next_y < height)
+            .and_then(|_| index.checked_add(width));
+        let neighbors = [left, right, above, below];
+        for neighbor in neighbors.into_iter().flatten() {
+            if mask[neighbor] && !visited[neighbor] {
+                visited[neighbor] = true;
+                stack.push(neighbor);
+            }
+        }
+    }
+
+    if component_is_text_like(size, min_x, max_x, min_y, max_y) {
+        size
+    } else {
+        0
+    }
+}
+
+fn component_is_text_like(size: usize, min_x: usize, max_x: usize, min_y: usize, max_y: usize) -> bool {
+    if min_x >= max_x || min_y >= max_y {
+        return false;
+    }
+    let component_width = max_x - min_x + 1;
+    let component_height = max_y - min_y + 1;
+    let Some(area) = component_width.checked_mul(component_height) else {
+        return false;
+    };
+    let Some(scaled_size) = size.checked_mul(CLEAN_PAGE_TEXT_COMPONENT_MAX_FILL_DENOMINATOR) else {
+        return false;
+    };
+    let Some(maximum_fill) = area.checked_mul(CLEAN_PAGE_TEXT_COMPONENT_MAX_FILL_NUMERATOR) else {
+        return false;
+    };
+    let short_side = component_width.min(component_height);
+    let long_side = component_width.max(component_height);
+    let is_narrow = short_side
+        .checked_mul(CLEAN_PAGE_TEXT_COMPONENT_MIN_NARROW_ASPECT_RATIO)
+        .is_some_and(|minimum_long_side| long_side >= minimum_long_side);
+    scaled_size <= maximum_fill || is_narrow
 }
 
 fn prepare_preprocessed_ocr_image(
@@ -576,6 +802,7 @@ fn prepare_preprocessed_ocr_image(
                 height: normalized_height,
                 source_dpi,
                 apply_pix_preprocessing: true,
+                preprocessing: Some(preprocessing.clone()),
                 image_preprocessing: Some(result.metadata),
             }
         }
@@ -589,62 +816,11 @@ fn prepare_preprocessed_ocr_image(
                 // one. The 300 fallback is a guess for when there is nothing better.
                 source_dpi: known_source_dpi.map_or(PREPROCESSING_FALLBACK_SOURCE_DPI, |dpi| dpi.round() as i32),
                 apply_pix_preprocessing: true,
+                preprocessing: Some(preprocessing.clone()),
                 image_preprocessing: None,
             }
         }
     }
-}
-
-/// Decide whether an image should be inverted before OCR.
-///
-/// `force_invert` mirrors `ImagePreprocessingConfig.invert_colors`: `true`
-/// unconditionally forces inversion (an explicit override for cases where
-/// auto-detection disagrees); `false` (the default) falls back to
-/// auto-detection from `mean_gray` and `light_fraction` — see
-/// `DARK_BACKGROUND_MEAN_THRESHOLD` and `MIN_LIGHT_PIXEL_FRACTION_FOR_INVERT`.
-///
-/// This is a pure function so the polarity decision can be unit-tested
-/// without linking native Tesseract/Leptonica.
-fn should_invert_for_polarity(mean_gray: f64, light_fraction: f64, force_invert: bool) -> bool {
-    force_invert
-        || (mean_gray < DARK_BACKGROUND_MEAN_THRESHOLD && light_fraction >= MIN_LIGHT_PIXEL_FRACTION_FOR_INVERT)
-}
-
-/// Preprocess a raw Pix before handing it to Tesseract.
-///
-/// Order matters: polarity (light-on-dark vs. dark-on-light) is detected and
-/// corrected *first*, because `background_normalize` assumes a light
-/// background and Tesseract's own binarizer assumes dark text on a light
-/// background. `force_invert` mirrors `ImagePreprocessingConfig.invert_colors`
-/// (see [`should_invert_for_polarity`]).
-fn preprocess_pix(pix: xberg_tesseract::Pix, force_invert: bool) -> xberg_tesseract::Result<xberg_tesseract::Pix> {
-    let polarity_stats = pix
-        .to_grayscale()
-        .and_then(|gray| gray.grayscale_stats(LIGHT_PIXEL_VALUE_THRESHOLD, POLARITY_SAMPLE_STRIDE))
-        .ok();
-
-    let invert = match polarity_stats {
-        Some((mean_gray, light_fraction)) => should_invert_for_polarity(mean_gray, light_fraction, force_invert),
-        None => force_invert,
-    };
-
-    let source = if invert {
-        let inverted = pix.invert()?;
-        drop(pix);
-        inverted
-    } else {
-        pix
-    };
-
-    let normalized = source.background_normalize()?;
-    drop(source);
-
-    let sharpened = normalized.unsharp_mask(3, 0.5)?;
-    drop(normalized);
-
-    let grayscale = sharpened.to_grayscale()?;
-    drop(sharpened);
-    Ok(grayscale)
 }
 
 /// Check whether a center point (x, y) lies within a bounding box.
@@ -657,6 +833,7 @@ fn point_in_bbox(x: i32, y: i32, left: i32, top: i32, right: i32, bottom: i32) -
 /// (#192, #180).
 struct IteratorExtractionResult {
     elements: Vec<OcrElement>,
+    retained_text_confidence_stats: Option<RetainedWordConfidenceStats>,
     /// Words the Tesseract result iterator itself failed to extract
     /// (null pointer / invalid parameter / invalid UTF-8 per word), per
     /// `ResultIterator::extract_all_words` (#192).
@@ -791,6 +968,92 @@ fn insert_word_iterator_skipped_count_metadata(
     }
 }
 
+fn insert_retained_word_confidence_metadata(
+    metadata: &mut HashMap<String, serde_json::Value>,
+    stats: &RetainedWordConfidenceStats,
+) {
+    for key in [
+        "word_count",
+        "low_conf_word_count",
+        "mean_text_conf",
+        "median_word_conf",
+        "p10_word_conf",
+    ] {
+        metadata.remove(key);
+    }
+    metadata.insert(
+        "word_count".to_string(),
+        serde_json::Value::Number(stats.word_count().into()),
+    );
+    metadata.insert(
+        "low_conf_word_count".to_string(),
+        serde_json::Value::Number(stats.low_confidence_word_count().into()),
+    );
+    if let Some(mean) = stats.mean() {
+        metadata.insert("mean_text_conf".to_string(), serde_json::Value::Number(mean.into()));
+    }
+    if let Some(median) = stats.median() {
+        metadata.insert("median_word_conf".to_string(), serde_json::Value::Number(median.into()));
+    }
+    if let Some(p10) = stats.p10() {
+        metadata.insert("p10_word_conf".to_string(), serde_json::Value::Number(p10.into()));
+    }
+}
+
+fn retained_text_word_confidence_stats(
+    content: &str,
+    words: &[xberg_tesseract::WordData],
+) -> RetainedWordConfidenceStats {
+    let retained_tokens = content.split_whitespace().collect::<Vec<_>>();
+    let mut retained_index = 0usize;
+    let mut stats = RetainedWordConfidenceStats::default();
+    for word in words {
+        let cleaned = strip_control_characters(&word.text);
+        let word_tokens = cleaned.split_whitespace().collect::<Vec<_>>();
+        if word_tokens.is_empty() {
+            continue;
+        }
+        let Some(next_retained_index) = find_token_sequence_end(&retained_tokens, retained_index, &word_tokens) else {
+            break;
+        };
+        stats.record(f64::from(word.confidence));
+        retained_index = next_retained_index;
+    }
+    stats
+}
+
+fn find_token_sequence_end(haystack: &[&str], start: usize, needle: &[&str]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(start);
+    }
+
+    let mut prefix_lengths = vec![0usize; needle.len()];
+    for index in 1..needle.len() {
+        let mut matched = prefix_lengths[index - 1];
+        while matched > 0 && needle[index] != needle[matched] {
+            matched = prefix_lengths[matched - 1];
+        }
+        if needle[index] == needle[matched] {
+            matched += 1;
+        }
+        prefix_lengths[index] = matched;
+    }
+
+    let mut matched = 0usize;
+    for (offset, token) in haystack[start..].iter().enumerate() {
+        while matched > 0 && *token != needle[matched] {
+            matched = prefix_lengths[matched - 1];
+        }
+        if *token == needle[matched] {
+            matched += 1;
+            if matched == needle.len() {
+                return Some(start + offset + 1);
+            }
+        }
+    }
+    None
+}
+
 /// Extract OcrElements via Tesseract's iterator APIs with rich metadata.
 ///
 /// Uses ResultIterator for word-level text, bounding boxes, confidence, and font
@@ -800,9 +1063,11 @@ fn extract_elements_via_iterator(
     api: &TesseractAPI,
     page_number: u32,
     min_confidence: f64,
+    retained_text: Option<&str>,
 ) -> Result<IteratorExtractionResult, OcrError> {
     let empty = || IteratorExtractionResult {
         elements: Vec::new(),
+        retained_text_confidence_stats: None,
         skipped_words: 0,
         non_text_block_word_count: 0,
         dict_invalid_word_ratio: None,
@@ -870,6 +1135,8 @@ fn extract_elements_via_iterator(
     }
 
     let dict_invalid_word_ratio = dictionary_invalid_word_ratio(api, &word_extraction.words);
+    let retained_text_confidence_stats =
+        retained_text.map(|content| retained_text_word_confidence_stats(content, &word_extraction.words));
 
     let mut elements = Vec::new();
     let mut non_text_block_word_count = 0usize;
@@ -908,10 +1175,24 @@ fn extract_elements_via_iterator(
 
     Ok(IteratorExtractionResult {
         elements,
+        retained_text_confidence_stats,
         skipped_words: word_extraction.skipped,
         non_text_block_word_count,
         dict_invalid_word_ratio,
     })
+}
+
+/// Resolve the `SecurityLimits` to apply when decoding an image for OCR.
+///
+/// `None` means no `ExtractionConfig` reached this call (internal/test call sites), not
+/// that limits should be waived — this falls back to the same default a configured caller
+/// gets when they never set `security_limits` explicitly (GH#1554: `load_image_for_ocr`
+/// previously hardcoded this default unconditionally, ignoring a caller's own configured,
+/// possibly higher, limit). ~keep
+fn security_limits_for_ocr(extraction_config: Option<&ExtractionConfig>) -> SecurityLimits {
+    extraction_config
+        .and_then(|config| config.security_limits.clone())
+        .unwrap_or_default()
 }
 
 /// Perform OCR on an image using Tesseract.
@@ -949,8 +1230,9 @@ pub(super) fn perform_ocr(
         )
     });
 
+    let security_limits = security_limits_for_ocr(extraction_config);
     let rgb_image = {
-        let img = crate::extraction::image::load_image_for_ocr(image_bytes)
+        let img = crate::extraction::image::load_image_for_ocr(image_bytes, &security_limits)
             .map_err(|e| OcrError::ImageProcessingFailed(e.to_string()))?;
         img.into_rgb8()
     };
@@ -971,10 +1253,14 @@ pub(super) fn perform_ocr(
         ci_debug_enabled,
         config.source_dpi,
     );
-    let image_data = prepared_image.data;
-    let width = prepared_image.width;
-    let height = prepared_image.height;
+    #[cfg_attr(not(auto_rotate), allow(unused_mut))]
+    let mut image_data = prepared_image.data;
+    #[cfg_attr(not(auto_rotate), allow(unused_mut))]
+    let mut width = prepared_image.width;
+    #[cfg_attr(not(auto_rotate), allow(unused_mut))]
+    let mut height = prepared_image.height;
     let source_dpi = prepared_image.source_dpi;
+    let preprocessing = prepared_image.preprocessing;
     let image_preprocessing = prepared_image.image_preprocessing;
     #[cfg_attr(not(auto_rotate), allow(unused_mut))]
     let mut ocr_image_width = width;
@@ -982,7 +1268,6 @@ pub(super) fn perform_ocr(
     let mut ocr_image_height = height;
 
     let bytes_per_pixel: u32 = 3;
-    let bytes_per_line = width * bytes_per_pixel;
 
     let languages: Vec<String> = config.language.split('+').map(|lang| lang.trim().to_string()).collect();
     let tessdata_path = resolve_tessdata_path(&languages, config.tessdata_path.as_deref())?;
@@ -1047,61 +1332,7 @@ pub(super) fn perform_ocr(
     psm_result.map_err(|e| OcrError::InvalidConfiguration(format!("Failed to set PSM mode: {}", e)))?;
 
     apply_tesseract_variables(&api, config)?;
-
-    let force_invert_colors = config.preprocessing.as_ref().map(|p| p.invert_colors).unwrap_or(false);
-
-    let processed_pix: Option<xberg_tesseract::Pix> = if prepared_image.apply_pix_preprocessing {
-        match xberg_tesseract::Pix::from_raw_rgb(&image_data, width, height) {
-            Ok(mut pix) => {
-                if let Ok((xres, yres)) = pix.get_resolution()
-                    && (xres == 0 || yres == 0)
-                {
-                    let _ = pix.set_resolution(72, 72);
-                }
-
-                let processed = preprocess_pix(pix, force_invert_colors);
-                match processed {
-                    Ok(p) => Some(p),
-                    Err(e) => {
-                        tracing::debug!("Leptonica preprocessing failed, using raw image: {}", e);
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::debug!("Leptonica Pix creation failed, using raw image: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    if let Some(ref pix) = processed_pix {
-        api.set_image_2(pix.as_ptr())
-            .map_err(|e| OcrError::ProcessingFailed(format!("Failed to set preprocessed image: {}", e)))?;
-    } else {
-        api.set_image(
-            &image_data,
-            width as i32,
-            height as i32,
-            bytes_per_pixel as i32,
-            bytes_per_line as i32,
-        )
-        .map_err(|e| OcrError::ProcessingFailed(format!("Failed to set image: {}", e)))?;
-    }
-    drop(processed_pix);
-
     let source_dpi = source_dpi.max(70);
-    api.set_source_resolution(source_dpi)
-        .map_err(|e| OcrError::ProcessingFailed(format!("Failed to set source resolution: {}", e)))?;
-
-    log_ci_debug(ci_debug_enabled, "set_image", || {
-        format!(
-            "width={} height={} bytes_per_pixel={} bytes_per_line={} source_dpi={}",
-            width, height, bytes_per_pixel, bytes_per_line, source_dpi
-        )
-    });
 
     // Only (degrees, confidence): the ONNX PP-LCNet orientation classifier used
     // here has no script-detection capability, unlike Tesseract's own
@@ -1129,12 +1360,26 @@ pub(super) fn perform_ocr(
 
     #[cfg(auto_rotate)]
     if auto_rotate_enabled {
-        let orientation_result = image::RgbImage::from_raw(width, height, image_data.clone())
-            .ok_or_else(|| crate::error::XbergError::Ocr {
+        let expected_rgb_len = usize::try_from(width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|pixels| pixels.checked_mul(bytes_per_pixel as usize));
+        let orientation_result = if expected_rgb_len != Some(image_data.len()) {
+            Err(crate::error::XbergError::Ocr {
                 message: "auto_rotate: image buffer does not match dimensions".to_string(),
                 source: None,
             })
-            .and_then(|img| doc_orientation_detector().detect(&img));
+        } else {
+            let image = image::RgbImage::from_raw(width, height, std::mem::take(&mut image_data))
+                .expect("validated RGB buffer length must match dimensions");
+            let result = doc_orientation_detector().detect(&image);
+            image_data = image.into_raw();
+            result
+        };
 
         match orientation_result {
             Err(e) => {
@@ -1158,36 +1403,9 @@ pub(super) fn perform_ocr(
                     let correction_deg = (360 - orient_deg).rem_euclid(360);
                     let (rotated_data, new_width, new_height) =
                         rotate_rgb_image_data(&image_data, width, height, correction_deg);
-                    let new_bytes_per_line = new_width * bytes_per_pixel;
-
-                    let rotated_pix = if prepared_image.apply_pix_preprocessing {
-                        xberg_tesseract::Pix::from_raw_rgb(&rotated_data, new_width, new_height)
-                            .ok()
-                            .and_then(|pix| preprocess_pix(pix, force_invert_colors).ok())
-                    } else {
-                        None
-                    };
-
-                    if let Some(ref pix) = rotated_pix {
-                        api.set_image_2(pix.as_ptr()).map_err(|e| {
-                            OcrError::ProcessingFailed(format!("Failed to set rotated preprocessed image: {}", e))
-                        })?;
-                    } else {
-                        api.set_image(
-                            &rotated_data,
-                            new_width as i32,
-                            new_height as i32,
-                            bytes_per_pixel as i32,
-                            new_bytes_per_line as i32,
-                        )
-                        .map_err(|e| OcrError::ProcessingFailed(format!("Failed to set rotated image: {}", e)))?;
-                    }
-
-                    drop(rotated_pix);
-
-                    api.set_source_resolution(source_dpi).map_err(|e| {
-                        OcrError::ProcessingFailed(format!("Failed to set source resolution after rotation: {}", e))
-                    })?;
+                    image_data = rotated_data;
+                    width = new_width;
+                    height = new_height;
                     ocr_image_width = new_width;
                     ocr_image_height = new_height;
 
@@ -1206,6 +1424,51 @@ pub(super) fn perform_ocr(
         }
     }
 
+    let processed_pix: Option<xberg_tesseract::Pix> =
+        if let (true, Some(preprocessing)) = (prepared_image.apply_pix_preprocessing, preprocessing.as_ref()) {
+            match xberg_tesseract::Pix::from_raw_rgb(&image_data, width, height) {
+                Ok(pix) => match preprocess_pix(pix, preprocessing) {
+                    Ok(processed) => Some(processed),
+                    Err(error) => {
+                        tracing::debug!(%error, "Leptonica preprocessing failed; using raw image");
+                        None
+                    }
+                },
+                Err(error) => {
+                    tracing::debug!(%error, "Leptonica Pix creation failed; using raw image");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+    if let Some(ref pix) = processed_pix {
+        api.set_image_2(pix.as_ptr())
+            .map_err(|error| OcrError::ProcessingFailed(format!("Failed to set preprocessed image: {error}")))?;
+    } else {
+        let bytes_per_line = width * bytes_per_pixel;
+        api.set_image(
+            &image_data,
+            width as i32,
+            height as i32,
+            bytes_per_pixel as i32,
+            bytes_per_line as i32,
+        )
+        .map_err(|error| OcrError::ProcessingFailed(format!("Failed to set image: {error}")))?;
+    }
+    drop(processed_pix);
+
+    api.set_source_resolution(source_dpi)
+        .map_err(|error| OcrError::ProcessingFailed(format!("Failed to set source resolution: {error}")))?;
+
+    log_ci_debug(ci_debug_enabled, "set_image", || {
+        format!(
+            "width={} height={} bytes_per_pixel={} source_dpi={}",
+            width, height, bytes_per_pixel, source_dpi
+        )
+    });
+
     drop(image_data);
 
     api.recognize()
@@ -1217,32 +1480,36 @@ pub(super) fn perform_ocr(
         format!("completed mean_text_conf={}", mean_text_conf)
     });
 
-    let word_confidence_stats = match api.all_word_confidences() {
-        Ok(confidences) if !confidences.is_empty() => {
-            let word_count = confidences.len();
-            let low_conf_word_count = confidences.iter().filter(|&&c| c < 50).count();
+    let word_confidence_stats = if matches!(config.output_format.as_str(), "markdown" | "text") {
+        None
+    } else {
+        match api.all_word_confidences() {
+            Ok(confidences) if !confidences.is_empty() => {
+                let word_count = confidences.len();
+                let low_conf_word_count = confidences.iter().filter(|&&c| c < 50).count();
 
-            let mut sorted = confidences.clone();
-            sorted.sort_unstable();
-            let median_word_conf = if word_count % 2 == 0 {
-                (sorted[word_count / 2 - 1] + sorted[word_count / 2]) / 2
-            } else {
-                sorted[word_count / 2]
-            };
+                let mut sorted = confidences.clone();
+                sorted.sort_unstable();
+                let median_word_conf = if word_count % 2 == 0 {
+                    (sorted[word_count / 2 - 1] + sorted[word_count / 2]) / 2
+                } else {
+                    sorted[word_count / 2]
+                };
 
-            let p10_idx = ((word_count as f64 - 1.0) * 0.1).floor() as usize;
-            let p10_word_conf = sorted[p10_idx.min(word_count - 1)];
+                let p10_idx = ((word_count as f64 - 1.0) * 0.1).floor() as usize;
+                let p10_word_conf = sorted[p10_idx.min(word_count - 1)];
 
-            Some((median_word_conf, p10_word_conf, word_count, low_conf_word_count))
+                Some((median_word_conf, p10_word_conf, word_count, low_conf_word_count))
+            }
+            Ok(_) => match api.mean_text_conf() {
+                Ok(mean_conf) => Some((mean_conf, mean_conf, 0usize, 0usize)),
+                Err(_) => None,
+            },
+            Err(_) => match api.mean_text_conf() {
+                Ok(mean_conf) => Some((mean_conf, mean_conf, 0usize, 0usize)),
+                Err(_) => None,
+            },
         }
-        Ok(_) => match api.mean_text_conf() {
-            Ok(mean_conf) => Some((mean_conf, mean_conf, 0usize, 0usize)),
-            Err(_) => None,
-        },
-        Err(_) => match api.mean_text_conf() {
-            Ok(mean_conf) => Some((mean_conf, mean_conf, 0usize, 0usize)),
-            Err(_) => None,
-        },
     };
 
     let tsv_data_for_tables = if config.enable_table_detection || config.output_format == "tsv" {
@@ -1255,6 +1522,8 @@ pub(super) fn perform_ocr(
     };
 
     let mut hocr_document: Option<InternalDocument> = None;
+    let mut dictionary_filtered_line_count = 0usize;
+    let mut retained_hocr_confidence_stats = None;
 
     let (raw_content, mime_type) = match config.output_format.as_str() {
         "text" => {
@@ -1282,10 +1551,15 @@ pub(super) fn perform_ocr(
                 max_invalid_ratio: crate::ocr::hocr_parser::DEFAULT_DICT_INVALID_LINE_RATIO,
             };
 
-            let internal_doc =
-                parse_hocr_to_internal_document_with_page_offset(&hocr, Some(&dictionary_filter), config.page_number);
-            let content = flatten_hocr_elements_to_text(&internal_doc.elements);
-            hocr_document = Some(internal_doc);
+            let parse_result = parse_hocr_to_internal_document_with_page_offset_and_stats(
+                &hocr,
+                Some(&dictionary_filter),
+                config.page_number,
+            );
+            dictionary_filtered_line_count = parse_result.dictionary_filtered_line_count;
+            let content = flatten_hocr_elements_to_text(&parse_result.document.elements);
+            retained_hocr_confidence_stats = Some(parse_result.retained_word_confidence_stats);
+            hocr_document = Some(parse_result.document);
 
             let mime_type = extraction_config
                 .map(|c| match c.output_format {
@@ -1351,31 +1625,41 @@ pub(super) fn perform_ocr(
     if auto_rotate_unavailable {
         metadata.insert("auto_rotate_unavailable".to_string(), serde_json::Value::Bool(true));
     }
-
-    if mean_text_conf >= 0 {
+    if dictionary_filtered_line_count > 0 {
         metadata.insert(
-            "mean_text_conf".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(mean_text_conf)),
+            "dictionary_filtered_line_count".to_string(),
+            serde_json::Value::Number(dictionary_filtered_line_count.into()),
         );
     }
 
-    if let Some((median_conf, p10_conf, word_count, low_conf_count)) = word_confidence_stats {
-        metadata.insert(
-            "median_word_conf".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(median_conf)),
-        );
-        metadata.insert(
-            "p10_word_conf".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(p10_conf)),
-        );
-        metadata.insert(
-            "word_count".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(word_count)),
-        );
-        metadata.insert(
-            "low_conf_word_count".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(low_conf_count)),
-        );
+    if let Some(stats) = retained_hocr_confidence_stats.as_ref() {
+        insert_retained_word_confidence_metadata(&mut metadata, stats);
+    } else if config.output_format != "text" {
+        if mean_text_conf >= 0 {
+            metadata.insert(
+                "mean_text_conf".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(mean_text_conf)),
+            );
+        }
+
+        if let Some((median_conf, p10_conf, word_count, low_conf_count)) = word_confidence_stats {
+            metadata.insert(
+                "median_word_conf".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(median_conf)),
+            );
+            metadata.insert(
+                "p10_word_conf".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(p10_conf)),
+            );
+            metadata.insert(
+                "word_count".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(word_count)),
+            );
+            metadata.insert(
+                "low_conf_word_count".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(low_conf_count)),
+            );
+        }
     }
 
     // No `script_name`/`script_confidence` metadata: the ONNX PP-LCNet
@@ -1511,7 +1795,19 @@ pub(super) fn perform_ocr(
         }
     }
 
-    let iterator_extraction = extract_elements_via_iterator(&api, config.page_number, config.min_confidence);
+    if let Some(document) = hocr_document.as_mut() {
+        document.elements = filter_elements_covered_by_tables(std::mem::take(&mut document.elements), &tables);
+    }
+
+    let mut content = strip_control_characters(&raw_content).into_owned();
+    let retained_text = (config.output_format == "text").then_some(content.as_str());
+    let iterator_extraction =
+        extract_elements_via_iterator(&api, config.page_number, config.min_confidence, retained_text);
+    if let Ok(extraction) = &iterator_extraction
+        && let Some(stats) = extraction.retained_text_confidence_stats.as_ref()
+    {
+        insert_retained_word_confidence_metadata(&mut metadata, stats);
+    }
     match iterator_extraction {
         Ok(extraction) if !extraction.elements.is_empty() => {
             insert_word_iterator_skipped_count_metadata(&mut metadata, extraction.skipped_words);
@@ -1540,8 +1836,6 @@ pub(super) fn perform_ocr(
             }
         }
     }
-
-    let mut content = strip_control_characters(&raw_content).into_owned();
 
     let is_markdown_output = extraction_config
         .map(|c| c.output_format == crate::core::config::OutputFormat::Markdown)
@@ -1818,8 +2112,214 @@ pub(super) fn process_image_files_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ocr::hocr_parser::HOCR_FONT_SIZE_ATTRIBUTE;
+    use crate::ocr::hocr_parser::{
+        HOCR_FONT_SIZE_ATTRIBUTE, parse_hocr_to_internal_document_with_page_offset_and_stats,
+    };
     use tempfile::tempdir;
+
+    fn confidence_word(text: &str, confidence: f32) -> xberg_tesseract::WordData {
+        xberg_tesseract::WordData {
+            text: text.to_string(),
+            left: 0,
+            top: 0,
+            right: 10,
+            bottom: 10,
+            confidence,
+            font_attrs: None,
+            language: None,
+        }
+    }
+
+    #[test]
+    fn should_publish_only_retained_hocr_word_confidence_metadata() {
+        let hocr = r#"<div class="ocr_page" title="ppageno 0">
+            <p class="ocr_par">
+                <span class="ocr_line">
+                    <span class="ocrx_word" title="x_wconf 20">CLEAR</span>
+                    <span class="ocrx_word" title="x_wconf 90">WORDS</span>
+                </span>
+                <span class="ocr_line">
+                    <span class="ocrx_word" title="x_wconf 0">OWATS</span>
+                    <span class="ocrx_word" title="x_wconf 0">DNDEVET</span>
+                </span>
+            </p>
+        </div>"#;
+        let is_valid_word = |word: &str| Some(matches!(word, "CLEAR" | "WORDS"));
+        let filter = DictionaryLineFilter {
+            is_valid_word: &is_valid_word,
+            max_invalid_ratio: crate::ocr::hocr_parser::DEFAULT_DICT_INVALID_LINE_RATIO,
+        };
+        let result = parse_hocr_to_internal_document_with_page_offset_and_stats(hocr, Some(&filter), 1);
+        let mut metadata = HashMap::new();
+
+        insert_retained_word_confidence_metadata(&mut metadata, &result.retained_word_confidence_stats);
+
+        assert_eq!(flatten_hocr_elements_to_text(&result.document.elements), "CLEAR WORDS");
+        assert_eq!(metadata.get("word_count"), Some(&serde_json::json!(2)));
+        assert_eq!(metadata.get("mean_text_conf"), Some(&serde_json::json!(55)));
+        assert_eq!(metadata.get("median_word_conf"), Some(&serde_json::json!(55)));
+        assert_eq!(metadata.get("p10_word_conf"), Some(&serde_json::json!(20)));
+        assert_eq!(metadata.get("low_conf_word_count"), Some(&serde_json::json!(1)));
+        assert_eq!(metadata.len(), 5);
+    }
+
+    /// GH#1554 regression: `perform_ocr` must use the caller's `ExtractionConfig.security_limits`
+    /// rather than always decoding under `SecurityLimits::default()`, which silently refused
+    /// ordinary high-DPI scans a caller had explicitly configured a higher limit to permit.
+    #[test]
+    fn should_use_configured_security_limits_when_extraction_config_present() {
+        let config = ExtractionConfig {
+            security_limits: Some(SecurityLimits {
+                max_content_size: 200 * 1024 * 1024,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let resolved = security_limits_for_ocr(Some(&config));
+
+        assert_eq!(resolved.max_content_size, 200 * 1024 * 1024);
+    }
+
+    /// `None` (no `ExtractionConfig` reached the call) must fall back to
+    /// `SecurityLimits::default()`, not to an unbounded/disabled check.
+    #[test]
+    fn should_fall_back_to_default_security_limits_when_extraction_config_absent() {
+        let resolved = security_limits_for_ocr(None);
+
+        assert_eq!(resolved.max_content_size, SecurityLimits::default().max_content_size);
+    }
+
+    #[test]
+    fn should_omit_hocr_confidence_quantiles_when_every_word_is_rejected() {
+        let hocr = r#"<div class="ocr_page" title="ppageno 0">
+            <p class="ocr_par">
+                <span class="ocr_line">
+                    <span class="ocrx_word" title="x_wconf 10">OWATS</span>
+                    <span class="ocrx_word" title="x_wconf 90">DNDEVET</span>
+                </span>
+            </p>
+        </div>"#;
+        let always_invalid = |_: &str| Some(false);
+        let filter = DictionaryLineFilter {
+            is_valid_word: &always_invalid,
+            max_invalid_ratio: crate::ocr::hocr_parser::DEFAULT_DICT_INVALID_LINE_RATIO,
+        };
+        let result = parse_hocr_to_internal_document_with_page_offset_and_stats(hocr, Some(&filter), 1);
+        let mut metadata = HashMap::new();
+
+        insert_retained_word_confidence_metadata(&mut metadata, &result.retained_word_confidence_stats);
+
+        assert!(flatten_hocr_elements_to_text(&result.document.elements).is_empty());
+        assert_eq!(metadata.get("word_count"), Some(&serde_json::json!(0)));
+        assert_eq!(metadata.get("low_conf_word_count"), Some(&serde_json::json!(0)));
+        assert!(!metadata.contains_key("mean_text_conf"));
+        assert!(!metadata.contains_key("median_word_conf"));
+        assert!(!metadata.contains_key("p10_word_conf"));
+        assert_eq!(metadata.len(), 2);
+    }
+
+    #[test]
+    fn should_publish_zero_text_confidence_words_when_every_iterator_word_is_filtered() {
+        let words = [confidence_word("\u{001f}", 95.0)];
+        let stats = retained_text_word_confidence_stats("", &words);
+        let mut metadata = HashMap::from([
+            ("word_count".to_string(), serde_json::json!(1)),
+            ("low_conf_word_count".to_string(), serde_json::json!(0)),
+            ("mean_text_conf".to_string(), serde_json::json!(95)),
+            ("median_word_conf".to_string(), serde_json::json!(95)),
+            ("p10_word_conf".to_string(), serde_json::json!(95)),
+        ]);
+
+        insert_retained_word_confidence_metadata(&mut metadata, &stats);
+
+        assert_eq!(metadata.get("word_count"), Some(&serde_json::json!(0)));
+        assert_eq!(metadata.get("low_conf_word_count"), Some(&serde_json::json!(0)));
+        assert!(!metadata.contains_key("mean_text_conf"));
+        assert!(!metadata.contains_key("median_word_conf"));
+        assert!(!metadata.contains_key("p10_word_conf"));
+    }
+
+    #[test]
+    fn should_publish_only_partially_retained_text_word_confidences() {
+        let words = [
+            confidence_word("RETAINED", 20.0),
+            confidence_word("\u{001f}", 95.0),
+            confidence_word("WORDS", 90.0),
+        ];
+        let stats = retained_text_word_confidence_stats("RETAINED WORDS", &words);
+        let mut metadata = HashMap::from([
+            ("word_count".to_string(), serde_json::json!(3)),
+            ("low_conf_word_count".to_string(), serde_json::json!(1)),
+            ("mean_text_conf".to_string(), serde_json::json!(68)),
+            ("median_word_conf".to_string(), serde_json::json!(90)),
+            ("p10_word_conf".to_string(), serde_json::json!(20)),
+        ]);
+
+        insert_retained_word_confidence_metadata(&mut metadata, &stats);
+
+        assert_eq!(metadata.get("word_count"), Some(&serde_json::json!(2)));
+        assert_eq!(metadata.get("mean_text_conf"), Some(&serde_json::json!(55)));
+        assert_eq!(metadata.get("median_word_conf"), Some(&serde_json::json!(55)));
+        assert_eq!(metadata.get("p10_word_conf"), Some(&serde_json::json!(20)));
+        assert_eq!(metadata.get("low_conf_word_count"), Some(&serde_json::json!(1)));
+    }
+
+    #[test]
+    fn should_align_words_after_a_retained_iterator_gap() {
+        let words = [confidence_word("FIRST", 10.0), confidence_word("LAST", 90.0)];
+
+        let stats = retained_text_word_confidence_stats("FIRST OMITTED LAST", &words);
+
+        assert_eq!(stats.word_count(), 2);
+        assert_eq!(stats.mean(), Some(50));
+        assert_eq!(stats.median(), Some(50));
+        assert_eq!(stats.p10(), Some(10));
+        assert_eq!(stats.low_confidence_word_count(), 1);
+    }
+
+    #[test]
+    fn should_align_repeated_words_without_losing_later_words() {
+        let words = [confidence_word("A", 20.0), confidence_word("B", 80.0)];
+
+        let stats = retained_text_word_confidence_stats("A A B", &words);
+
+        assert_eq!(stats.word_count(), 2);
+        assert_eq!(stats.mean(), Some(50));
+        assert_eq!(stats.median(), Some(50));
+        assert_eq!(stats.p10(), Some(20));
+        assert_eq!(stats.low_confidence_word_count(), 1);
+    }
+
+    #[test]
+    fn should_align_punctuation_and_unicode_exactly() {
+        let words = [
+            confidence_word("Hello,", 60.0),
+            confidence_word("Gr\u{00fc}\u{00df}e", 70.0),
+            confidence_word("\u{4e16}\u{754c}!", 80.0),
+        ];
+
+        let stats = retained_text_word_confidence_stats("Hello, Gr\u{00fc}\u{00df}e \u{4e16}\u{754c}!", &words);
+
+        assert_eq!(stats.word_count(), 3);
+        assert_eq!(stats.mean(), Some(70));
+        assert_eq!(stats.median(), Some(70));
+        assert_eq!(stats.p10(), Some(60));
+        assert_eq!(stats.low_confidence_word_count(), 0);
+    }
+
+    #[test]
+    fn should_align_multi_token_words_across_whitespace_variants() {
+        let words = [confidence_word("ALPHA\tBETA", 75.0), confidence_word("GAMMA", 85.0)];
+
+        let stats = retained_text_word_confidence_stats("ALPHA  \n BETA\r\nGAMMA", &words);
+
+        assert_eq!(stats.word_count(), 2);
+        assert_eq!(stats.mean(), Some(80));
+        assert_eq!(stats.median(), Some(80));
+        assert_eq!(stats.p10(), Some(75));
+        assert_eq!(stats.low_confidence_word_count(), 0);
+    }
 
     /// Exact count: a known number of skipped words must produce exactly the
     /// matching `word_iterator_skipped_count` value, not just a truthy presence
@@ -2053,6 +2553,87 @@ mod tests {
         );
     }
 
+    fn paragraph_with_bbox(text: &str, x0: f64, y0: f64, x1: f64, y1: f64) -> crate::types::internal::InternalElement {
+        let mut elem = crate::types::internal::InternalElement::text(ElementKind::Paragraph, text, 0);
+        elem.bbox = Some(crate::types::extraction::BoundingBox { x0, y0, x1, y1 });
+        elem
+    }
+
+    fn table_at(left: u32, top: u32, right: u32, bottom: u32) -> OcrTable {
+        OcrTable {
+            cells: vec![vec!["cell".to_string()]],
+            markdown: "| cell |".to_string(),
+            page_number: 1,
+            bounding_box: Some(OcrTableBoundingBox {
+                left,
+                top,
+                right,
+                bottom,
+            }),
+        }
+    }
+
+    #[test]
+    fn filter_elements_covered_by_tables_drops_paragraph_inside_table_bbox() {
+        // A paragraph whose bbox is fully inside (so its centre is inside) a detected
+        // table's bbox must be removed -- this is the #1571 duplication itself: the
+        // paragraph's words are also the table's cells.
+        let elements = vec![paragraph_with_bbox("Apple 50 10 00", 10.0, 10.0, 90.0, 30.0)];
+        let tables = vec![table_at(0, 0, 100, 100)];
+
+        let filtered = filter_elements_covered_by_tables(elements, &tables);
+
+        assert!(
+            filtered.is_empty(),
+            "paragraph centred inside the table bbox must be dropped"
+        );
+    }
+
+    #[test]
+    fn filter_elements_covered_by_tables_keeps_paragraph_adjacent_to_table() {
+        // Precision guard (#1571): a paragraph that merely overlaps a table's bbox edge,
+        // with its centre outside the bbox, must survive -- the word-centre rule must not
+        // over-delete prose that sits next to (not inside) a table.
+        let elements = vec![
+            paragraph_with_bbox("Vehicle Maintenance Guide", 10.0, 0.0, 90.0, 15.0),
+            paragraph_with_bbox("Apple 50 10 00", 10.0, 50.0, 90.0, 70.0),
+        ];
+        let tables = vec![table_at(0, 40, 100, 140)];
+
+        let filtered = filter_elements_covered_by_tables(elements, &tables);
+
+        assert_eq!(
+            filtered.len(),
+            1,
+            "only the paragraph centred inside the table bbox should be dropped"
+        );
+        assert_eq!(filtered[0].text, "Vehicle Maintenance Guide");
+    }
+
+    #[test]
+    fn filter_elements_covered_by_tables_is_noop_without_tables() {
+        let elements = vec![paragraph_with_bbox("Apple 50 10 00", 10.0, 10.0, 90.0, 30.0)];
+
+        let filtered = filter_elements_covered_by_tables(elements, &[]);
+
+        assert_eq!(filtered.len(), 1, "no tables detected means nothing should be filtered");
+    }
+
+    #[test]
+    fn filter_elements_covered_by_tables_keeps_elements_without_bbox() {
+        let mut elem = crate::types::internal::InternalElement::text(ElementKind::Paragraph, "no geometry", 0);
+        elem.bbox = None;
+        let tables = vec![table_at(0, 0, 100, 100)];
+
+        let filtered = filter_elements_covered_by_tables(vec![elem], &tables);
+
+        assert_eq!(
+            filtered.len(),
+            1,
+            "an element with no bbox cannot be tested against a table and must survive"
+        );
+    }
+
     #[test]
     fn flatten_hocr_elements_to_text_leaves_content_unchanged_without_font_sizes() {
         let elements = vec![
@@ -2243,12 +2824,187 @@ mod tests {
         let mut pix = xberg_tesseract::Pix::from_raw_rgb(&rgb_data, width, height).unwrap();
         pix.set_resolution(300, 300).unwrap();
 
-        let processed = preprocess_pix(pix, false).unwrap();
+        let processed = preprocess_pix(pix, &preprocessing_config()).unwrap();
 
         assert_eq!(processed.width(), width as i32);
         assert_eq!(processed.height(), height as i32);
-        assert_eq!(processed.depth(), 8);
-        assert_eq!(processed.get_resolution().unwrap(), (72, 72));
+        assert_eq!(processed.depth(), 1);
+        assert_eq!(processed.get_resolution().unwrap(), (300, 300));
+    }
+
+    fn preprocessing_fixture() -> (Vec<u8>, u32, u32) {
+        const WIDTH: u32 = 640;
+        const HEIGHT: u32 = 480;
+        const CHANNELS: usize = 3;
+        let mut rgb_data = Vec::with_capacity(WIDTH as usize * HEIGHT as usize * CHANNELS);
+
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                let background = 176 + ((x * 48) / WIDTH) as u8;
+                let skewed_line = (40..=390).step_by(50).any(|line_y| y.abs_diff(line_y + x / 16) <= 2);
+                let noise = (x * 37 + y * 19).is_multiple_of(97);
+                let value = if noise {
+                    16
+                } else if skewed_line && (20..620).contains(&x) {
+                    72
+                } else {
+                    background
+                };
+                rgb_data.extend_from_slice(&[value, value, value]);
+            }
+        }
+
+        (rgb_data, WIDTH, HEIGHT)
+    }
+
+    fn preprocessing_config() -> crate::types::ImagePreprocessingConfig {
+        crate::types::ImagePreprocessingConfig {
+            target_dpi: 300,
+            auto_rotate: false,
+            deskew: false,
+            denoise: false,
+            contrast_enhance: false,
+            binarization_method: "otsu".to_string(),
+            invert_colors: false,
+        }
+    }
+
+    fn preprocess_fixture_with_config(config: &crate::types::ImagePreprocessingConfig) -> xberg_tesseract::Pix {
+        let (rgb_data, width, height) = preprocessing_fixture();
+        preprocess_rgb_with_config(rgb_data, width, height, config)
+    }
+
+    fn preprocess_rgb_with_config(
+        rgb_data: Vec<u8>,
+        width: u32,
+        height: u32,
+        config: &crate::types::ImagePreprocessingConfig,
+    ) -> xberg_tesseract::Pix {
+        let pix = xberg_tesseract::Pix::from_raw_rgb(&rgb_data, width, height).unwrap();
+        preprocess_pix(pix, config).unwrap()
+    }
+
+    fn sampled_pixel_signature(pix: &xberg_tesseract::Pix) -> Vec<u32> {
+        const SAMPLE_STEP: usize = 8;
+        let mut signature = vec![pix.width() as u32, pix.height() as u32, pix.depth() as u32];
+        for y in (0..pix.height()).step_by(SAMPLE_STEP) {
+            for x in (0..pix.width()).step_by(SAMPLE_STEP) {
+                let sample = pix.clip_rectangle(x, y, 1, 1).unwrap();
+                let (mean, _) = sample.grayscale_stats(1, 1).unwrap();
+                signature.push(mean.round() as u32);
+            }
+        }
+        signature
+    }
+
+    fn binary_pixel_value(pix: &xberg_tesseract::Pix, x: i32, y: i32) -> u32 {
+        let sample = pix.clip_rectangle(x, y, 1, 1).unwrap();
+        let (mean, _) = sample.grayscale_stats(1, 1).unwrap();
+        mean.round() as u32
+    }
+
+    #[test]
+    fn should_change_preprocessed_pixels_when_deskew_is_enabled() {
+        let disabled = preprocessing_config();
+        let enabled = crate::types::ImagePreprocessingConfig {
+            deskew: true,
+            ..disabled.clone()
+        };
+
+        let disabled_signature = sampled_pixel_signature(&preprocess_fixture_with_config(&disabled));
+        let enabled_signature = sampled_pixel_signature(&preprocess_fixture_with_config(&enabled));
+
+        assert_ne!(
+            enabled_signature, disabled_signature,
+            "deskew must affect the OCR raster"
+        );
+    }
+
+    #[test]
+    fn should_change_preprocessed_pixels_when_denoise_is_enabled() {
+        let disabled = preprocessing_config();
+        let enabled = crate::types::ImagePreprocessingConfig {
+            denoise: true,
+            ..disabled.clone()
+        };
+
+        let disabled_signature = sampled_pixel_signature(&preprocess_fixture_with_config(&disabled));
+        let enabled_signature = sampled_pixel_signature(&preprocess_fixture_with_config(&enabled));
+
+        assert_ne!(
+            enabled_signature, disabled_signature,
+            "denoise must affect the OCR raster"
+        );
+    }
+
+    #[test]
+    fn should_change_preprocessed_pixels_when_contrast_enhance_is_enabled() {
+        let disabled = crate::types::ImagePreprocessingConfig {
+            binarization_method: "adaptive".to_string(),
+            ..preprocessing_config()
+        };
+        let enabled = crate::types::ImagePreprocessingConfig {
+            contrast_enhance: true,
+            ..disabled.clone()
+        };
+
+        let disabled_signature = sampled_pixel_signature(&preprocess_fixture_with_config(&disabled));
+        let enabled_signature = sampled_pixel_signature(&preprocess_fixture_with_config(&enabled));
+
+        assert_ne!(
+            enabled_signature, disabled_signature,
+            "contrast enhancement must affect the OCR raster"
+        );
+    }
+
+    #[test]
+    fn should_change_preprocessed_pixels_when_binarization_method_changes() {
+        let otsu = preprocessing_config();
+        let adaptive = crate::types::ImagePreprocessingConfig {
+            binarization_method: "adaptive".to_string(),
+            ..otsu.clone()
+        };
+
+        let otsu_signature = sampled_pixel_signature(&preprocess_fixture_with_config(&otsu));
+        let adaptive_signature = sampled_pixel_signature(&preprocess_fixture_with_config(&adaptive));
+
+        assert_ne!(
+            adaptive_signature, otsu_signature,
+            "binarization_method must select a distinct preprocessing operation"
+        );
+    }
+
+    #[test]
+    fn should_change_preprocessed_pixels_when_sauvola_is_selected() {
+        const WIDTH: u32 = 256;
+        const HEIGHT: u32 = 128;
+        let mut rgb_data = Vec::with_capacity(WIDTH as usize * HEIGHT as usize * RGB_CHANNEL_COUNT);
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                let background = 72 + ((x * 168) / WIDTH) as u8;
+                let is_text = (20..=100).step_by(20).any(|line| y.abs_diff(line) <= 1) && (8..248).contains(&x);
+                let value = if is_text {
+                    background.saturating_sub(32)
+                } else {
+                    background
+                };
+                rgb_data.extend_from_slice(&[value, value, value]);
+            }
+        }
+        let otsu = preprocessing_config();
+        let sauvola = crate::types::ImagePreprocessingConfig {
+            binarization_method: "sauvola".to_string(),
+            ..otsu.clone()
+        };
+
+        let otsu_signature =
+            sampled_pixel_signature(&preprocess_rgb_with_config(rgb_data.clone(), WIDTH, HEIGHT, &otsu));
+        let sauvola_signature = sampled_pixel_signature(&preprocess_rgb_with_config(rgb_data, WIDTH, HEIGHT, &sauvola));
+
+        assert_ne!(
+            sauvola_signature, otsu_signature,
+            "Sauvola must select a distinct operation"
+        );
     }
 
     #[test]
@@ -2269,7 +3025,299 @@ mod tests {
         const SAMPLE_PIXEL_COUNT: usize = 16;
         let rgb_data = vec![u8::MAX; SAMPLE_PIXEL_COUNT * RGB_CHANNEL_COUNT];
 
-        assert!(should_apply_default_preprocessing(&rgb_data));
+        assert!(should_apply_default_preprocessing(
+            &rgb_data,
+            SAMPLE_PIXEL_COUNT as u32,
+            1
+        ));
+    }
+
+    const CONTRAST_FIXTURE_WIDTH: u32 = 512;
+    const CONTRAST_FIXTURE_HEIGHT: u32 = 128;
+    const CONTRAST_FIXTURE_FILL_WIDTH: u32 = 80;
+    const PALE_TEXT: [u8; RGB_CHANNEL_COUNT] = [200, 220, 245];
+    const DARK_TEXT: [u8; RGB_CHANNEL_COUNT] = [30, 30, 30];
+    const BRIGHT_BLUE_FILL: [u8; RGB_CHANNEL_COUNT] = [210, 220, 240];
+
+    fn glyph_mask(x: u32, y: u32, offset: u32) -> bool {
+        const TOP: u32 = 48;
+        const HEIGHT: u32 = 24;
+        const WIDTH: u32 = 20;
+        const STROKE: u32 = 2;
+        for left in [4 + offset, 30 + offset, 56 + offset] {
+            let local_x = x.checked_sub(left);
+            let local_y = y.checked_sub(TOP);
+            if let (Some(local_x), Some(local_y)) = (local_x, local_y)
+                && local_x < WIDTH
+                && local_y < HEIGHT
+                && (!(STROKE..WIDTH - STROKE).contains(&local_x)
+                    || (HEIGHT / 2..HEIGHT / 2 + STROKE).contains(&local_y))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn contrast_fixture(text: [u8; RGB_CHANNEL_COUNT], fill: bool, offset: u32) -> (Vec<u8>, usize) {
+        let mut rgb_data =
+            Vec::with_capacity(CONTRAST_FIXTURE_WIDTH as usize * CONTRAST_FIXTURE_HEIGHT as usize * RGB_CHANNEL_COUNT);
+        let mut glyph_pixels = 0usize;
+        for y in 0..CONTRAST_FIXTURE_HEIGHT {
+            for x in 0..CONTRAST_FIXTURE_WIDTH {
+                let pixel = if glyph_mask(x, y, offset) {
+                    glyph_pixels += 1;
+                    text
+                } else if fill && x < CONTRAST_FIXTURE_FILL_WIDTH {
+                    BRIGHT_BLUE_FILL
+                } else {
+                    [u8::MAX; RGB_CHANNEL_COUNT]
+                };
+                rgb_data.extend_from_slice(&pixel);
+            }
+        }
+        (rgb_data, glyph_pixels)
+    }
+
+    fn aggregate_foreground_contrast(rgb_data: &[u8]) -> f64 {
+        let mut background_sum = 0.0;
+        let mut background_count = 0usize;
+        let mut foreground_sum = 0.0;
+        let mut foreground_count = 0usize;
+        for pixel in rgb_data.chunks_exact(RGB_CHANNEL_COUNT) {
+            let luminance = pixel.iter().map(|channel| f64::from(*channel)).sum::<f64>()
+                / (RGB_CHANNEL_MAX * RGB_CHANNEL_COUNT as f64);
+            if luminance >= CLEAN_PAGE_LIGHT_PIXEL_THRESHOLD {
+                background_sum += luminance;
+                background_count += 1;
+            } else {
+                foreground_sum += luminance;
+                foreground_count += 1;
+            }
+        }
+        background_sum / background_count as f64 - foreground_sum / foreground_count as f64
+    }
+
+    #[test]
+    fn should_preserve_pale_glyphs_without_implicit_otsu() {
+        let (rgb_data, glyph_pixels) = contrast_fixture(PALE_TEXT, false, 0);
+        assert_eq!(
+            glyph_pixels, 384,
+            "fixture must contain the intended nonempty glyph mask"
+        );
+
+        let prepared = prepare_ocr_image(
+            rgb_data.clone(),
+            CONTRAST_FIXTURE_WIDTH,
+            CONTRAST_FIXTURE_HEIGHT,
+            None,
+            None,
+            false,
+            Some(300.0),
+        );
+
+        assert!(!prepared.apply_pix_preprocessing);
+        assert!(prepared.preprocessing.is_none());
+        assert!(prepared.image_preprocessing.is_none());
+        assert_eq!(
+            prepared.data, rgb_data,
+            "implicit preprocessing must preserve pale glyph pixels"
+        );
+    }
+
+    #[test]
+    fn should_apply_implicit_otsu_to_dark_glyphs_over_bright_fill_at_every_sample_phase() {
+        for offset in 0..DEFAULT_PREPROCESSING_SAMPLE_STRIDE as u32 {
+            let (rgb_data, glyph_pixels) = contrast_fixture(DARK_TEXT, true, offset);
+            assert_eq!(glyph_pixels, 384, "offset {offset} changed the glyph population");
+            assert!(
+                aggregate_foreground_contrast(&rgb_data) < CLEAN_PAGE_MIN_FOREGROUND_CONTRAST,
+                "fixture must fail the legacy aggregate-contrast gate at offset {offset}"
+            );
+
+            let prepared = prepare_ocr_image(
+                rgb_data,
+                CONTRAST_FIXTURE_WIDTH,
+                CONTRAST_FIXTURE_HEIGHT,
+                None,
+                None,
+                false,
+                Some(300.0),
+            );
+
+            assert!(
+                prepared.apply_pix_preprocessing,
+                "dark glyphs were missed at offset {offset}"
+            );
+            assert_eq!(prepared.width, CONTRAST_FIXTURE_WIDTH);
+            assert_eq!(prepared.height, CONTRAST_FIXTURE_HEIGHT);
+            assert_eq!(
+                prepared
+                    .preprocessing
+                    .as_ref()
+                    .map(|config| config.binarization_method.as_str()),
+                Some("otsu")
+            );
+        }
+    }
+
+    #[test]
+    fn should_reject_scattered_speckles_with_the_same_dark_pixel_count_as_glyphs() {
+        let (mut rgb_data, glyph_pixels) = contrast_fixture(BRIGHT_BLUE_FILL, true, 0);
+        let mut speckles = 0usize;
+        'rows: for y in (0..CONTRAST_FIXTURE_HEIGHT).step_by(2) {
+            for x in (0..CONTRAST_FIXTURE_WIDTH).step_by(DEFAULT_PREPROCESSING_SAMPLE_STRIDE) {
+                let pixel_index = (y as usize * CONTRAST_FIXTURE_WIDTH as usize + x as usize) * RGB_CHANNEL_COUNT;
+                rgb_data[pixel_index..pixel_index + RGB_CHANNEL_COUNT].copy_from_slice(&DARK_TEXT);
+                speckles += 1;
+                if speckles == glyph_pixels {
+                    break 'rows;
+                }
+            }
+        }
+        assert_eq!(
+            speckles, glyph_pixels,
+            "control must have the same dark-pixel population"
+        );
+
+        let prepared = prepare_ocr_image(
+            rgb_data.clone(),
+            CONTRAST_FIXTURE_WIDTH,
+            CONTRAST_FIXTURE_HEIGHT,
+            None,
+            None,
+            false,
+            Some(300.0),
+        );
+        assert!(
+            !prepared.apply_pix_preprocessing,
+            "isolated speckles are not text structure"
+        );
+        assert_eq!(prepared.data, rgb_data);
+    }
+
+    #[test]
+    fn should_reject_a_contiguous_blob_with_the_same_dark_pixel_count_as_glyphs() {
+        const BLOB_WIDTH: u32 = 16;
+        const BLOB_HEIGHT: u32 = 24;
+        let (mut rgb_data, glyph_pixels) = contrast_fixture(BRIGHT_BLUE_FILL, true, 0);
+        assert_eq!(BLOB_WIDTH as usize * BLOB_HEIGHT as usize, glyph_pixels);
+
+        for y in 48..48 + BLOB_HEIGHT {
+            for x in 4..4 + BLOB_WIDTH {
+                let pixel_index = (y as usize * CONTRAST_FIXTURE_WIDTH as usize + x as usize) * RGB_CHANNEL_COUNT;
+                rgb_data[pixel_index..pixel_index + RGB_CHANNEL_COUNT].copy_from_slice(&DARK_TEXT);
+            }
+        }
+
+        let prepared = prepare_ocr_image(
+            rgb_data.clone(),
+            CONTRAST_FIXTURE_WIDTH,
+            CONTRAST_FIXTURE_HEIGHT,
+            None,
+            None,
+            false,
+            Some(300.0),
+        );
+        assert!(!prepared.apply_pix_preprocessing, "a solid blob is not text structure");
+        assert_eq!(prepared.data, rgb_data);
+    }
+
+    #[test]
+    fn should_preserve_three_narrow_solid_glyphs_with_the_same_dark_pixel_count() {
+        const GLYPH_WIDTH: u32 = 4;
+        const GLYPH_HEIGHT: u32 = 32;
+        let (mut rgb_data, glyph_pixels) = contrast_fixture(BRIGHT_BLUE_FILL, true, 0);
+        assert_eq!(3 * GLYPH_WIDTH as usize * GLYPH_HEIGHT as usize, glyph_pixels);
+
+        for left in [4, 12, 20] {
+            for y in 44..44 + GLYPH_HEIGHT {
+                for x in left..left + GLYPH_WIDTH {
+                    let pixel_index = (y as usize * CONTRAST_FIXTURE_WIDTH as usize + x as usize) * RGB_CHANNEL_COUNT;
+                    rgb_data[pixel_index..pixel_index + RGB_CHANNEL_COUNT].copy_from_slice(&DARK_TEXT);
+                }
+            }
+        }
+
+        let prepared = prepare_ocr_image(
+            rgb_data,
+            CONTRAST_FIXTURE_WIDTH,
+            CONTRAST_FIXTURE_HEIGHT,
+            None,
+            None,
+            false,
+            Some(300.0),
+        );
+        assert!(
+            prepared.apply_pix_preprocessing,
+            "narrow solid glyphs remain text structure"
+        );
+    }
+
+    #[test]
+    fn should_reject_a_small_defect_among_equal_count_scattered_speckles() {
+        const DEFECT_PIXELS: usize = 4;
+        let (mut rgb_data, glyph_pixels) = contrast_fixture(BRIGHT_BLUE_FILL, true, 0);
+        for y in 0..2 {
+            for x in 0..2 {
+                let pixel_index = (y * CONTRAST_FIXTURE_WIDTH as usize + x) * RGB_CHANNEL_COUNT;
+                rgb_data[pixel_index..pixel_index + RGB_CHANNEL_COUNT].copy_from_slice(&DARK_TEXT);
+            }
+        }
+
+        let mut speckles = 0usize;
+        'rows: for y in (4..CONTRAST_FIXTURE_HEIGHT).step_by(2) {
+            for x in (4..CONTRAST_FIXTURE_WIDTH).step_by(DEFAULT_PREPROCESSING_SAMPLE_STRIDE) {
+                let pixel_index = (y as usize * CONTRAST_FIXTURE_WIDTH as usize + x as usize) * RGB_CHANNEL_COUNT;
+                rgb_data[pixel_index..pixel_index + RGB_CHANNEL_COUNT].copy_from_slice(&DARK_TEXT);
+                speckles += 1;
+                if speckles + DEFECT_PIXELS == glyph_pixels {
+                    break 'rows;
+                }
+            }
+        }
+        assert_eq!(speckles + DEFECT_PIXELS, glyph_pixels);
+
+        let prepared = prepare_ocr_image(
+            rgb_data.clone(),
+            CONTRAST_FIXTURE_WIDTH,
+            CONTRAST_FIXTURE_HEIGHT,
+            None,
+            None,
+            false,
+            Some(300.0),
+        );
+        assert!(
+            !prepared.apply_pix_preprocessing,
+            "a small connected defect does not make scattered noise text-like"
+        );
+        assert_eq!(prepared.data, rgb_data);
+    }
+
+    #[test]
+    fn should_reject_malformed_or_overflowing_rgb_dimensions() {
+        assert!(!should_apply_default_preprocessing(&[u8::MAX; 3], 2, 2));
+        assert!(!should_apply_default_preprocessing(&[], u32::MAX, u32::MAX));
+    }
+
+    #[test]
+    fn should_select_default_preprocessing_for_black_text_on_white_page() {
+        const WIDTH: u32 = 80;
+        const HEIGHT: u32 = 20;
+        const FOREGROUND_WIDTH: u32 = 4;
+        let mut rgb_data = Vec::with_capacity(WIDTH as usize * HEIGHT as usize * RGB_CHANNEL_COUNT);
+        for _y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                let pixel = if x < FOREGROUND_WIDTH {
+                    [0; RGB_CHANNEL_COUNT]
+                } else {
+                    [u8::MAX; RGB_CHANNEL_COUNT]
+                };
+                rgb_data.extend_from_slice(&pixel);
+            }
+        }
+
+        assert!(should_apply_default_preprocessing(&rgb_data, WIDTH, HEIGHT));
     }
 
     #[test]
@@ -2281,6 +3329,11 @@ mod tests {
         let prepared = prepare_ocr_image(rgb_data, WIDTH, HEIGHT, None, None, false, None);
 
         assert!(prepared.apply_pix_preprocessing);
+        let preprocessing = prepared
+            .preprocessing
+            .expect("implicit preprocessing must retain its effective configuration");
+        assert!(preprocessing.deskew);
+        assert_eq!(preprocessing.binarization_method, "otsu");
     }
 
     #[test]
@@ -2289,7 +3342,11 @@ mod tests {
         const SHADOWED_CHANNEL_VALUE: u8 = 128;
         let rgb_data = vec![SHADOWED_CHANNEL_VALUE; SAMPLE_PIXEL_COUNT * RGB_CHANNEL_COUNT];
 
-        assert!(!should_apply_default_preprocessing(&rgb_data));
+        assert!(!should_apply_default_preprocessing(
+            &rgb_data,
+            SAMPLE_PIXEL_COUNT as u32,
+            1
+        ));
     }
 
     #[test]
@@ -2303,6 +3360,7 @@ mod tests {
         let prepared = prepare_ocr_image(rgb_data, 2, 2, Some(&preprocessing), None, false, None);
 
         assert!(prepared.apply_pix_preprocessing);
+        assert_eq!(prepared.preprocessing.unwrap().target_dpi, 72);
     }
 
     /// #209: when a caller supplies `ImageExtractionConfig`, its `max_image_dimension`
@@ -2353,8 +3411,9 @@ mod tests {
         assert!(metadata.dimension_clamped);
     }
 
-    /// Pixel width of a US Letter page (612pt wide) rendered at the 150 DPI the PDF OCR route
-    /// asks `render_page_with_safeguards` for.
+    /// Pixel width of a US Letter page (612pt wide) rendered at 150 DPI -- an arbitrary
+    /// non-72, non-target render resolution exercising `known_source_dpi`, not tied to
+    /// whatever DPI the PDF OCR route actually renders at (`effective_pdf_render_dpi`, #1577).
     const LETTER_AT_150_DPI_WIDTH_PX: u32 = 1275;
     /// Pixel height of the same page (792pt tall) at 150 DPI.
     const LETTER_AT_150_DPI_HEIGHT_PX: u32 = 1650;
@@ -2510,8 +3569,6 @@ mod tests {
 
     #[test]
     fn test_preprocess_pix_inverts_light_on_dark_image() {
-        // Synthetic light-text-on-dark-background image: dark background (20)
-        // with a bright "text" region covering ~6% of the image.
         let width = 40u32;
         let height = 40u32;
         let mut rgb_data = Vec::with_capacity((width * height * 3) as usize);
@@ -2524,31 +3581,15 @@ mod tests {
         }
 
         let pix = xberg_tesseract::Pix::from_raw_rgb(&rgb_data, width, height).unwrap();
-        let original_gray = pix.to_grayscale().unwrap();
-        let (original_mean, _) = original_gray
-            .grayscale_stats(LIGHT_PIXEL_VALUE_THRESHOLD, POLARITY_SAMPLE_STRIDE)
-            .unwrap();
-        drop(original_gray);
+        let processed = preprocess_pix(pix, &preprocessing_config()).unwrap();
 
-        // Auto-detection with no explicit override should invert: the result's
-        // background (post background_normalize + grayscale) should be light,
-        // i.e. brighter on average than the raw dark-background source.
-        let processed = preprocess_pix(pix, false).unwrap();
-        let (processed_mean, _) = processed
-            .grayscale_stats(LIGHT_PIXEL_VALUE_THRESHOLD, POLARITY_SAMPLE_STRIDE)
-            .unwrap();
-
-        assert!(
-            processed_mean > original_mean,
-            "expected inverted+normalized output to be brighter than the dark-background \
-             source (original_mean={original_mean}, processed_mean={processed_mean})"
-        );
+        assert_eq!(processed.depth(), 1);
+        assert_eq!(binary_pixel_value(&processed, 0, 0), 0, "background must be white");
+        assert_eq!(binary_pixel_value(&processed, 10, 11), 1, "text must be black");
     }
 
     #[test]
     fn test_preprocess_pix_does_not_invert_dark_on_light_image() {
-        // A normal dark-text-on-light-paper image should not be inverted:
-        // processing should keep (or increase) brightness, not flip polarity.
         let width = 40u32;
         let height = 40u32;
         let mut rgb_data = Vec::with_capacity((width * height * 3) as usize);
@@ -2561,15 +3602,11 @@ mod tests {
         }
 
         let pix = xberg_tesseract::Pix::from_raw_rgb(&rgb_data, width, height).unwrap();
-        let processed = preprocess_pix(pix, false).unwrap();
-        let (processed_mean, _) = processed
-            .grayscale_stats(LIGHT_PIXEL_VALUE_THRESHOLD, POLARITY_SAMPLE_STRIDE)
-            .unwrap();
+        let processed = preprocess_pix(pix, &preprocessing_config()).unwrap();
 
-        assert!(
-            processed_mean > DARK_BACKGROUND_MEAN_THRESHOLD,
-            "expected light-background image to stay light after preprocessing (mean={processed_mean})"
-        );
+        assert_eq!(processed.depth(), 1);
+        assert_eq!(binary_pixel_value(&processed, 0, 0), 0, "background must be white");
+        assert_eq!(binary_pixel_value(&processed, 10, 11), 1, "text must be black");
     }
 
     #[cfg(auto_rotate)]

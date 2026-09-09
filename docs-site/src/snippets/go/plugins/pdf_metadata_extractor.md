@@ -1,115 +1,63 @@
-```go title="Go"
+```go title="Go - PDF metadata observer"
 package main
 
 import (
-	"encoding/json"
 	"log"
 	"sync/atomic"
-	"unsafe"
 
 	"github.com/xberg-io/xberg/packages/go"
 )
 
-/*
-#cgo CFLAGS: -I${SRCDIR}/../../../crates/xberg-ffi/include
-#cgo LDFLAGS: -L${SRCDIR}/../../../target/release -L${SRCDIR}/../../../target/debug -lxberg_ffi
-#include "../../../crates/xberg-ffi/include/xberg.h"
-#include <stdlib.h>
-*/
-import "C"
-
-// pdfMetadataState tracks statistics about PDF processing
-var pdfMetadataState = struct {
-	processedCount int64
-}{
-	processedCount: 0,
+type pdfMetadataObserver struct {
+	processedCount atomic.Int64
 }
 
-// pdfMetadataExtractor enriches PDF extraction results with additional metadata
-//export pdfMetadataExtractor
-func pdfMetadataExtractor(resultJSON *C.char) *C.char {
-	jsonStr := C.GoString(resultJSON)
-	var result map[string]interface{}
-
-	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
-		return C.CString("{\"error\":\"Failed to parse result JSON\"}")
+func (processor *pdfMetadataObserver) Name() string       { return "pdf_metadata_observer" }
+func (processor *pdfMetadataObserver) Version() string    { return "1.0.0" }
+func (processor *pdfMetadataObserver) Initialize() error  { return nil }
+func (processor *pdfMetadataObserver) Shutdown() error    { return nil }
+func (processor *pdfMetadataObserver) Priority() int32    { return 80 }
+func (processor *pdfMetadataObserver) ProcessingStage() xberg.ProcessingStage {
+	return xberg.ProcessingStageEarly
+}
+func (processor *pdfMetadataObserver) ShouldProcess(
+	result xberg.ExtractedDocument,
+	_ xberg.ExtractionConfig,
+) bool {
+	return result.MimeType == "application/pdf"
+}
+func (processor *pdfMetadataObserver) EstimatedDurationMs(_ xberg.ExtractedDocument) uint64 {
+	return 1
+}
+func (processor *pdfMetadataObserver) Process(
+	result xberg.ExtractedDocument,
+	_ xberg.ExtractionConfig,
+) error {
+	if result.Metadata != nil && result.Metadata.Title != nil {
+		log.Printf("PDF title: %s", *result.Metadata.Title)
 	}
-
-	// Only process PDFs
-	mimeType, ok := result["mime_type"].(string)
-	if !ok || mimeType != "application/pdf" {
-		// Return unchanged for non-PDF documents
-		outputJSON, err := json.Marshal(result)
-		if err != nil {
-			return C.CString("{\"error\":\"Failed to serialize result\"}")
-		}
-		return C.CString(string(outputJSON))
-	}
-
-	// Process PDF-specific metadata
-	metadata, ok := result["metadata"].(map[string]interface{})
-	if !ok {
-		metadata = make(map[string]interface{})
-	}
-
-	// Mark as processed by this processor
-	metadata["pdf_processed"] = true
-
-	// Add content statistics
-	content, ok := result["content"].(string)
-	if ok {
-		metadata["content_length"] = len(content)
-	}
-
-	// Increment processed count atomically
-	atomic.AddInt64(&pdfMetadataState.processedCount, 1)
-	metadata["pdf_processor_version"] = "1.0.0"
-
-	result["metadata"] = metadata
-
-	// Serialize back to JSON
-	outputJSON, err := json.Marshal(result)
-	if err != nil {
-		return C.CString("{\"error\":\"Failed to serialize result\"}")
-	}
-
-	return C.CString(string(outputJSON))
+	log.Printf("PDF content length: %d", len(result.Content))
+	processor.processedCount.Add(1)
+	return nil
 }
 
 func main() {
-	// Register the post-processor with priority 80, early stage
-	if err := xberg.RegisterPostProcessor("pdf_metadata_extractor", 80,
-		(C.PostProcessorCallback)(C.pdfMetadataExtractor)); err != nil {
-		log.Fatalf("failed to register post-processor: %v", err)
+	processor := &pdfMetadataObserver{}
+	if err := xberg.RegisterPostProcessor(processor); err != nil {
+		log.Fatalf("register post-processor: %v", err)
 	}
 	defer func() {
-		if err := xberg.UnregisterPostProcessor("pdf_metadata_extractor"); err != nil {
-			log.Printf("warning: failed to unregister post-processor: %v", err)
+		if err := xberg.UnregisterPostProcessor(processor.Name()); err != nil {
+			log.Printf("unregister post-processor: %v", err)
 		}
-
-		log.Printf("Total PDFs processed: %d", atomic.LoadInt64(&pdfMetadataState.processedCount))
+		log.Printf("PDFs processed: %d", processor.processedCount.Load())
 	}()
 
-	// Extract PDF document
 	input := xberg.ExtractInputFromURI("document.pdf")
 	result, err := xberg.Extract(*input, xberg.ExtractionConfig{})
 	if err != nil {
-		log.Fatalf("extraction failed: %v", err)
+		log.Fatalf("extract PDF: %v", err)
 	}
-
 	log.Printf("PDF MIME type: %s", result.Results[0].MimeType)
-
-	// Parse and display metadata
-	var metadata map[string]interface{}
-	if metaJSON, ok := result.Results[0].MetadataJSON.(string); ok {
-		if err := json.Unmarshal([]byte(metaJSON), &metadata); err == nil {
-			if pdfProcessed, ok := metadata["pdf_processed"].(bool); ok && pdfProcessed {
-				log.Printf("PDF metadata extracted successfully")
-				if contentLen, ok := metadata["content_length"].(float64); ok {
-					log.Printf("Content length: %.0f bytes", contentLen)
-				}
-			}
-		}
-	}
 }
 ```

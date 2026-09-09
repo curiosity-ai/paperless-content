@@ -218,23 +218,12 @@ mod tests {
             .unwrap();
 
         let config = ExtractionConfig::default();
-        let result = extract_file(&file_path, None, &config).await;
+        let result = extract_file(&file_path, None, &config)
+            .await
+            .expect("extensionless plain text should route by content");
 
-        // Despite the test's name, `detect_mime_type` (crates/xberg/src/core/mime.rs) has
-        // no content-sniffing fallback for an extensionless path: with no `extension`, it
-        // skips straight past `mime_guess` (which also needs an extension) to the final
-        // `Err(Validation)` naming the path. This must always fail, not "gracefully do
-        // either" -- content sniffing is a real behavior this crate does not have here.
-        let error = result.expect_err("an extensionless path has no extension to sniff a MIME type from");
-        use crate::XbergError;
-        assert!(
-            matches!(error, XbergError::Validation { .. }),
-            "expected a Validation error, got: {error:?}"
-        );
-        assert!(
-            error.to_string().contains("Could not determine MIME type"),
-            "error must name the MIME-determination failure, got: {error}"
-        );
+        assert_text_content(&result.content, "plain text content");
+        assert_eq!(result.mime_type, "text/plain");
     }
 
     #[tokio::test]

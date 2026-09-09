@@ -219,16 +219,21 @@ Use provider-hosted embedding models when you need to match your vector database
 <TabItem label="TypeScript">
 
 ```typescript title="TypeScript"
-import { embedSync } from '@xberg-io/xberg';
+// NOTE: The Node/TypeScript binding has no standalone embed()/embedSync() entry
+// point — only embedding-backend registration (registerEmbeddingBackend,
+// listEmbeddingBackends, unregisterEmbeddingBackend) and the EmbeddingConfig type
+// are exposed. VLM/LLM embeddings are available through EmbeddingConfig attached to
+// ExtractionConfig.chunking, produced per chunk during extraction — see the Rust
+// tab below for the standalone dispatcher this configures.
+import type { EmbeddingConfig } from '@xberg-io/xberg';
 
-const embeddings = embedSync(['Hello world'], {
+const config: EmbeddingConfig = {
   model: {
     modelType: 'llm',
     value: 'openai/text-embedding-3-small',
   },
   normalize: true,
-});
-console.log(embeddings[0].length); // 1536
+};
 ```
 
 </TabItem>

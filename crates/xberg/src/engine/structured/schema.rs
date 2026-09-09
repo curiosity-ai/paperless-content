@@ -46,7 +46,7 @@ pub struct MergedOutput {
 ///
 /// # Arguments
 /// * `raw_responses` - Vision-LLM JSON responses (already parsed as `serde_json::Value`)
-/// * `schema` - JSON Schema (Draft 2020-12) for validation
+/// * `schema` - JSON Schema for validation; its declared `$schema` draft is honored. ~keep
 /// * `merge_mode` - Merging strategy
 ///
 /// # Behavior
@@ -69,7 +69,7 @@ pub fn validate_and_merge(
         };
     }
 
-    let validator = match jsonschema::validator_for(schema) {
+    let validator = match jsonschema::options().offline().build(schema) {
         Ok(v) => v,
         Err(e) => {
             return MergedOutput {
@@ -173,7 +173,64 @@ fn merge_validated(batches: Vec<serde_json::Value>, merge_mode: MergeMode) -> se
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
     use super::*;
+
+    const SCHEMA_SERVER_TIMEOUT: Duration = Duration::from_secs(2);
+    const SCHEMA_SERVER_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+    fn serve_schema_once() -> (String, std::net::SocketAddr, thread::JoinHandle<bool>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback schema server");
+        listener.set_nonblocking(true).expect("make schema server nonblocking");
+        let address = listener.local_addr().expect("read schema server address");
+        let handle = thread::spawn(move || {
+            let deadline = Instant::now() + SCHEMA_SERVER_TIMEOUT;
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        // On BSD-derived systems (macOS) an accepted socket INHERITS O_NONBLOCK
+                        // from its listener; on Linux it does not. Without this the read below
+                        // returns EAGAIN immediately instead of honouring the timeout, so the
+                        // server thread panics and the test fails only on macOS. ~keep
+                        stream
+                            .set_nonblocking(false)
+                            .expect("make accepted schema stream blocking");
+                        stream
+                            .set_read_timeout(Some(SCHEMA_SERVER_TIMEOUT))
+                            .expect("set schema request timeout");
+                        let mut request_prefix = [0_u8; b"TEST SHUTDOWN".len()];
+                        stream
+                            .read_exact(&mut request_prefix)
+                            .expect("read schema request prefix");
+                        if request_prefix == *b"TEST SHUTDOWN" {
+                            return false;
+                        }
+
+                        let body = r#"{"type":"object"}"#;
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .expect("write schema response");
+                        return true;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return false;
+                        }
+                        thread::sleep(SCHEMA_SERVER_POLL_INTERVAL);
+                    }
+                    Err(error) => panic!("accept schema request: {error}"),
+                }
+            }
+        });
+        (format!("http://{address}/schema.json"), address, handle)
+    }
 
     #[test]
     fn object_merge_happy_path() {
@@ -301,5 +358,90 @@ mod tests {
 
         assert_eq!(result.outcome, Outcome::Success);
         assert_eq!(result.merged.get("key").map(|v| v.as_str()), Some(Some("value")));
+    }
+
+    #[test]
+    fn should_honor_the_schema_declared_draft() {
+        let schema = serde_json::json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "array",
+            "items": [
+                { "type": "string" },
+                { "type": "integer" }
+            ],
+            "additionalItems": false
+        });
+
+        let result = validate_and_merge(vec![serde_json::json!(["entry", 7])], &schema, MergeMode::ArrayConcat);
+
+        assert_eq!(result.outcome, Outcome::Success);
+        assert_eq!(result.merged, serde_json::json!(["entry", 7]));
+    }
+
+    #[test]
+    fn should_reject_remote_schema_references_without_http_access() {
+        let (schema_url, address, server) = serve_schema_once();
+        let schema = serde_json::json!({"$ref": schema_url});
+        let result = validate_and_merge(vec![serde_json::json!({})], &schema, MergeMode::ObjectMerge);
+        if let Ok(mut shutdown) = TcpStream::connect(address) {
+            shutdown.write_all(b"TEST SHUTDOWN").expect("stop schema server");
+        }
+        let was_accessed = server.join().expect("join schema server");
+
+        assert!(!was_accessed, "schema compilation must not access remote HTTP targets");
+        assert_eq!(result.outcome, Outcome::Error);
+        assert!(
+            result
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("Retrieval is disabled")),
+            "offline rejection must explain that retrieval is disabled: {:?}",
+            result.error_message
+        );
+    }
+
+    #[test]
+    fn should_reject_file_schema_references_when_the_target_exists() {
+        let mut target = tempfile::NamedTempFile::new().expect("create referenced schema file");
+        target
+            .write_all(br#"{"type":"object"}"#)
+            .expect("write referenced schema");
+        let schema_url = url::Url::from_file_path(target.path())
+            .expect("convert referenced schema path to file URL")
+            .to_string();
+        let schema = serde_json::json!({"$ref": schema_url});
+
+        let result = validate_and_merge(vec![serde_json::json!({})], &schema, MergeMode::ObjectMerge);
+
+        assert_eq!(result.outcome, Outcome::Error);
+        assert!(
+            result
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("Retrieval is disabled")),
+            "offline rejection must explain that retrieval is disabled: {:?}",
+            result.error_message
+        );
+    }
+
+    #[test]
+    fn should_allow_in_document_schema_references_offline() {
+        let schema = serde_json::json!({
+            "$defs": { "identifier": { "type": "string" } },
+            "type": "object",
+            "properties": { "id": { "$ref": "#/$defs/identifier" } },
+            "required": ["id"]
+        });
+
+        let result = validate_and_merge(
+            vec![serde_json::json!({"id": "document-1"})],
+            &schema,
+            MergeMode::ObjectMerge,
+        );
+
+        assert_eq!(result.outcome, Outcome::Success);
+
+        let invalid_result = validate_and_merge(vec![serde_json::json!({"id": 42})], &schema, MergeMode::ObjectMerge);
+        assert_eq!(invalid_result.outcome, Outcome::SchemaInvalid);
     }
 }

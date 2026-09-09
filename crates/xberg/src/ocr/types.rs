@@ -204,14 +204,20 @@ fn default_page_number() -> u32 {
 /// whole bad page.
 const MIN_CONFIDENCE_FLOOR_DEFAULT: f64 = 0.0;
 
+/// Engine-facing PSM used when the public `types::formats::TesseractConfig::psm` is
+/// `None` (no explicit caller choice) and no pipeline-level default (whole-image,
+/// vertical-language, layout-region, sparse-retry) applied one either — see #1573.
+/// Keep in sync with the platform split documented on `types::formats::TesseractConfig::psm`.
+#[cfg(target_arch = "wasm32")]
+const DEFAULT_ENGINE_PSM: u8 = 6;
+#[cfg(not(target_arch = "wasm32"))]
+const DEFAULT_ENGINE_PSM: u8 = 3;
+
 impl Default for TesseractConfig {
     fn default() -> Self {
         Self {
             language: "eng".to_string(),
-            #[cfg(target_arch = "wasm32")]
-            psm: 6,
-            #[cfg(not(target_arch = "wasm32"))]
-            psm: 3,
+            psm: DEFAULT_ENGINE_PSM,
             output_format: "markdown".to_string(),
             oem: 3,
             min_confidence: MIN_CONFIDENCE_FLOOR_DEFAULT,
@@ -242,13 +248,22 @@ impl Default for TesseractConfig {
 impl TesseractConfig {
     #[cfg(feature = "ocr")]
     pub(crate) fn validate(&self) -> Result<(), String> {
-        match self.output_format.as_str() {
-            "text" | "markdown" | "hocr" | "tsv" => Ok(()),
-            _ => Err(format!(
+        if !matches!(self.output_format.as_str(), "text" | "markdown" | "hocr" | "tsv") {
+            return Err(format!(
                 "Invalid output_format: '{}'. Must be one of: text, markdown, hocr, tsv",
                 self.output_format
-            )),
+            ));
         }
+        if let Some(preprocessing) = &self.preprocessing {
+            crate::core::config_validation::validate_image_preprocessing_config(preprocessing).map_err(|error| {
+                if let crate::XbergError::Validation { message, .. } = error {
+                    message
+                } else {
+                    error.to_string()
+                }
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -260,7 +275,7 @@ impl TesseractConfig {
 impl From<&crate::types::TesseractConfig> for TesseractConfig {
     fn from(config: &crate::types::TesseractConfig) -> Self {
         Self {
-            psm: config.psm as u8,
+            psm: config.psm.map(|psm| psm as u8).unwrap_or(DEFAULT_ENGINE_PSM),
             language: config.language.join("+"),
             output_format: config.output_format.clone(),
             oem: config.oem as u8,
@@ -420,6 +435,36 @@ mod tests {
             };
             assert!(config.validate().is_ok());
         }
+
+        for method in ["none", "off"] {
+            let config = TesseractConfig {
+                preprocessing: Some(ImagePreprocessingConfig {
+                    deskew: false,
+                    binarization_method: method.to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert!(config.validate().is_ok(), "{method} must disable binarization");
+        }
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn should_reject_tesseract_config_when_deskew_has_no_binarization() {
+        let config = TesseractConfig {
+            preprocessing: Some(ImagePreprocessingConfig {
+                deskew: true,
+                binarization_method: "off".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            config.validate().unwrap_err(),
+            "deskew must be false when binarization_method is none or off"
+        );
     }
 
     #[cfg(feature = "ocr")]
@@ -523,7 +568,7 @@ mod tests {
     fn test_tesseract_config_from_public_api() {
         let public_config = crate::types::TesseractConfig {
             language: vec!["deu".to_string()],
-            psm: 6,
+            psm: Some(6),
             output_format: "text".to_string(),
             oem: 1,
             min_confidence: 70.0,

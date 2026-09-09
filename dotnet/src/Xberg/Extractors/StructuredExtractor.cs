@@ -20,6 +20,7 @@ public sealed class StructuredExtractor : IExtractor
         "application/json",
         "text/json",
         "application/csl+json",
+        Mime.GeoJsonMimeType,
         "application/x-ndjson",
         "application/jsonl",
         "application/x-jsonlines",
@@ -49,7 +50,8 @@ public sealed class StructuredExtractor : IExtractor
 
         StructuredResult result = mimeType switch
         {
-            "application/json" or "text/json" or "application/csl+json" => ParseJson(bytes),
+            "application/json" or "text/json" or "application/csl+json" or Mime.GeoJsonMimeType
+                => ParseJson(bytes),
             "application/x-ndjson" or "application/jsonl" or "application/x-jsonlines" => ParseJsonl(bytes),
             "application/yaml" or "application/x-yaml" or "text/yaml" or "text/x-yaml" => ParseYaml(bytes),
             "application/toml" or "text/toml" => ParseToml(bytes),
@@ -58,7 +60,8 @@ public sealed class StructuredExtractor : IExtractor
 
         string sourceFormat = mimeType switch
         {
-            "application/json" or "text/json" or "application/csl+json" => "json",
+            "application/json" or "text/json" or "application/csl+json" or Mime.GeoJsonMimeType
+                => "json",
             "application/x-ndjson" or "application/jsonl" or "application/x-jsonlines" => "jsonl",
             "application/yaml" or "application/x-yaml" or "text/yaml" or "text/x-yaml" => "yaml",
             "application/toml" or "text/toml" => "toml",

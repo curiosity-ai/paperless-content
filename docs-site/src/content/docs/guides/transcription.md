@@ -18,7 +18,8 @@ Enable the `transcription` Cargo feature and set a `TranscriptionConfig` block i
 | `audio/mp4`  | `.m4a`         | M4A / AAC in MP4             |
 | `audio/wav`  | `.wav`         | WAV / RIFF                   |
 | `audio/webm` | `.webm`        | WebM audio                   |
-| `video/mp4`  | `.mp4`, `.mpeg` | MP4 video (audio track only) |
+| `video/mp4`  | `.mp4`, `.mpg4`, `.mp4v`, `.m4v` | MP4 video (audio track only) |
+| `video/mpeg` | `.mpeg`, `.mpg`, `.mpe`, `.m1v`, `.m2v` | MPEG video (audio track only) |
 | `video/webm` | `.webm`        | WebM video (audio track only) |
 
 ## Model sizes

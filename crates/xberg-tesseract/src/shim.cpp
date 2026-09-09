@@ -26,10 +26,15 @@ char *xberg_tess_get_utf8_text(void *handle) {
   }
 }
 
-void xberg_tess_clear(void *handle) {
+int xberg_tess_clear(void *handle) {
+  if (handle == nullptr) {
+    return -1;
+  }
   try {
     TessBaseAPIClear(static_cast<TessBaseAPI *>(handle));
+    return 0;
   } catch (...) {
+    return -1;
   }
 }
 

@@ -64,11 +64,20 @@ impl SceptreWasmEngine {
         if image_bytes.is_empty() {
             return Err(XbergError::validation("Cannot run Sceptre OCR on empty image data"));
         }
-        let image = sceptre::Image::from_bytes(image_bytes).map_err(map_sceptre_error)?;
+        let image = decode_sceptre_wasm_image(image_bytes)?;
         self.reader
             .recognize(&image, &ReadOptions::default())
             .map_err(map_sceptre_error)
     }
+}
+
+fn decode_sceptre_wasm_image(image_bytes: &[u8]) -> Result<sceptre::Image> {
+    let decoded = crate::extraction::image_decode::decode_standard_rgb8_with_default_security_limits(image_bytes)
+        .map_err(|error| XbergError::Ocr {
+            message: "Sceptre OCR operation failed".to_string(),
+            source: Some(Box::new(error)),
+        })?;
+    sceptre::Image::from_rgb8(decoded.width(), decoded.height(), decoded.into_raw()).map_err(map_sceptre_error)
 }
 
 fn map_sceptre_error(error: sceptre::OcrError) -> XbergError {
@@ -89,6 +98,17 @@ fn ocr_error(message: impl Into<String>) -> XbergError {
 mod tests {
     use super::*;
     use sceptre::Language;
+
+    #[test]
+    fn should_reject_oversized_declared_dimensions_before_sceptre_wasm_decode() {
+        let oversized = crate::extraction::image_decode::bmp_with_declared_dimensions(6_000, 6_000);
+
+        let error =
+            decode_sceptre_wasm_image(&oversized).expect_err("oversized image must fail at the decoded-image budget");
+
+        let source = std::error::Error::source(&error).expect("Sceptre OCR error must preserve the decode source");
+        assert!(source.to_string().contains("security_limits.max_content_size"));
+    }
 
     #[test]
     fn should_map_all_gen2_model_groups() {

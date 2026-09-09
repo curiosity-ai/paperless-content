@@ -22,14 +22,21 @@ internal static class PdfTextRepair
     /// <summary>
     /// Repair ligature corruption using contextual heuristics. Some PDF fonts have broken
     /// ToUnicode CMaps that map ligature glyphs to punctuation: <c>!</c> → fi/ff,
-    /// <c>"</c> → ffi, <c>#</c> → fi, <c>*</c> → tt, <c>:</c> → ti, and an uppercase
-    /// <c>M</c> between lowercase letters → tti.
+    /// <c>"</c> → ffi, <c>#</c> → fi, <c>*</c> → tt.
     /// <para>
     /// Every rule is gated on its neighbours, so ordinary punctuation is untouched: there is
     /// deliberately no letter + <c>!</c> + end-of-string rule, because a sentence-final
     /// exclamation mark looks exactly like the corrupted form.
     /// </para>
     /// </summary>
+    /// <remarks>
+    /// There is no <c>:</c> → ti rule and no uppercase <c>M</c> → tti rule. Both characters
+    /// occur constantly in healthy text — ratios, times, URLs, units like "nM", identifiers —
+    /// so those arms corrupted ordinary words, turning "aMb" into "attib". They were introduced
+    /// behind a per-font broken-CMap signal that no longer exists here, and were left
+    /// unconditional when it went away. Re-add only alongside real document-level evidence
+    /// (xberg-io/xberg#1556).
+    /// </remarks>
     public static string RepairContextualLigatures(string text)
     {
         if (text.Length < 2) return text;
@@ -62,15 +69,6 @@ internal static class PdfTextRepair
                     result.Append("fi"); repaired = true; break;
                 case '*' when prevIsAlpha && nextIsAlpha:
                     result.Append("tt"); repaired = true; break;
-                case ':' when prevIsAlpha && nextIsLower:
-                    result.Append("ti"); repaired = true; break;
-                case 'M' when prevIsAlpha && !prevIsSpaceOrStart:
-                {
-                    bool prevWasLower = i > 0 && char.IsLower(text[i - 1]);
-                    if (prevWasLower && nextIsLower) { result.Append("tti"); repaired = true; }
-                    else result.Append(ch);
-                    break;
-                }
                 default:
                     result.Append(ch); break;
             }
@@ -145,11 +143,11 @@ internal static class PdfTextRepair
     /// must run before <see cref="NormalizeUnicodeText"/>, while U+2010/U+2011 are still
     /// distinguishable from an ASCII hyphen.
     /// </remarks>
-    public static string RepairSegment(string text)
+    public static string RepairSegment(string text, PdfTextRepairWitnesses witnesses)
     {
         if (text.Length == 0) return text;
         string t = NormalizeTextEncoding(text);
-        t = RepairLigatureSpaces(t);
+        t = RepairLigatureSpaces(t, witnesses);
         t = ExpandLigaturesWithSpaceAbsorption(t);
         t = CollapseSpacedHyphens(t);
         t = NormalizeUnicodeText(t);
@@ -161,12 +159,29 @@ internal static class PdfTextRepair
     /// "signif icant", "f irst".
     /// </summary>
     /// <remarks>
+    /// <para>
     /// The gap appears at the ligature position because the extractor split the glyph into
     /// characters whose advance widths no longer add up. Only an <c>f</c> followed by a space and
-    /// then <c>i</c>, <c>l</c>, or <c>f</c> qualifies, and only when the word so far is not a
-    /// common short word — otherwise "of interest" and "if flying" would lose their spaces.
+    /// then <c>i</c>, <c>l</c>, or <c>f</c> qualifies.
+    /// </para>
+    /// <para>
+    /// That same character pattern is also an ordinary word boundary whenever a word happens to
+    /// end in <c>f</c> and the next happens to begin with <c>i</c>, <c>l</c> or <c>f</c> —
+    /// "relief for", "itself infringes", "bedrijf is". At the string layer the two cases are
+    /// indistinguishable; only whether the document itself uses the word elsewhere tells them
+    /// apart, so the space survives when either fragment is attested in
+    /// <paramref name="witnesses"/>. The guard this replaces tested a hard-coded list of 33 short
+    /// English words against the <em>left</em> fragment only, so everything outside that list
+    /// welded, English included (xberg-io/xberg#1591).
+    /// </para>
+    /// <para>
+    /// Known limits, stated rather than silently accepted: a real word ending in <c>f</c> used
+    /// exactly once in the whole document, right before an <c>i</c>/<c>l</c>/<c>f</c>-initial
+    /// word, still welds; and a genuine ligature fragment that coincides with an attested word is
+    /// left split. Both need a coincidence the static list could never have caught either.
+    /// </para>
     /// </remarks>
-    public static string RepairLigatureSpaces(string text)
+    public static string RepairLigatureSpaces(string text, PdfTextRepairWitnesses witnesses)
     {
         if (!text.Contains("f ", StringComparison.Ordinal)) return text;
 
@@ -177,19 +192,33 @@ internal static class PdfTextRepair
             char ch = text[i];
             if (ch == 'f' && i + 1 < text.Length && text[i + 1] == ' ')
             {
-                char continuation = i + 2 < text.Length ? text[i + 2] : '\0';
-                bool isLigatureContinuation = continuation is 'i' or 'l' or 'f';
-                if (isLigatureContinuation && !IsCommonShortWord(text.AsSpan(wordStart, i - wordStart + 1)))
+                var rightWord = AlphabeticRunAt(text, i + 2);
+                if (rightWord.Length > 0 && PdfTextRepairWitnesses.IsLigatureContinuation(rightWord[0]))
                 {
-                    result.Append(ch);
-                    i++; // swallow the space
-                    continue;
+                    var leftWord = text.AsSpan(wordStart, i - wordStart + 1);
+                    bool weldsAWitnessedWord =
+                        witnesses.IsWitnessedWord(leftWord) || witnesses.IsWitnessedWord(rightWord);
+                    if (!weldsAWitnessedWord)
+                    {
+                        result.Append(ch);
+                        i++; // swallow the space
+                        continue;
+                    }
                 }
             }
             result.Append(ch);
             if (!char.IsLetter(ch)) wordStart = i + 1;
         }
         return result.Length == text.Length ? text : result.ToString();
+    }
+
+    /// <summary>The maximal run of letters starting at <paramref name="start"/>, possibly empty.</summary>
+    private static ReadOnlySpan<char> AlphabeticRunAt(string text, int start)
+    {
+        if (start >= text.Length) return default;
+        int end = start;
+        while (end < text.Length && char.IsLetter(text[end])) end++;
+        return text.AsSpan(start, end - start);
     }
 
     /// <summary>
@@ -425,11 +454,14 @@ internal static class PdfTextRepair
     private static int Utf8Len(string s) => Encoding.UTF8.GetByteCount(s);
 
     /// <summary>
-    /// Whether a word is one of the short function words that legitimately end in <c>f</c>
-    /// before a space — "of interest", "if flying". Guards
-    /// <see cref="RepairLigatureSpaces"/> against eating a real word boundary, and keeps
-    /// <see cref="RepairBrokenWordSpacing"/> from swallowing a real word.
+    /// Whether a word is one of the short function words a repair must not swallow, which keeps
+    /// <see cref="RepairBrokenWordSpacing"/> from absorbing a real word.
     /// </summary>
+    /// <remarks>
+    /// This list used to be the only guard on <see cref="RepairLigatureSpaces"/> too, tested
+    /// against the left fragment alone; it now judges by what the document itself attests
+    /// instead, since no fixed list can decide a boundary that depends on the text at hand.
+    /// </remarks>
     private static bool IsCommonShortWord(ReadOnlySpan<char> word) =>
         CommonShortWords.Contains(word.ToString());
 

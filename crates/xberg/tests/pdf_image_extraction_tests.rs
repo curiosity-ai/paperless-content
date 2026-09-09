@@ -1172,6 +1172,14 @@ fn test_include_page_rasters_emits_warning_on_document_level_ocr_bypass() {
             include_page_rasters: true,
             ..Default::default()
         }),
+        // Zero margins are what select the document-level OCR path; the non-zero defaults
+        // (0.06 / 0.05) route to per-page image OCR instead, and this mock's `process_image`
+        // panics by design. See `should_use_per_page_ocr_only_when_effective_margins_are_nonzero`. ~keep
+        pdf_options: Some(xberg::PdfConfig {
+            top_margin_fraction: Some(0.0),
+            bottom_margin_fraction: Some(0.0),
+            ..Default::default()
+        }),
         use_cache: false,
         ..Default::default()
     };

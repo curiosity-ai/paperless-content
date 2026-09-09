@@ -138,7 +138,7 @@ public static class PdfStructure
     private const int SPARSE_PEER_HEADING_MIN_PAGES = 2;
     /// <summary>Font tolerance for the repeated-peer-tier test.</summary>
     private const float SPARSE_PEER_HEADING_FONT_TOLERANCE = 0.5f;
-    private const int MAX_BOLD_HEADING_WORD_COUNT = 12;
+    internal const int MAX_BOLD_HEADING_WORD_COUNT = 12;
 
     /// <summary>Longest a run may be and still be read as a page number (Rust
     /// <c>MAX_PAGE_NUMBER_WORD_COUNT</c>).</summary>
@@ -220,6 +220,11 @@ public static class PdfStructure
             catch { }
         }
 
+        // Text-repair evidence is document-scoped and must be gathered before any page's
+        // segments are consumed: a witness on one page can be the sole evidence for a repair
+        // decision on another.
+        var witnesses = PdfTextRepairWitnesses.Collect(allPageSegments);
+
         var headingMap = BuildHeadingMap(allPageSegments, kClusters);
         float? docBodyFontSize = null;
         foreach (var (fs, lvl) in headingMap) { if (lvl is null) { docBodyFontSize = fs; break; } }
@@ -276,8 +281,8 @@ public static class PdfStructure
             // continuation and dehyphenation rules read the last and first characters of
             // neighbouring segments — a trailing soft hyphen or control character left in place
             // would be read as ordinary text and change the decision.
-            ApplyToAllSegments(paras, PdfTextRepair.RepairSegment);
-            DehyphenateParagraphs(paras);
+            ApplyToAllSegments(paras, text => PdfTextRepair.RepairSegment(text, witnesses));
+            DehyphenateParagraphs(paras, witnesses);
             SplitEmbeddedListItems(paras);
             SynchronizeParagraphTextMetadata(paras);
             MergeContinuationParagraphs(paras);
@@ -303,6 +308,7 @@ public static class PdfStructure
         foreach (var page in allPageParagraphs) RetainPageFurnitureSafely(page);
         DeduplicateParagraphs(allPageParagraphs);
         CompactFinalHeadingHierarchy(allPageParagraphs);
+        PdfBodySizeBoldHeadings.Promote(allPageParagraphs, docBodyFontSize);
 
         var doc = AssembleInternalDocument(allPageParagraphs, tablesByPage);
 
@@ -1250,7 +1256,8 @@ public static class PdfStructure
         ("user", "defined"), ("well", "known"),
     };
 
-    private static bool ShouldPreserveLexicalHyphen(string trailingWord, string leadingWord)
+    private static bool ShouldPreserveLexicalHyphen(
+        string trailingWord, string leadingWord, PdfTextRepairWitnesses witnesses)
     {
         static string Trim(string s)
         {
@@ -1264,7 +1271,10 @@ public static class PdfStructure
             if (string.Equals(left, expectedLeft, StringComparison.OrdinalIgnoreCase)
                 && string.Equals(right, expectedRight, StringComparison.OrdinalIgnoreCase))
                 return true;
-        return false;
+        // The static list covers common English compounds; a hyphen the document itself writes
+        // mid-run elsewhere is the document's own evidence that this one is authored rather than
+        // a line-wrap artefact (xberg-io/xberg#1543).
+        return witnesses.Hyphens.Contains((left.ToLowerInvariant(), right.ToLowerInvariant()));
     }
 
     /// <summary>
@@ -1278,16 +1288,16 @@ public static class PdfStructure
     /// word onto the first. Here the halves are actually spliced: the trailing segment absorbs
     /// the leading word and the following segment gives it up.
     /// </remarks>
-    private static void DehyphenateParagraphs(List<PdfParagraph> paragraphs)
+    private static void DehyphenateParagraphs(List<PdfParagraph> paragraphs, PdfTextRepairWitnesses witnesses)
     {
         foreach (var para in paragraphs)
         {
             if (para.IsCodeBlock || para.Lines.Count < 2) continue;
-            DehyphenateParagraphLines(para);
+            DehyphenateParagraphLines(para, witnesses);
         }
     }
 
-    private static void DehyphenateParagraphLines(PdfParagraph para)
+    private static void DehyphenateParagraphLines(PdfParagraph para, PdfTextRepairWitnesses witnesses)
     {
         float maxRightEdge = 0f;
         foreach (var line in para.Lines)
@@ -1304,6 +1314,12 @@ public static class PdfStructure
             if (trailingSegments.Count == 0 || leadingSegments.Count == 0) continue;
 
             var trailingSeg = trailingSegments[^1];
+            // A paragraph line boundary is not always a visual one: inline style and
+            // font-resource splitting introduce them mid-line, so a suspended hyphen
+            // ("vracht- en verzendkosten") can end one logical line and begin the next while
+            // both runs share a baseline. Joining is licensed only across a real line break
+            // (xberg-io/xberg#1561).
+            if (!CrossesVisualLineBreak(trailingSeg, leadingSegments[0])) continue;
             if (maxRightEdge > 0f && trailingSeg.X + trailingSeg.Width < threshold) continue;
 
             string trailingText = trailingSeg.Text;
@@ -1317,7 +1333,7 @@ public static class PdfStructure
             string trailingWord = LastWhitespaceSeparatedWord(trailingText.TrimEnd('-'));
             if (trailingWord.Length > 0 && IsCjkChar(trailingWord[^1])) continue;
 
-            string preservedHyphen = ShouldPreserveLexicalHyphen(trailingWord, leadingWord) ? "-" : "";
+            string preservedHyphen = ShouldPreserveLexicalHyphen(trailingWord, leadingWord, witnesses) ? "-" : "";
             string joinedWord = trailingWord + preservedHyphen + leadingWord;
 
             // The characters dropped off the trailing segment are counted in UTF-8 bytes, as
@@ -1952,7 +1968,7 @@ public static class PdfStructure
 
     // ── heading refinement (classify.rs) ─────────────────────────────────────────
 
-    private static string ParagraphPlainText(PdfParagraph p) =>
+    internal static string ParagraphPlainText(PdfParagraph p) =>
         string.Join(" ", p.Lines.SelectMany(l => l.Segments).Select(s => s.Text));
 
     private static string EffectiveText(PdfParagraph p) => p.Text.Length > 0 ? p.Text : ParagraphPlainText(p);
@@ -2586,7 +2602,7 @@ public static class PdfStructure
         _ => false,
     };
 
-    private static bool IsSeparatorText(string text)
+    internal static bool IsSeparatorText(string text)
     {
         string trimmed = text.Trim();
         if (trimmed.Length == 0) return false;
@@ -2596,7 +2612,7 @@ public static class PdfStructure
         return total >= 6 && ((double)alnum / total) < 0.15;
     }
 
-    private static bool LooksLikeFigureLabel(string text)
+    internal static bool LooksLikeFigureLabel(string text)
     {
         var words = text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
         if (words.Length >= 3 && words.All(w => w.Length <= 1)) return true;
@@ -2609,13 +2625,13 @@ public static class PdfStructure
         return false;
     }
 
-    private static bool LooksLikeBareUrl(string text)
+    internal static bool LooksLikeBareUrl(string text)
     {
         string t = text.Trim();
         return (t.StartsWith("http://") || t.StartsWith("https://") || t.StartsWith("www.")) && !t.Any(char.IsWhiteSpace);
     }
 
-    private static bool IsSectionPattern(string text)
+    internal static bool IsSectionPattern(string text)
     {
         string t = text.Trim();
         if (t.StartsWith('§')) return true;
@@ -2624,7 +2640,7 @@ public static class PdfStructure
         return StartsWithSectionNumber(t);
     }
 
-    private static bool IsNumberedSectionHeading(string text)
+    internal static bool IsNumberedSectionHeading(string text)
     {
         string t = text.Trim();
         if (t.Length == 0) return false;
@@ -3010,7 +3026,7 @@ public static class PdfStructure
                 var nextSeg = all[runStart];
                 string prevLast = prevSeg.Text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).LastOrDefault() ?? "";
                 string nextFirst = nextSeg.Text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
-                if (ShouldDehyphenate(prevLast, nextFirst)) { if (text.Length > 0) text.Remove(text.Length - 1, 1); }
+                if (ShouldDehyphenate(prevLast, nextFirst, prevSeg, nextSeg)) { if (text.Length > 0) text.Remove(text.Length - 1, 1); }
                 else if (SegmentsNeedSpace(prevSeg, prevLast, nextSeg, nextFirst)) text.Append(' ');
             }
 
@@ -3021,7 +3037,7 @@ public static class PdfStructure
                 {
                     var (prev, prevIdx) = runWords[wi - 1];
                     var (word, wordIdx) = runWords[wi];
-                    if (ShouldDehyphenate(prev, word)) { if (text.Length > 0) text.Remove(text.Length - 1, 1); }
+                    if (ShouldDehyphenate(prev, word, all[prevIdx], all[wordIdx])) { if (text.Length > 0) text.Remove(text.Length - 1, 1); }
                     else if (prevIdx == wordIdx) { if (NeedsSpaceBetween(prev, word)) text.Append(' '); }
                     else if (SegmentsNeedSpace(all[prevIdx], prev, all[wordIdx], word)) text.Append(' ');
                 }
@@ -3063,7 +3079,7 @@ public static class PdfStructure
                         if (wordsPerLine[p].Count > 0) { prev = wordsPerLine[p][^1]; break; }
                 if (prev is not { } previous) { result.Append(word); continue; }
 
-                if (ShouldDehyphenate(previous.Word, word))
+                if (ShouldDehyphenate(previous.Word, word, previous.Segment, seg))
                 {
                     if (result.Length > 0) result.Remove(result.Length - 1, 1);
                     result.Append(word);
@@ -3089,9 +3105,75 @@ public static class PdfStructure
     /// lines, in different styles, or with an explicit space at the boundary always take one.
     /// Ports Rust <c>segments_need_space</c>.
     /// </remarks>
+    /// <summary>
+    /// Maximum horizontal gap between two same-line, same-font-size segments, as a fraction of
+    /// the larger font size, that identifies them as one word split across a font-resource
+    /// change rather than a genuine inter-word space.
+    /// </summary>
+    /// <remarks>
+    /// Chosen for headroom on both sides rather than to sit at either bound: the reported defect
+    /// measures 0.008 em, and a gap the rest of the pipeline treats as a real word boundary sits
+    /// at 0.05 em. At 0.05 the outcome would be decided by how <c>fontSize * ratio</c> rounds,
+    /// which flips with the font size — and a threshold that flips on font size is not a
+    /// threshold. 0.025 em sits about 3x above the defect and 2x below the word-boundary bound
+    /// at every font size (xberg-io/xberg#1566).
+    /// </remarks>
+    private const float TOUCHING_SPAN_GAP_EM_RATIO = 0.025f;
+
+    /// <summary>Maximum baseline difference, in points, for two spans to count as touching.
+    /// Tighter than the same-line test, which must tolerate wrapped-line reflow noise.</summary>
+    private const float TOUCHING_SPAN_BASELINE_TOLERANCE = 0.05f;
+
+    /// <summary>Maximum font-size difference for two spans to count as touching, as a fraction
+    /// of the larger of the two.</summary>
+    private const float TOUCHING_SPAN_FONT_SIZE_TOLERANCE_RATIO = 0.01f;
+
+    /// <summary>
+    /// Whether two segments are the two halves of one word split across a mid-word font-resource
+    /// change: same rotation frame, same baseline, same font size, a gap far below a genuine word
+    /// space, and a word character immediately on each side of the boundary.
+    /// </summary>
+    /// <remarks>
+    /// A word drawn as two spans 0.069 pt apart — 0.008 em at 9 pt, against a 2.5 pt space glyph
+    /// — came back as "pri js" instead of "prijs". No gap threshold could produce that space,
+    /// because the style comparison returns first: a mid-word switch between two embedded subset
+    /// fonts whose descriptors disagree reads as a style change with no geometric signal. So this
+    /// is checked <em>before</em> any bold/italic/monospace comparison. It can only ever join two
+    /// spans, never split them, so it cannot regress a document that already reads correctly
+    /// (xberg-io/xberg#1566).
+    /// </remarks>
+    internal static bool SegmentsAreTouching(
+        SegmentData prevSeg, string prevWord, SegmentData nextSeg, string nextWord)
+    {
+        if (prevWord.Length == 0 || nextWord.Length == 0) return false;
+        if (!char.IsLetterOrDigit(prevWord[^1]) || !char.IsLetterOrDigit(nextWord[0])) return false;
+
+        // An explicitly drawn space at the boundary outranks any geometry: the producer emitted a
+        // space glyph, and its advance is already inside the previous segment's extent, so the
+        // measured gap collapses to ~0 and reads as "touching" — exactly the shape this fires on.
+        // Words are whitespace-split, so neither word can reveal it; only the segment text can.
+        if ((prevSeg.Text.Length > 0 && char.IsWhiteSpace(prevSeg.Text[^1]))
+            || (nextSeg.Text.Length > 0 && char.IsWhiteSpace(nextSeg.Text[0])))
+            return false;
+
+        if (!prevSeg.HasSameRotation(nextSeg)) return false;
+
+        if (Math.Abs(prevSeg.UprightBaseline() - nextSeg.UprightBaseline()) > TOUCHING_SPAN_BASELINE_TOLERANCE)
+            return false;
+
+        float maxFontSize = Math.Max(Math.Max(prevSeg.FontSize, nextSeg.FontSize), 1.0f);
+        if (Math.Abs(prevSeg.FontSize - nextSeg.FontSize) > maxFontSize * TOUCHING_SPAN_FONT_SIZE_TOLERANCE_RATIO)
+            return false;
+
+        float gap = nextSeg.UprightAdvanceExtent().Start - prevSeg.UprightAdvanceExtent().End;
+        return Math.Abs(gap) < maxFontSize * TOUCHING_SPAN_GAP_EM_RATIO;
+    }
+
     private static bool SegmentsNeedSpace(SegmentData prevSeg, string prevWord, SegmentData nextSeg, string nextWord)
     {
         if (!NeedsSpaceBetween(prevWord, nextWord)) return false;
+
+        if (SegmentsAreTouching(prevSeg, prevWord, nextSeg, nextWord)) return false;
 
         bool explicitBoundarySpace =
             (prevSeg.Text.Length > 0 && char.IsWhiteSpace(prevSeg.Text[^1]))
@@ -3115,12 +3197,49 @@ public static class PdfStructure
         return advanceGap > nextSeg.FontSize * SEGMENT_GAP_SPACE_RATIO;
     }
 
-    private static bool ShouldDehyphenate(string prev, string next)
+    /// <summary>
+    /// Whether a line-ending hyphen should be dropped and the two words joined.
+    /// </summary>
+    /// <remarks>
+    /// The text pattern alone — trailing <c>-</c>, a letter before it, lowercase after — is
+    /// also what a <em>suspended</em> hyphen looks like mid-line: Dutch "onderhouds- en" and
+    /// "CV- en" matched it and were welded into "onderhoudsen" and "CVen", neither of which is a
+    /// word. So the two runs must additionally sit on genuinely different visual lines
+    /// (xberg-io/xberg#1581). The check strictly narrows the predicate, so it cannot create a
+    /// join anywhere one did not already happen.
+    /// </remarks>
+    private static bool ShouldDehyphenate(string prev, string next, SegmentData prevSeg, SegmentData nextSeg)
     {
         if (prev.Length < 2 || !prev.EndsWith('-')) return false;
         char? beforeHyphen = prev.Length >= 2 ? prev[^2] : (char?)null;
         if (!(beforeHyphen.HasValue && char.IsLetter(beforeHyphen.Value))) return false;
-        return next.Length > 0 && char.IsLower(next[0]);
+        if (!(next.Length > 0 && char.IsLower(next[0]))) return false;
+        return CrossesVisualLineBreak(prevSeg, nextSeg);
+    }
+
+    /// <summary>
+    /// Maximum baseline difference, in points, for two runs to count as one visual line rather
+    /// than two split by a real line break.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately its own constant rather than a reuse of
+    /// <see cref="INLINE_STYLE_BASELINE_TOLERANCE"/> (same value): that one drives the
+    /// inline-style grouping call sites, and coupling dehyphenation to it would let an unrelated
+    /// change there silently retune this.
+    /// </remarks>
+    private const float LINE_BREAK_BASELINE_TOLERANCE = 0.5f;
+
+    /// <summary>
+    /// Whether two runs sit on genuinely different visual lines, rather than being one line
+    /// split by a style-run or font-resource boundary.
+    /// </summary>
+    private static bool CrossesVisualLineBreak(SegmentData trailing, SegmentData leading)
+    {
+        if (!trailing.HasSameRotation(leading)) return false;
+        float trailingBaseline = trailing.UprightBaseline();
+        float leadingBaseline = leading.UprightBaseline();
+        return float.IsFinite(trailingBaseline) && float.IsFinite(leadingBaseline)
+            && Math.Abs(trailingBaseline - leadingBaseline) > LINE_BREAK_BASELINE_TOLERANCE;
     }
 
     private static bool NeedsSpaceBetween(string prev, string next)

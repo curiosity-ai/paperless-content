@@ -40,12 +40,70 @@ public static class Mime
     /// <summary>The MIME every source file resolves to, whatever language it turns out to be.</summary>
     public const string CodeMimeType = "text/x-source-code";
 
+    /// <summary>GeoJSON — JSON syntax, routed to the structured extractor.</summary>
+    public const string GeoJsonMimeType = "application/geo+json";
+
+    /// <summary>KML — XML syntax, routed to the XML extractor.</summary>
+    public const string KmlMimeType = "application/vnd.google-earth.kml+xml";
+
+    /// <summary>A packaged OpenDocument drawing.</summary>
+    public const string OdgMimeType = "application/vnd.oasis.opendocument.graphics";
+
+    /// <summary>
+    /// The flat single-file XML variant of <see cref="OdgMimeType"/> (<c>.fodg</c>): the whole
+    /// package's <c>content.xml</c> inlined as one document, with no ZIP layer.
+    /// </summary>
+    public const string OdgFlatMimeType = "application/vnd.oasis.opendocument.graphics-flat-xml";
+
+    /// <summary>The ODF namespace bound to the <c>office:</c> prefix, used to confirm that a flat
+    /// ODF document's root really is <c>office:document</c> before trusting its
+    /// <c>office:mimetype</c>.</summary>
+    private const string OdfOfficeNamespace = "urn:oasis:names:tc:opendocument:xmlns:office:1.0";
+
+    /// <summary>The MS-CFB (compound binary file) signature, shared by legacy .doc/.xls/.ppt.</summary>
+    private static bool IsOle2(ReadOnlySpan<byte> b) =>
+        b.Length >= 8 && b[0] == 0xD0 && b[1] == 0xCF && b[2] == 0x11 && b[3] == 0xE0 &&
+        b[4] == 0xA1 && b[5] == 0xB1 && b[6] == 0x1A && b[7] == 0xE1;
+
+    /// <summary>
+    /// Identify a legacy MS-CFB compound document (.doc/.xls/.ppt) from its root storage CLSID,
+    /// returning null when the container declares one this port does not recognise.
+    /// </summary>
+    /// <remarks>
+    /// Ports upstream's <c>detect_ole2_package</c>. The container magic is shared by every legacy
+    /// Office binary format, so without this a <c>.xls</c> or <c>.ppt</c> whose extension is
+    /// missing or wrong was answered as <c>application/msword</c>. A compound file cannot be
+    /// typed from a truncated prefix — locating the root directory entry means following the FAT
+    /// sector chain, and a chain built from a partial read references sectors the buffer does not
+    /// contain — so this is only attempted against the whole file (xberg-io/xberg#1590).
+    /// </remarks>
+    private static string? DetectOle2Package(ReadOnlySpan<byte> content)
+    {
+        if (!IsOle2(content)) return null;
+        try
+        {
+            return Internal.Cfb.CompoundFile.Open(content).RootClsid.ToString() switch
+            {
+                "00020810-0000-0000-c000-000000000046" or "00020820-0000-0000-c000-000000000046"
+                    => "application/vnd.ms-excel",
+                "00020906-0000-0000-c000-000000000046" => "application/msword",
+                "64818d10-4f9b-11cf-86ea-00aa00b929e8" => "application/vnd.ms-powerpoint",
+                _ => null,
+            };
+        }
+        catch (Exception e) when (e is InvalidDataException or ArgumentException or IndexOutOfRangeException)
+        {
+            return null;
+        }
+    }
+
     /// <summary>Content-based detection. Returns null when the type cannot be determined.</summary>
     public static string? DetectMimeTypeFromBytes(ReadOnlySpan<byte> content, bool sourceCode = true)
     {
         string? magic = SniffMagic(content);
         if (magic is not null)
         {
+            if (IsOle2(content) && DetectOle2Package(content) is { } ole2) return ole2;
             if (magic == "application/zip")
             {
                 string? office = DetectOfficeFormatFromZip(content);
@@ -134,12 +192,25 @@ public static class Mime
         var header = content.Length > MagicHeaderBytes ? content[..MagicHeaderBytes] : content;
         if (header.IsEmpty) return extensionMime;
 
-        string? fromMagic = DetectMimeTypeFromBytes(header, sourceCode);
+        // A compound file is the exception to reading only the header: its magic names the
+        // container, not the format, and the root directory entry that does name the format is
+        // reached by following the FAT sector chain — through sectors a 4 KiB prefix does not
+        // contain (xberg-io/xberg#1590). Resolve it over the whole buffer instead.
+        string? fromMagic = IsOle2(content)
+            ? DetectOle2Package(content)
+            : DetectMimeTypeFromBytes(header, sourceCode);
         if (fromMagic is null || fromMagic == extensionMime) return extensionMime;
 
         if (fromMagic == "text/plain") return extensionMime;
-        if (IsGenericXmlMime(fromMagic) && IsSpecificXmlMime(extensionMime)) return extensionMime;
-        if (fromMagic == "application/json" && IsSpecificJsonMime(extensionMime)) return extensionMime;
+        // A more specific vocabulary only outranks the generic syntax it is written in when this
+        // port can actually extract it: `.atom` and `.gltf` are XML and JSON vocabularies nothing
+        // here handles, so a file with one of those extensions is better served as the XML or
+        // JSON the content says it is than as a type no extractor claims (upstream
+        // `fix(mime): reject unsupported vocabulary MIME`).
+        if (IsGenericXmlMime(fromMagic) && IsSpecificXmlMime(extensionMime)
+            && SupportedMimeTypes.Contains(extensionMime)) return extensionMime;
+        if (fromMagic == "application/json" && IsSpecificJsonMime(extensionMime)
+            && SupportedMimeTypes.Contains(extensionMime)) return extensionMime;
         if (IsAmbiguousContainer(fromMagic)) return extensionMime;
 
         return SupportedMimeTypes.Contains(fromMagic) || fromMagic.StartsWith("image/", StringComparison.Ordinal)
@@ -174,7 +245,36 @@ public static class Mime
         }
         string? root = RootStartTag(trimmed);
         if (root is null) return null;
-        return RootIsInNamespace(root, "http://docbook.org/ns/docbook") ? DocbookMimeType : null;
+        if (RootIsInNamespace(root, "http://docbook.org/ns/docbook")) return DocbookMimeType;
+        // A flat ODF document carries the packaged MIME type inside itself, as the root
+        // element's `office:mimetype`, rather than as a separate file in a ZIP — so content
+        // detection reads that attribute rather than sniffing a container.
+        if (RootIsInNamespace(root, OdfOfficeNamespace)
+            && RootLocalNameIs(root, "document")
+            && RootAttributeValue(root, "office:mimetype") == OdgMimeType)
+            return OdgFlatMimeType;
+        return null;
+    }
+
+    /// <summary>The local name of the root element, ignoring any namespace prefix.</summary>
+    private static bool RootLocalNameIs(string root, string localName)
+    {
+        string name = root.TrimStart('<').Split(' ', '\t', '\n', '\r', '>', '/')[0];
+        int colon = name.IndexOf(':');
+        return (colon >= 0 ? name[(colon + 1)..] : name) == localName;
+    }
+
+    /// <summary>The value of a quoted attribute on the root start tag, or null when absent.</summary>
+    private static string? RootAttributeValue(string root, string attribute)
+    {
+        int start = root.IndexOf(attribute + "=", StringComparison.Ordinal);
+        if (start < 0) return null;
+        string value = root[(start + attribute.Length + 1)..];
+        if (value.Length == 0) return null;
+        char quote = value[0];
+        if (quote != '"' && quote != '\'') return null;
+        int end = value.IndexOf(quote, 1);
+        return end > 0 ? value[1..end] : null;
     }
 
     /// <summary>
@@ -387,9 +487,10 @@ public static class Mime
         if (b.Length >= 4 && ((b[0] == 0x49 && b[1] == 0x49 && b[2] == 0x2A && b[3] == 0x00) ||
                               (b[0] == 0x4D && b[1] == 0x4D && b[2] == 0x00 && b[3] == 0x2A))) return "image/tiff";
         if (b.Length >= 4 && b[0] == 0x25 && b[1] == 0x50 && b[2] == 0x44 && b[3] == 0x46) return "application/pdf";
-        // OLE2 / CFB compound file (doc/xls/ppt/msg/hwp) — default to msword without CLSID resolution.
-        if (b.Length >= 8 && b[0] == 0xD0 && b[1] == 0xCF && b[2] == 0x11 && b[3] == 0xE0 &&
-            b[4] == 0xA1 && b[5] == 0xB1 && b[6] == 0x1A && b[7] == 0xE1) return "application/msword";
+        // OLE2 / CFB compound file (doc/xls/ppt/msg/hwp). The container magic names only the
+        // container, so `DetectMimeTypeFromBytes` follows up with the root storage's CLSID;
+        // `application/msword` is what a caller sees when that read cannot settle it.
+        if (IsOle2(b)) return "application/msword";
         if (b.Length >= 6 && b[0] == 0x37 && b[1] == 0x7A && b[2] == 0xBC && b[3] == 0xAF && b[4] == 0x27 && b[5] == 0x1C)
             return "application/x-7z-compressed";
         if (b.Length >= 2 && b[0] == 0x1F && b[1] == 0x8B) return "application/gzip";
@@ -484,9 +585,10 @@ public static class Mime
         Add("text/x-quarto", "qmd");
         Add("text/x-r-markdown", "rmd");
         Add("text/mdx", "mdx");
-        Add("text/x-djot", "djot");
+        Add("text/x-djot", "djot", "dj");
         Add("application/pdf", "pdf");
         Add("text/html", "html", "htm");
+        Add("application/xhtml+xml", "xhtml", "xht");
         Add("application/vnd.openxmlformats-officedocument.wordprocessingml.document", "docx");
         Add("application/vnd.ms-word.document.macroEnabled.12", "docm");
         Add("application/vnd.openxmlformats-officedocument.wordprocessingml.template", "dotx");
@@ -498,14 +600,14 @@ public static class Mime
         Add("application/vnd.ms-powerpoint.presentation.macroEnabled.12", "pptm");
         Add("application/vnd.openxmlformats-officedocument.presentationml.template", "potx");
         Add("application/vnd.ms-powerpoint.template.macroEnabled.12", "potm");
-        Add("application/vnd.ms-powerpoint", "ppt", "pot");
+        Add("application/vnd.ms-powerpoint", "ppt", "pot", "pps");
         Add("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx");
         Add("application/vnd.openxmlformats-officedocument.spreadsheetml.template", "xltx");
-        Add("application/vnd.ms-excel", "xls", "xlt");
+        Add("application/vnd.ms-excel", "xls", "xlt", "xla");
         Add("application/vnd.ms-excel.sheet.macroEnabled.12", "xlsm");
         Add("application/vnd.ms-excel.sheet.binary.macroEnabled.12", "xlsb");
         Add("application/vnd.ms-excel.addin.macroEnabled.12", "xlam");
-        Add("application/vnd.ms-excel.template.macroEnabled.12", "xla");
+        Add("application/vnd.ms-excel.template.macroEnabled.12", "xltm");
         Add("application/vnd.oasis.opendocument.spreadsheet", "ods");
         Add("application/vnd.oasis.opendocument.presentation", "odp");
         Add("application/x-dbf", "dbf");
@@ -518,13 +620,16 @@ public static class Mime
         Add("image/png", "png");
         Add("image/tiff", "tiff", "tif");
         Add("image/webp", "webp");
-        Add("image/jp2", "jp2", "j2k", "j2c");
+        Add("image/jp2", "jp2", "jpg2");
+        Add("image/j2c", "j2c", "j2k", "jpc");
         Add("image/jpx", "jpx");
         Add("image/jpm", "jpm");
         Add("image/mj2", "mj2");
         Add("image/x-jbig2", "jbig2", "jb2");
-        Add("image/heic", "heic", "heics");
-        Add("image/heif", "heif");
+        Add("image/heic", "heic");
+        Add("image/heic-sequence", "heics");
+        Add("image/heif", "heif", "hif");
+        Add("image/heif-sequence", "heifs");
         Add("image/avif", "avif");
         Add("image/avcs", "avcs");
         Add("image/x-portable-anymap", "pnm");
@@ -534,10 +639,15 @@ public static class Mime
         Add("text/csv", "csv");
         Add("text/tab-separated-values", "tsv");
         Add("application/json", "json");
+        // Geospatial siblings of JSON and XML: each keeps its own MIME so a consumer can tell
+        // what it is, and routes to the extractor for the syntax it is written in.
+        Add(GeoJsonMimeType, "geojson");
         Add("application/x-ndjson", "jsonl", "ndjson");
         Add("application/x-yaml", "yaml", "yml");
         Add("application/toml", "toml");
         Add("application/xml", "xml");
+        Add(KmlMimeType, "kml");
+        Add(OdgFlatMimeType, "fodg");
         Add("image/svg+xml", "svg");
         Add("message/rfc822", "eml");
         Add("application/vnd.ms-outlook", "msg");

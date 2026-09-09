@@ -78,6 +78,22 @@ def validate_aggregation_gate(jobs: dict[str, list[str]], benchmark_jobs: set[st
         raise ValueError("aggregate-and-publish validation gates must precede publication")
 
 
+def validate_tika_artifact(jobs: dict[str, list[str]]) -> None:
+    prefetch = jobs.get("prefetch-tika", [])
+    tika = jobs.get("bench-tika", [])
+    prefetch_text = "\n".join(prefetch)
+    tika_text = "\n".join(tika)
+    if prefetch_text.count("repo.maven.apache.org/maven2/org/apache/tika/") != 1:
+        raise ValueError("prefetch-tika must download Apache Tika exactly once")
+    if "${TIKA_SHA256}  ${jar_path}" not in prefetch_text:
+        raise ValueError("prefetch-tika must verify the pinned Apache Tika checksum")
+    for job, text in (("prefetch-tika", prefetch_text), ("bench-tika", tika_text)):
+        if "          name: apache-tika-jar" not in text:
+            raise ValueError(f"{job} must use the shared apache-tika-jar artifact")
+    if "repo1.maven.org" in tika_text or "repo.maven.apache.org" in tika_text:
+        raise ValueError("bench-tika matrix jobs must not download Apache Tika independently")
+
+
 def strip_comment(value: str) -> str:
     return value.split("#", 1)[0].strip()
 
@@ -235,6 +251,7 @@ def workflow_cells(workflow: str) -> list[dict[str, object]]:
     jobs = split_jobs(workflow)
     benchmark_jobs = {job for job in jobs if job.startswith("bench-") and "      matrix:" in jobs[job]}
     validate_aggregation_gate(jobs, benchmark_jobs)
+    validate_tika_artifact(jobs)
     for job in sorted(benchmark_jobs):
         lines = jobs[job]
         dimensions, excludes = parse_matrix(job, lines)

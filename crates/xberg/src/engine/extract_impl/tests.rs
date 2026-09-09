@@ -8,6 +8,12 @@ use super::*;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::core::config::concurrency::LayoutBatchWorkload;
 
+#[test]
+fn extraction_cache_namespaces_invalidate_pre_f32_pdf_results() {
+    assert_eq!(CACHE_KEY_NAMESPACE, b"xberg-engine-extract-v2");
+    assert_eq!(BATCH_CACHE_KEY_NAMESPACE, b"xberg-engine-extract-batch-v2");
+}
+
 #[tokio::test]
 async fn extract_bytes_input_returns_envelope() {
     let config = ExtractionConfig::default();
@@ -723,7 +729,7 @@ fn engine_batch_concurrency_detects_per_input_layout_override() {
 
 #[cfg(feature = "url-ingestion")]
 #[tokio::test]
-async fn url_markdown_page_runs_through_pipeline() {
+async fn url_markdown_page_runs_through_pipeline_and_preserves_source_mime() {
     let config = ExtractionConfig::default();
     let links = vec![ExtractedUri {
         url: "https://example.com/next".to_string(),
@@ -736,15 +742,82 @@ async fn url_markdown_page_runs_through_pipeline() {
         "alpha beta gamma delta epsilon zeta eta theta".to_string(),
         true,
         "text/html; charset=utf-8",
+        "",
         links,
         &config,
     )
     .await
     .unwrap();
 
-    assert_eq!(result.mime_type, "text/markdown");
+    assert_eq!(result.mime_type, "text/html");
     assert_eq!(result.metadata.output_format.as_deref(), Some("plain"));
     assert_eq!(result.uris.as_ref().map(Vec::len), Some(1));
+}
+
+#[cfg(feature = "url-ingestion")]
+#[tokio::test]
+async fn url_page_rejects_untrusted_content_type_as_public_mime() {
+    let result = run_url_page_pipeline(
+        "safe content".to_string(),
+        true,
+        "text/html\r\nx-injected: value",
+        "",
+        Vec::new(),
+        &ExtractionConfig::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.mime_type, "text/html");
+}
+
+/// GH CI E2E `test_metadata_access`: a crawled page is restamped `text/html`, so
+/// `metadata.format.html` must be populated even though the extraction itself ran over
+/// crawlberg's pre-rendered markdown and never touched the HTML extractor.
+#[cfg(all(feature = "url-ingestion", feature = "html"))]
+#[tokio::test]
+async fn url_html_page_recovers_format_metadata_from_source_html_when_content_is_markdown() {
+    let source_html = "<html><head><title>Simple Table Test</title></head><body><h1>Heading</h1></body></html>";
+
+    let result = run_url_page_pipeline(
+        "# Heading\n\nalpha beta gamma".to_string(),
+        true,
+        "text/html",
+        source_html,
+        Vec::new(),
+        &ExtractionConfig::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.mime_type, "text/html");
+    let Some(crate::types::FormatMetadata::Html(html_metadata)) = result.metadata.format else {
+        panic!("expected FormatMetadata::Html; got {:?}", result.metadata.format);
+    };
+    assert_eq!(html_metadata.title.as_deref(), Some("Simple Table Test"));
+}
+
+/// Negative control for the test above: with no source HTML to recover from, the format field
+/// stays `None` rather than being invented.
+#[cfg(all(feature = "url-ingestion", feature = "html"))]
+#[tokio::test]
+async fn url_page_without_source_html_leaves_format_metadata_unset() {
+    let result = run_url_page_pipeline(
+        "alpha beta gamma".to_string(),
+        true,
+        "text/html",
+        "",
+        Vec::new(),
+        &ExtractionConfig::default(),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        result.metadata.format.is_none(),
+        "format must stay None with no HTML to read; got {:?}",
+        result.metadata.format
+    );
 }
 
 #[cfg(feature = "tree-sitter")]
@@ -777,38 +850,91 @@ async fn extract_py_local_uri_returns_source_code_mime() {
     assert!(output.results[0].content.len() >= 5, "content must be non-trivial");
 }
 
-#[cfg(feature = "url-ingestion")]
 #[test]
-fn refine_downloaded_mime_type_passthrough_non_octet_stream() {
-    let refined = refine_downloaded_mime_type("application/pdf", Some("document.py"), "http://example.com/document.py");
-    assert_eq!(
-        refined, "application/pdf",
-        "explicit server MIME type must not be overridden by filename"
-    );
+fn downloaded_specific_http_mime_remains_authoritative_under_every_policy() {
+    for policy in [
+        crate::MimeDetectionPolicy::PreferContent,
+        crate::MimeDetectionPolicy::TrustExtension,
+        crate::MimeDetectionPolicy::ContentOnly,
+    ] {
+        let config = ExtractionConfig {
+            mime_detection_policy: policy,
+            ..Default::default()
+        };
+        let resolved = resolve_bytes_mime_type(
+            Some("application/pdf"),
+            Some("document.txt"),
+            br#"{"kind":"json"}"#,
+            &config,
+        )
+        .unwrap();
+        assert_eq!(resolved, "application/pdf", "unexpected MIME for {policy:?}");
+    }
 }
 
-#[cfg(all(feature = "url-ingestion", feature = "tree-sitter"))]
 #[test]
-fn refine_downloaded_mime_type_py_extension_resolves_to_source_code() {
-    let refined = refine_downloaded_mime_type(
-        "application/octet-stream",
-        Some("hello.py"),
-        "http://example.com/code/hello.py",
-    );
-    assert_eq!(
-        refined, "text/x-source-code",
-        "octet-stream with .py filename must resolve to text/x-source-code"
-    );
+fn downloaded_octet_stream_uses_policy_with_derived_filename() {
+    let cases = [
+        (crate::MimeDetectionPolicy::PreferContent, "application/json"),
+        (crate::MimeDetectionPolicy::TrustExtension, "text/plain"),
+        (crate::MimeDetectionPolicy::ContentOnly, "application/json"),
+    ];
+    for (policy, expected) in cases {
+        let config = ExtractionConfig {
+            mime_detection_policy: policy,
+            ..Default::default()
+        };
+        let resolved = resolve_bytes_mime_type(
+            Some("application/octet-stream"),
+            Some("download.txt"),
+            br#"{"kind":"json"}"#,
+            &config,
+        )
+        .unwrap();
+        assert_eq!(resolved, expected, "unexpected MIME for {policy:?}");
+    }
 }
 
-#[cfg(feature = "url-ingestion")]
 #[test]
-fn refine_downloaded_mime_type_no_filename_returns_octet_stream() {
-    let refined = refine_downloaded_mime_type("application/octet-stream", None, "http://example.com/download");
-    assert_eq!(
-        refined, "application/octet-stream",
-        "no filename means no refinement; extract_bytes handles sniffing"
-    );
+fn prefer_content_bytes_falls_back_from_unsupported_specialized_extension_to_plain_text() {
+    let config = ExtractionConfig {
+        mime_detection_policy: crate::MimeDetectionPolicy::PreferContent,
+        ..Default::default()
+    };
+
+    let resolved = resolve_bytes_mime_type(None, Some("feed.atom"), b"ordinary prose without markup", &config).unwrap();
+
+    assert_eq!(resolved, "text/plain");
+}
+
+#[test]
+fn content_only_bytes_ignores_a_supported_filename_extension() {
+    let config = ExtractionConfig {
+        mime_detection_policy: crate::MimeDetectionPolicy::ContentOnly,
+        ..Default::default()
+    };
+
+    let resolved = resolve_bytes_mime_type(None, Some("document.txt"), br#"{"kind":"content"}"#, &config).unwrap();
+
+    assert_eq!(resolved, "application/json");
+}
+
+#[cfg(feature = "tree-sitter")]
+#[test]
+fn generic_text_keeps_tree_sitter_content_detection_without_bypassing_trusted_extensions() {
+    use crate::core::config::TreeSitterConfig;
+
+    let source = b"#!/usr/bin/env python3\nprint('hello')\n";
+    let mut config = ExtractionConfig {
+        tree_sitter: Some(TreeSitterConfig::default()),
+        ..Default::default()
+    };
+    let detected = resolve_bytes_mime_type(None, Some("script.unknown"), source, &config).unwrap();
+    assert_eq!(detected, "text/x-source-code");
+
+    config.mime_detection_policy = crate::MimeDetectionPolicy::TrustExtension;
+    let trusted = resolve_bytes_mime_type(None, Some("script.txt"), source, &config).unwrap();
+    assert_eq!(trusted, "text/plain");
 }
 
 /// Regression: a shared-URL batch result that maps to no input slot (e.g.

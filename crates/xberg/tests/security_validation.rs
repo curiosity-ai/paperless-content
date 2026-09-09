@@ -629,17 +629,7 @@ fn test_security_special_file_handling() {
     let config = ExtractionConfig::default();
     let result = extract_uri_document_blocking(path.to_str().expect("Operation failed"), None, &config);
 
-    // ~keep: MEASURED 2026-08-22, and it contradicts the obvious guess. `NamedTempFile`
-    // gets a random extensionless name, and the path-based lookup does NOT then fall back
-    // to content sniffing -- extraction fails outright with a Validation error naming the
-    // path. Asserting a `text/plain` sniff here would assert a behaviour this crate does
-    // not have. Whether the URI path SHOULD sniff on an unknown extension, the way
-    // extract_bytes does, is a real question; this test pins today's answer so a change
-    // to it is visible rather than silent.
-    let error = result.expect_err("an extensionless path must be rejected, not sniffed");
-    let message = error.to_string();
-    assert!(
-        message.contains("Could not determine MIME type"),
-        "expected a MIME-determination failure naming the path, got: {message}"
-    );
+    let extracted = result.expect("an extensionless plain-text file should route by content");
+    assert_text_content(&extracted.content, "test content");
+    assert_eq!(extracted.mime_type, "text/plain");
 }

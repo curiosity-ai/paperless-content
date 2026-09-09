@@ -133,29 +133,56 @@ public class OxStructureOrderTests
     }
 
     /// <summary>
-    /// A tagged RTL form whose label and value cells sit either side of a ruled grid. Read
-    /// geometrically, the two are separate words in separate cells and the grid reads as a
-    /// 10x4 table; read in structure order they are reading-order-adjacent, so
-    /// `merge_adjacent_words` fuses each label with its value into one word whose box spans
-    /// the whole row — leaving three of the four columns empty, which `is_valid_table`
-    /// rejects. Upstream emits no table here.
+    /// A tagged RTL form whose label and value cells sit either side of a ruled grid: the port
+    /// recovers the same single table the Rust reference does, at the same geometry.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This test previously asserted the opposite — that upstream emits <em>no</em> table here,
+    /// on the reasoning that structure-order word merging fuses each label with its value into
+    /// one row-spanning word, emptying three of four columns and failing the validity check. That
+    /// was written while the fixture corpus was absent, so it had never run; once fetched, it
+    /// failed on the first execution.
+    /// </para>
+    /// <para>
+    /// Settled against the Rust reference (<c>tools/xberg-reference-gen</c>) rather than by
+    /// reasoning: upstream emits exactly one table for this fixture, spanning
+    /// (85, 254)-(506, 495) on page 1 with 11 rows, and the port already produced precisely that.
+    /// The port was never wrong; the expectation was. It is kept as a parity guard rather than
+    /// deleted, now asserting the geometry the reference actually reports.
+    /// </para>
+    /// </remarks>
     [Fact]
-    public void ATaggedRtlFormYieldsNoSpatialTable()
+    public void ATaggedRtlFormRecoversTheSameTableAsTheReference()
     {
-        string? path = FindFixture("vendored/docling/pdf/right_to_left_03.pdf");
-        if (path is null) return;
+        string path = RequireFixture("vendored/docling/pdf/right_to_left_03.pdf");
 
         var result = new Extractor().Extract(
             ExtractInput.FromUri(path), new ExtractionConfig { OutputFormat = OutputFormat.Plain });
 
-        Assert.Empty(result.Results[0].Tables);
+        var table = Assert.Single(result.Results[0].Tables);
+        Assert.Equal(1u, table.PageNumber);
+        Assert.Equal(11, table.Cells.Count);
+        var box = table.BoundingBox!;
+        Assert.Equal(85.0, box.X0, 1);
+        Assert.Equal(254.0, box.Y0, 1);
+        Assert.Equal(506.0, box.X1, 1);
+        Assert.Equal(495.0, box.Y1, 1);
     }
 
-    private static string? FindFixture(string relative) =>
-        new[]
+    /// <summary>
+    /// The fixture's path, or a failure naming it. A test that returns early when its fixture is
+    /// missing passes without asserting anything — which is how the assertion above sat green
+    /// through an entire upstream sync while being wrong.
+    /// </summary>
+    private static string RequireFixture(string relative)
+    {
+        string? path = new[]
         {
             Path.Combine("/workspace/test_documents", relative),
             Path.Combine(AppContext.BaseDirectory, "../../../../../../test_documents", relative),
         }.FirstOrDefault(File.Exists);
+        Assert.True(path is not null, $"corpus fixture missing: {relative}");
+        return path!;
+    }
 }

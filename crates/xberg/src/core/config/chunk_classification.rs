@@ -27,6 +27,7 @@ pub const DEFAULT_MAX_CONCURRENCY: usize = 4;
 /// label carries its own semantic description, letting the LLM disambiguate
 /// similarly named labels without relying on the label string alone.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "alef-meta", alef(since = "1.0.0"))]
 pub struct ChunkClassificationDefinition {
@@ -45,6 +46,7 @@ pub struct ChunkClassificationDefinition {
 /// (`ExtractedDocument::chunks`) rather than whole pages, and built for large
 /// taxonomies where each label needs its own description rather than a bare name.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "alef-meta", alef(since = "1.0.0"))]
 pub struct ChunkClassificationConfig {

@@ -157,11 +157,9 @@ fn build_metadata(image_bytes: &[u8], table_count: u32) -> Metadata {
 
 /// Read image dimensions from the header without decoding pixel data.
 fn probe_image_dimensions(image_bytes: &[u8]) -> Option<(u32, u32)> {
-    image::ImageReader::new(std::io::Cursor::new(image_bytes))
-        .with_guessed_format()
-        .ok()?
-        .into_dimensions()
+    crate::extraction::image_decode::probe_standard_image_with_default_security_limits(image_bytes)
         .ok()
+        .map(|(width, height, _)| (width, height))
 }
 
 /// Parse every GFM table in `content` into structured [`Table`] entries.

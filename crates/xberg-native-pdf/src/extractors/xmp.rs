@@ -371,8 +371,14 @@ impl XmpExtractor {
                     element_stack.pop();
                 }
                 Ok(Event::Eof) => break,
-                Err(e) => {
-                    tracing::warn!("XMP parsing error: {:?}", e);
+                Err(_) => {
+                    tracing::warn!(
+                        target: crate::LOG_TARGET_ROOT,
+                        operation = "parse_xmp_metadata",
+                        error_code = "malformed_xml",
+                        error_offset = reader.reader.buffer_position(),
+                        "stopping XMP metadata parsing"
+                    );
                     break;
                 }
                 _ => {}
@@ -396,6 +402,46 @@ impl XmpExtractor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+    use tracing::Level;
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    #[derive(Clone, Default)]
+    struct EventCapture(Arc<Mutex<Vec<(Level, String, BTreeMap<String, String>)>>>);
+
+    impl<S> Layer<S> for EventCapture
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(&self, event: &tracing::Event<'_>, _context: tracing_subscriber::layer::Context<'_, S>) {
+            let mut fields = FieldCapture::default();
+            event.record(&mut fields);
+            self.0.lock().unwrap().push((
+                *event.metadata().level(),
+                event.metadata().target().to_string(),
+                fields.0,
+            ));
+        }
+    }
+
+    #[derive(Default)]
+    struct FieldCapture(BTreeMap<String, String>);
+
+    impl tracing::field::Visit for FieldCapture {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_string(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+    }
 
     #[test]
     fn test_parse_xmp_basic() {
@@ -548,5 +594,32 @@ mod tests {
         let metadata = XmpExtractor::parse_xmp(xmp).unwrap().unwrap();
 
         assert_eq!(metadata.dc_creator, vec!["Jane & John #1", "Smith"]);
+    }
+
+    #[test]
+    fn malformed_xmp_warning_has_stable_identity_without_parser_text() {
+        const CONFIDENTIAL_MARKER: &str = "CONFIDENTIAL_XMP_ELEMENT_2fd6";
+        let xmp = format!("<rdf:RDF><{CONFIDENTIAL_MARKER}></wrong></rdf:RDF>");
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+
+        let result = tracing::subscriber::with_default(subscriber, || XmpExtractor::parse_xmp(&xmp));
+
+        assert!(result.is_ok());
+        let events = capture.0.lock().unwrap().clone();
+        let warnings: Vec<_> = events
+            .iter()
+            .filter(|(level, target, fields)| {
+                *level == Level::WARN
+                    && target == crate::LOG_TARGET_ROOT
+                    && fields.get("operation").map(String::as_str) == Some("parse_xmp_metadata")
+            })
+            .collect();
+        assert_eq!(warnings.len(), 1, "expected one XMP parser warning: {events:#?}");
+        let fields = &warnings[0].2;
+        assert_eq!(fields.get("error_code").map(String::as_str), Some("malformed_xml"));
+        assert!(fields.contains_key("error_offset"));
+        assert!(!fields.contains_key("error"));
+        assert!(!format!("{events:?}").contains(CONFIDENTIAL_MARKER));
     }
 }

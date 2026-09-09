@@ -297,9 +297,16 @@ impl From<crate::types::extraction::ExtractedDocument> for InternalDocument {
     /// reconstructed from `ExtractedDocument`, which is why `pre_rendered_content`
     /// carries the text.
     fn from(result: crate::types::extraction::ExtractedDocument) -> Self {
+        let extraction_method = result.extraction_method;
         let mut doc = Self::new(result.mime_type.as_ref());
         doc.mime_type = result.mime_type.into_owned();
         doc.metadata = result.metadata;
+        if let Some(extraction_method) = extraction_method {
+            doc.metadata.additional.insert(
+                std::borrow::Cow::Borrowed("extraction_method"),
+                serde_json::Value::String(extraction_method.as_str().to_string()),
+            );
+        }
         doc.tables = result.tables;
         doc.images = result.images.unwrap_or_default();
         doc.uris = result.uris.unwrap_or_default();

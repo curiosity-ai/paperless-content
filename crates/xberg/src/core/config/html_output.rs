@@ -35,6 +35,7 @@ fn default_true() -> bool {
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HtmlOutputConfig {
     /// Inline CSS string injected into the output after the theme stylesheet.
     /// Concatenated after `css_file` content when both are set.

@@ -65,4 +65,10 @@ func storeInVectorDatabase(records []VectorRecord) {
 		}
 	}
 }
+
+func main() {
+	if _, err := extractAndVectorize("document.pdf", "document-1"); err != nil {
+		fmt.Printf("Extraction failed: %v\n", err)
+	}
+}
 ```

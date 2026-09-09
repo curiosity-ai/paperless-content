@@ -104,7 +104,13 @@ public class DataXmlTests
     public void SupportedMimeTypes_MatchRust()
     {
         var mimes = new XmlExtractor().SupportedMimeTypes.ToList();
-        Assert.Equal(new[] { "application/xml", "text/xml", "image/svg+xml", "application/x-endnote+xml" }, mimes);
+        Assert.Equal(
+            new[]
+            {
+                "application/xml", "text/xml", Mime.KmlMimeType, "image/svg+xml",
+                "application/x-endnote+xml", Mime.OdgFlatMimeType,
+            },
+            mimes);
     }
 
     /// <summary>

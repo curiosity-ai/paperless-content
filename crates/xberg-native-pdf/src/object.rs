@@ -253,14 +253,15 @@ impl Object {
                             tracing::debug!(bytes = data.len(), "decryption successful");
                             data
                         }
-                        Err(e) => {
+                        Err(error) => {
                             tracing::error!(
                                 object_id = obj_num,
                                 generation = gen_num,
-                                error = %e,
+                                error_code = error.telemetry_code(),
+                                error_offset = ?error.telemetry_offset(),
                                 "decryption failed"
                             );
-                            return Err(e);
+                            return Err(error);
                         }
                     }
                 } else {
@@ -409,11 +410,30 @@ pub fn extract_ccitt_params_with_width(
     image_width: Option<u32>,
 ) -> Option<crate::decoders::CcittParams> {
     let dict = match params_obj? {
-        Object::Dictionary(d) => d,
-        Object::Array(arr) => arr.iter().filter_map(|obj| obj.as_dict()).next()?,
+        Object::Dictionary(dict) => dict,
+        Object::Array(params) => params.iter().find_map(Object::as_dict)?,
         _ => return None,
     };
+    ccitt_params_from_dict(dict, image_width)
+}
 
+pub(crate) fn extract_ccitt_params_with_width_at_index(
+    params_obj: Option<&Object>,
+    filter_index: usize,
+    image_width: Option<u32>,
+) -> Option<crate::decoders::CcittParams> {
+    let dict = match params_obj? {
+        Object::Dictionary(d) => d,
+        Object::Array(arr) => arr.get(filter_index)?.as_dict()?,
+        _ => return None,
+    };
+    ccitt_params_from_dict(dict, image_width)
+}
+
+fn ccitt_params_from_dict(
+    dict: &std::collections::HashMap<String, Object>,
+    image_width: Option<u32>,
+) -> Option<crate::decoders::CcittParams> {
     let k = dict.get("K").and_then(|obj| obj.as_integer()).unwrap_or(0);
 
     let columns = dict
@@ -950,6 +970,26 @@ mod tests {
         let result = extract_ccitt_params(Some(&arr)).unwrap();
         assert_eq!(result.k, -1);
         assert_eq!(result.columns, 612);
+    }
+
+    #[test]
+    fn test_extract_ccitt_params_skips_unrelated_filter_dictionary() {
+        let mut ccitt = HashMap::new();
+        ccitt.insert("K".to_string(), Object::Integer(-1));
+        ccitt.insert("Columns".to_string(), Object::Integer(2542));
+        ccitt.insert("Rows".to_string(), Object::Integer(4222));
+        ccitt.insert("BlackIs1".to_string(), Object::Boolean(true));
+        let params = Object::Array(vec![Object::Dictionary(HashMap::new()), Object::Dictionary(ccitt)]);
+
+        let result = extract_ccitt_params_with_width_at_index(Some(&params), 1, Some(2542)).unwrap();
+
+        assert_eq!(
+            result.k, -1,
+            "CCITT parameters must not come from the preceding ASCII85 filter"
+        );
+        assert_eq!(result.columns, 2542);
+        assert_eq!(result.rows, Some(4222));
+        assert!(result.black_is_1);
     }
 
     #[test]

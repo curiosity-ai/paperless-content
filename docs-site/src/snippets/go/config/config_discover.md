@@ -3,22 +3,16 @@ package main
 
 import (
 	"log"
-
-	"github.com/xberg-io/xberg/packages/go"
+	"os"
+	"os/exec"
 )
 
 func main() {
-	config, err := xberg.LoadExtractionConfigFromFile("")
-	if err != nil {
-		log.Fatalf("discover config failed: %v", err)
+	command := exec.Command("xberg", "extract", "document.pdf")
+	command.Stdout = os.Stdout
+	command.Stderr = os.Stderr
+	if err := command.Run(); err != nil {
+		log.Fatalf("extract with automatically discovered config: %v", err)
 	}
-
-	input := xberg.ExtractInputFromURI("document.pdf")
-	result, err := xberg.Extract(*input, *config)
-	if err != nil {
-		log.Fatalf("extract failed: %v", err)
-	}
-
-	log.Printf("Content length: %d", len(result.Results[0].Content))
 }
 ```

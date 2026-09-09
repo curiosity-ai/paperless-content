@@ -69,7 +69,7 @@ pub enum ChunkerType {
 /// `Xenova/cl100k_base`). To size chunks with your own tokenizer instead (llama.cpp/GGUF
 /// vocabularies, SentencePiece models, custom vocabs), register a `TokenizerBackend`
 /// with `register_tokenizer_backend` and set `model` to the registered name.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Default)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ChunkSizing {
     /// Size measured in Unicode characters (default).
@@ -91,8 +91,34 @@ pub enum ChunkSizing {
     },
 }
 
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum ChunkSizingWire {
+    Characters {},
+    #[cfg(feature = "chunking-tokenizers")]
+    Tokenizer {
+        model: String,
+        #[serde(default)]
+        cache_dir: Option<std::path::PathBuf>,
+    },
+}
+
+impl<'de> Deserialize<'de> for ChunkSizing {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match ChunkSizingWire::deserialize(deserializer)? {
+            ChunkSizingWire::Characters {} => Self::Characters,
+            #[cfg(feature = "chunking-tokenizers")]
+            ChunkSizingWire::Tokenizer { model, cache_dir } => Self::Tokenizer { model, cache_dir },
+        })
+    }
+}
+
 /// Post-processor configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PostProcessorConfig {
     /// Enable post-processors
     #[serde(default = "default_true")]
@@ -335,6 +361,7 @@ impl Default for ChunkingConfig {
 /// Configures embedding generation using ONNX models via the vendored embedding engine.
 /// Requires the `embeddings` feature to be enabled.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EmbeddingConfig {
     /// The embedding model to use (defaults to "gte-modernbert-base" preset if not specified)
     #[serde(default = "default_model", deserialize_with = "deserialize_null_model")]
@@ -420,7 +447,7 @@ impl Default for EmbeddingConfig {
 
 /// Embedding model types supported by Xberg.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EmbeddingModelType {
     /// Use a preset model configuration (recommended)
     Preset {
@@ -600,6 +627,11 @@ mod tests {
     }
 
     #[test]
+    fn chunk_sizing_rejects_unknown_fields() {
+        assert!(serde_json::from_str::<ChunkSizing>(r#"{"type":"characters","model":"ignored"}"#).is_err());
+    }
+
+    #[test]
     fn chunking_config_serialization_omits_removed_breadcrumb_settings() {
         let config = serde_json::to_value(ChunkingConfig::default()).expect("chunking config must serialize");
 
@@ -685,6 +717,12 @@ mod tests {
         let result: Result<EmbeddingModelType, _> = serde_json::from_str(wrong_json);
 
         assert!(result.is_err(), "Should reject adjacently-tagged format");
+    }
+
+    #[test]
+    fn embedding_model_type_rejects_unknown_fields() {
+        let json = r#"{"type":"preset","name":"fast","extra_name":"slow"}"#;
+        assert!(serde_json::from_str::<EmbeddingModelType>(json).is_err());
     }
 
     /// Tests round-trip serialization/deserialization of EmbeddingConfig.

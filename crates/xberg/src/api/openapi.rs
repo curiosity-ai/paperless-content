@@ -16,7 +16,7 @@ use utoipa::OpenApi;
     info(
         title = "Xberg API",
         version = env!("CARGO_PKG_VERSION"),
-        description = "High-performance document intelligence API for extracting text, metadata, and structured data from PDFs, Office documents, images, and 101 formats.",
+        description = "High-performance document intelligence API for extracting text, metadata, and structured data from PDFs, Office documents, images, and 107 formats.",
         contact(
             name = "Xberg",
             url = "https://xberg.io"
@@ -64,6 +64,7 @@ use utoipa::OpenApi;
             crate::api::types::WarmRequest,
             crate::api::types::WarmResponse,
             crate::core::mime::SupportedFormat,
+            crate::core::config::MimeDetectionPolicy,
             crate::core::config::ExtractionResult,
             crate::core::config::ExtractionSummary,
             crate::core::config::ExtractionErrorItem,
@@ -85,6 +86,7 @@ use utoipa::OpenApi;
             crate::types::tables::Table,
             crate::types::page::PageContent,
             crate::types::djot::DjotContent,
+            crate::types::djot::DjotAttributeGroup,
             // Nested schemas reachable from the types above. utoipa emits a `$ref`
             // for each of these but only defines a component for types listed here,
             // so omitting one produces a dangling pointer (#251). ~keep
@@ -388,6 +390,20 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&schema).expect("Invalid JSON");
         assert!(parsed.is_object());
         assert!(parsed["openapi"].is_string());
+    }
+
+    #[test]
+    #[cfg(feature = "api")]
+    fn should_publish_mime_detection_policy_as_a_snake_case_enum_component() {
+        let document: serde_json::Value =
+            serde_json::from_str(&openapi_json()).expect("OpenAPI document must be valid JSON");
+        let schema = &document["components"]["schemas"]["MimeDetectionPolicy"];
+
+        assert_eq!(schema["type"], "string");
+        assert_eq!(
+            schema["enum"],
+            serde_json::json!(["prefer_content", "trust_extension", "content_only"])
+        );
     }
 
     #[test]

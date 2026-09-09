@@ -7,6 +7,29 @@ use crate::plugins::OcrBackend;
 use ahash::AHashMap;
 use std::sync::Arc;
 
+pub(crate) fn builtin_ocr_backend_names() -> Vec<&'static str> {
+    let mut names = vec![
+        #[cfg(any(feature = "ocr", feature = "ocr-wasm"))]
+        "tesseract",
+        #[cfg(paddle_ocr)]
+        "paddle-ocr",
+        #[cfg(all(sceptre_ocr, not(target_arch = "wasm32")))]
+        "sceptre",
+        #[cfg(all(feature = "liter-llm", not(target_arch = "wasm32")))]
+        "vlm",
+        #[cfg(feature = "candle-trocr")]
+        "candle-trocr",
+        #[cfg(feature = "candle-paddleocr-vl")]
+        "candle-paddleocr-vl",
+        #[cfg(feature = "candle-glm-ocr")]
+        "candle-glm-ocr",
+        #[cfg(all(feature = "candle-deepseek-ocr", not(target_arch = "wasm32")))]
+        "candle-deepseek-ocr",
+    ];
+    names.sort_unstable();
+    names
+}
+
 /// Registry for OCR backend plugins.
 ///
 /// Manages OCR backends with backend type and language-based selection.
@@ -306,7 +329,19 @@ impl OcrBackendRegistry {
 
     /// List all registered backend names.
     pub fn list(&self) -> Vec<String> {
-        self.backends.keys().cloned().collect()
+        let mut names: Vec<_> = self.backends.keys().cloned().collect();
+        names.sort_unstable();
+        names
+    }
+
+    pub(crate) fn registered_snapshot(&self) -> Vec<(String, Arc<dyn OcrBackend>)> {
+        let mut backends: Vec<_> = self
+            .backends
+            .iter()
+            .map(|(name, backend)| (name.clone(), Arc::clone(backend)))
+            .collect();
+        backends.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        backends
     }
 
     /// Remove a backend from the registry.
@@ -369,6 +404,58 @@ impl OcrBackendRegistry {
 impl Default for OcrBackendRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod capability_manifest_tests {
+    use super::*;
+
+    #[test]
+    fn builtin_capability_manifest_is_sorted_and_matches_active_features() {
+        let names = builtin_ocr_backend_names();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted);
+
+        assert_eq!(
+            names.contains(&"tesseract"),
+            cfg!(any(feature = "ocr", feature = "ocr-wasm"))
+        );
+        assert_eq!(names.contains(&"paddle-ocr"), cfg!(paddle_ocr));
+        assert_eq!(
+            names.contains(&"sceptre"),
+            cfg!(all(sceptre_ocr, not(target_arch = "wasm32")))
+        );
+        assert_eq!(
+            names.contains(&"vlm"),
+            cfg!(all(feature = "liter-llm", not(target_arch = "wasm32")))
+        );
+        assert_eq!(names.contains(&"candle-trocr"), cfg!(feature = "candle-trocr"));
+        assert_eq!(
+            names.contains(&"candle-paddleocr-vl"),
+            cfg!(feature = "candle-paddleocr-vl")
+        );
+        assert_eq!(names.contains(&"candle-glm-ocr"), cfg!(feature = "candle-glm-ocr"));
+        assert_eq!(
+            names.contains(&"candle-deepseek-ocr"),
+            cfg!(all(feature = "candle-deepseek-ocr", not(target_arch = "wasm32")))
+        );
+        #[cfg(feature = "sceptre-ocr-candle")]
+        assert!(cfg!(sceptre_ocr));
+    }
+
+    #[test]
+    fn registered_backend_snapshot_is_sorted() {
+        let registry = OcrBackendRegistry::new();
+        let names: Vec<_> = registry
+            .registered_snapshot()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted);
     }
 }
 

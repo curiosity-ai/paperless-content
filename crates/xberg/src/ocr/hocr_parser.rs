@@ -82,16 +82,113 @@ pub(crate) fn parse_hocr_to_internal_document_with_dictionary_filter(
 /// it gets back can never know the true page number on its own. Callers that OCR one page at a
 /// time out of a larger document (the PDF OCR route) pass the real 1-indexed page number here,
 /// via `TesseractConfig::page_number`, instead of letting every page collapse to `1`.
+#[cfg(test)]
 pub(crate) fn parse_hocr_to_internal_document_with_page_offset(
     hocr_html: &str,
     dictionary_filter: Option<&DictionaryLineFilter<'_>>,
     page_offset: u32,
 ) -> InternalDocument {
+    parse_hocr_to_internal_document_with_page_offset_and_stats(hocr_html, dictionary_filter, page_offset).document
+}
+
+/// Parsed hOCR plus bounded counters needed by the OCR warning pipeline. ~keep
+pub(crate) struct HocrParseResult {
+    pub document: InternalDocument,
+    pub dictionary_filtered_line_count: usize,
+    pub retained_word_confidence_stats: RetainedWordConfidenceStats,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RetainedWordConfidenceStats {
+    histogram: [usize; 101],
+    count: usize,
+    sum: u64,
+    low_confidence_count: usize,
+}
+
+impl Default for RetainedWordConfidenceStats {
+    fn default() -> Self {
+        Self {
+            histogram: [0; 101],
+            count: 0,
+            sum: 0,
+            low_confidence_count: 0,
+        }
+    }
+}
+
+impl RetainedWordConfidenceStats {
+    pub(crate) fn record(&mut self, confidence: f64) {
+        if !confidence.is_finite() || !(0.0..=100.0).contains(&confidence) {
+            return;
+        }
+        let confidence = confidence.round() as usize;
+        self.histogram[confidence] = self.histogram[confidence].saturating_add(1);
+        self.count = self.count.saturating_add(1);
+        self.sum = self.sum.saturating_add(confidence as u64);
+        if confidence < 50 {
+            self.low_confidence_count = self.low_confidence_count.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn word_count(&self) -> usize {
+        self.count
+    }
+
+    pub(crate) fn mean(&self) -> Option<u64> {
+        (self.count > 0).then(|| self.sum / self.count as u64)
+    }
+
+    pub(crate) fn median(&self) -> Option<usize> {
+        if self.count == 0 {
+            return None;
+        }
+        let upper = self.value_at_rank(self.count / 2)?;
+        if self.count.is_multiple_of(2) {
+            let lower = self.value_at_rank(self.count / 2 - 1)?;
+            Some((lower + upper) / 2)
+        } else {
+            Some(upper)
+        }
+    }
+
+    pub(crate) fn p10(&self) -> Option<usize> {
+        if self.count == 0 {
+            None
+        } else {
+            self.value_at_rank((self.count - 1) / 10)
+        }
+    }
+
+    pub(crate) fn low_confidence_word_count(&self) -> usize {
+        self.low_confidence_count
+    }
+
+    fn value_at_rank(&self, rank: usize) -> Option<usize> {
+        let mut cumulative = 0usize;
+        for (confidence, count) in self.histogram.iter().enumerate() {
+            cumulative = cumulative.saturating_add(*count);
+            if rank < cumulative {
+                return Some(confidence);
+            }
+        }
+        None
+    }
+}
+
+/// Parse hOCR and report how many physical lines dictionary filtering removed. ~keep
+pub(crate) fn parse_hocr_to_internal_document_with_page_offset_and_stats(
+    hocr_html: &str,
+    dictionary_filter: Option<&DictionaryLineFilter<'_>>,
+    page_offset: u32,
+) -> HocrParseResult {
     let mut doc = InternalDocument::new("ocr");
     doc.mime_type = "application/x-hocr".to_string();
 
     let mut element_index: u32 = 0;
     let mut last_page: Option<u32> = None;
+    let mut dictionary_filtered_line_count = 0usize;
+    let mut retained_word_confidence_stats = RetainedWordConfidenceStats::default();
 
     let bytes = hocr_html.as_bytes();
     let mut pos = 0;
@@ -148,15 +245,17 @@ pub(crate) fn parse_hocr_to_internal_document_with_page_offset(
                 .next()
                 .unwrap_or("p")
                 .to_ascii_lowercase();
-            let (paragraph, end_pos) = parse_paragraph(
+            let (paragraph, end_pos, filtered_lines) = parse_paragraph(
                 hocr_html,
                 pos,
                 last_page.unwrap_or(page_offset),
                 element_index,
                 &par_tag_name,
                 dictionary_filter,
+                &mut retained_word_confidence_stats,
             );
             pos = end_pos;
+            dictionary_filtered_line_count = dictionary_filtered_line_count.saturating_add(filtered_lines);
 
             if let Some(mut elem) = paragraph {
                 if let Some(block) = block_extents.last() {
@@ -177,7 +276,11 @@ pub(crate) fn parse_hocr_to_internal_document_with_page_offset(
         "hOCR parse complete"
     );
 
-    doc
+    HocrParseResult {
+        document: doc,
+        dictionary_filtered_line_count,
+        retained_word_confidence_stats,
+    }
 }
 
 /// Parsed properties from an hOCR `title` attribute.
@@ -575,7 +678,8 @@ fn parse_paragraph(
     element_index: u32,
     par_tag: &str,
     dictionary_filter: Option<&DictionaryLineFilter<'_>>,
-) -> (Option<InternalElement>, usize) {
+    retained_word_confidence_stats: &mut RetainedWordConfidenceStats,
+) -> (Option<InternalElement>, usize, usize) {
     let bytes = html.as_bytes();
     let mut pos = start;
 
@@ -666,12 +770,13 @@ fn parse_paragraph(
         }
     }
 
+    let mut removed_line_count = 0usize;
     if let Some(filter) = dictionary_filter {
         let lines_before = lines.len();
         lines.retain(|line| !is_dictionary_noise_line(line, filter));
-        let removed_line_count = lines_before - lines.len();
+        removed_line_count = lines_before - lines.len();
         if removed_line_count > 0 {
-            tracing::warn!(
+            tracing::debug!(
                 page,
                 removed_line_count,
                 max_invalid_ratio = filter.max_invalid_ratio,
@@ -682,7 +787,7 @@ fn parse_paragraph(
 
     let all_words: Vec<&HocrWordInfo> = lines.iter().flat_map(|l| l.words.iter()).collect();
     if all_words.is_empty() {
-        return (None, pos);
+        return (None, pos, removed_line_count);
     }
 
     let style = aggregate_word_style(&all_words);
@@ -714,6 +819,7 @@ fn parse_paragraph(
         if let Some(c) = word.confidence {
             conf_sum += c;
             conf_count += 1;
+            retained_word_confidence_stats.record(c);
         }
         if let Some(fs) = word.font_size {
             font_size_sum += fs;
@@ -891,7 +997,7 @@ fn parse_paragraph(
         }
     }
 
-    (Some(elem), pos)
+    (Some(elem), pos, removed_line_count)
 }
 
 /// Check if a tag's class attribute contains the given class name.
@@ -2066,6 +2172,102 @@ mod tests {
                 text, "RIGHT ELEVATION\nLEFT ELEVATION",
                 "exactly the two real lines remain, in order"
             );
+        }
+
+        #[test]
+        fn reports_the_exact_number_of_dictionary_filtered_lines() {
+            let hocr = ELEVATIONS_PAGE_HOCR.replacen(
+                r#"<span class="ocr_line">
+                    <span class="ocrx_word" title="bbox 10 90 100 120">LEFT</span>"#,
+                r#"<span class="ocr_line">
+                    <span class="ocrx_word" title="bbox 10 82 100 88">OWATS</span>
+                    <span class="ocrx_word" title="bbox 110 82 220 88">DNDEVET</span>
+                    <span class="ocrx_word" title="bbox 230 82 320 88">OPMENT</span>
+                </span>
+                <span class="ocr_line">
+                    <span class="ocrx_word" title="bbox 10 90 100 120">LEFT</span>"#,
+                1,
+            );
+            let filter = DictionaryLineFilter {
+                is_valid_word: &measured_is_valid_word,
+                max_invalid_ratio: TEST_THRESHOLD,
+            };
+
+            let result = parse_hocr_to_internal_document_with_page_offset_and_stats(&hocr, Some(&filter), 1);
+
+            assert_eq!(result.dictionary_filtered_line_count, 2);
+            assert_eq!(result.document.elements[0].text, "RIGHT ELEVATION\nLEFT ELEVATION");
+        }
+
+        #[test]
+        fn retained_confidence_stats_exclude_dictionary_filtered_lines() {
+            let hocr = r#"<div class="ocr_page" title="ppageno 0">
+                <p class="ocr_par">
+                    <span class="ocr_line">
+                        <span class="ocrx_word" title="bbox 10 10 100 40; x_wconf 20">CLEAR</span>
+                        <span class="ocrx_word" title="bbox 110 10 220 40; x_wconf 90">WORDS</span>
+                    </span>
+                    <span class="ocr_line">
+                        <span class="ocrx_word" title="bbox 10 50 100 80; x_wconf 0">OWATS</span>
+                        <span class="ocrx_word" title="bbox 110 50 220 80; x_wconf 0">DNDEVET</span>
+                    </span>
+                </p>
+            </div>"#;
+            let is_valid = |word: &str| Some(matches!(word, "CLEAR" | "WORDS"));
+            let filter = DictionaryLineFilter {
+                is_valid_word: &is_valid,
+                max_invalid_ratio: TEST_THRESHOLD,
+            };
+
+            let unfiltered = parse_hocr_to_internal_document_with_page_offset_and_stats(hocr, None, 1);
+            let unfiltered_stats = &unfiltered.retained_word_confidence_stats;
+            assert_eq!(unfiltered_stats.word_count(), 4);
+            assert_eq!(unfiltered_stats.mean(), Some(27));
+            assert_eq!(unfiltered_stats.median(), Some(10));
+            assert_eq!(unfiltered_stats.p10(), Some(0));
+            assert_eq!(unfiltered_stats.low_confidence_word_count(), 3);
+
+            let result = parse_hocr_to_internal_document_with_page_offset_and_stats(hocr, Some(&filter), 1);
+            let stats = &result.retained_word_confidence_stats;
+
+            assert_eq!(result.document.elements[0].text, "CLEAR WORDS");
+            assert_eq!(result.dictionary_filtered_line_count, 1);
+            assert_eq!(stats.word_count(), 2);
+            assert_eq!(stats.mean(), Some(55));
+            assert_eq!(stats.median(), Some(55));
+            assert_eq!(stats.p10(), Some(20));
+            assert_eq!(stats.low_confidence_word_count(), 1);
+        }
+
+        #[test]
+        fn rejected_all_words_produces_empty_stats() {
+            let hocr = r#"<div class="ocr_page" title="ppageno 0">
+                <p class="ocr_par">
+                    <span class="ocr_line">
+                        <span class="ocrx_word" title="bbox 10 10 100 40; x_wconf 10">OWATS</span>
+                        <span class="ocrx_word" title="bbox 110 10 220 40; x_wconf 90">DNDEVET</span>
+                    </span>
+                </p>
+            </div>"#;
+            let always_invalid = |_: &str| Some(false);
+            let filter = DictionaryLineFilter {
+                is_valid_word: &always_invalid,
+                max_invalid_ratio: TEST_THRESHOLD,
+            };
+
+            let unfiltered = parse_hocr_to_internal_document_with_page_offset_and_stats(hocr, None, 1);
+            assert_eq!(unfiltered.retained_word_confidence_stats.word_count(), 2);
+            assert_eq!(unfiltered.retained_word_confidence_stats.median(), Some(50));
+
+            let result = parse_hocr_to_internal_document_with_page_offset_and_stats(hocr, Some(&filter), 1);
+            let stats = &result.retained_word_confidence_stats;
+
+            assert!(result.document.elements.is_empty());
+            assert_eq!(stats.word_count(), 0);
+            assert_eq!(stats.mean(), None);
+            assert_eq!(stats.median(), None);
+            assert_eq!(stats.p10(), None);
+            assert_eq!(stats.low_confidence_word_count(), 0);
         }
 
         /// A line with only ONE dictionary-checkable word must never be scored, even when

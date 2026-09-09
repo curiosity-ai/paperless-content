@@ -21,7 +21,8 @@ pub use self::file_config::FileExtractionConfig;
 pub use self::types::SvgOptions;
 pub use self::types::{
     ExtractInput, ExtractInputKind, ExtractionErrorItem, ExtractionResult, ExtractionSummary, ImageExtractionConfig,
-    ImageOutputFormat, LanguageDetectionConfig, TokenReductionOptions, UrlExtractionConfig, UrlExtractionMode,
+    ImageOutputFormat, LanguageDetectionConfig, MimeDetectionPolicy, TokenReductionOptions, UrlExtractionConfig,
+    UrlExtractionMode,
 };
 
 #[cfg(test)]

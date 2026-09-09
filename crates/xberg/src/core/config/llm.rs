@@ -42,6 +42,7 @@ const PENALTY_MAX: f64 = 2.0;
 /// `Debug` is implemented by hand so `api_key`, header values, and the AWS
 /// credentials in [`BedrockConfig`] are never printed.
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
 pub struct LlmConfig {
     /// Provider/model string using liter-llm routing format.
@@ -379,7 +380,7 @@ fn validate_sampling_range(field_name: &str, value: f64, min: f64, max: f64) -> 
 /// [`CredentialProviderConfig::BedrockWebIdentity`] reference a *file path*, never the key or
 /// token itself.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "alef-meta", alef(since = "1.1.0"))]
 pub enum CredentialProviderConfig {
@@ -478,6 +479,7 @@ impl std::fmt::Debug for CredentialProviderConfig {
 ///
 /// Mirrors liter-llm's `LlmProviderConfig`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "alef-meta", alef(since = "1.1.0"))]
 pub struct LlmProviderConfig {
@@ -502,6 +504,7 @@ pub struct LlmProviderConfig {
 /// feature is compiled in; otherwise the value round-trips through configuration
 /// but is not consulted at request time.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "alef-meta", alef(since = "1.1.0"))]
 pub struct LlmCacheConfig {
@@ -528,6 +531,7 @@ pub struct LlmCacheConfig {
 /// feature is compiled in; otherwise the value round-trips through configuration
 /// but is not enforced at request time.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "alef-meta", alef(since = "1.1.0"))]
 pub struct LlmBudgetConfig {
@@ -550,6 +554,7 @@ pub struct LlmBudgetConfig {
 /// `tower` feature is compiled in; otherwise the value round-trips through
 /// configuration but is not enforced at request time.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "alef-meta", alef(since = "1.1.0"))]
 pub struct LlmRateLimitConfig {
@@ -588,6 +593,7 @@ pub struct LlmRateLimitConfig {
 ///
 /// `Debug` is implemented by hand so the three credential fields are never printed.
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "alef-meta", alef(since = "1.1.0"))]
 pub struct BedrockConfig {
@@ -689,6 +695,7 @@ impl std::fmt::Debug for BedrockConfig {
 /// model = "openai/gpt-4o"
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StructuredExtractionConfig {
     /// JSON Schema defining the desired output structure.
     pub schema: serde_json::Value,
@@ -1458,6 +1465,18 @@ scope = "https://cognitiveservices.azure.com/.default"
         let round_tripped: LlmConfig =
             serde_json::from_str(&serde_json::to_string(&cfg).expect("serialize")).expect("deserialize");
         assert_eq!(round_tripped, cfg);
+    }
+
+    #[test]
+    fn credential_provider_rejects_unknown_fields() {
+        let json = r#"{
+            "type":"azure_ad",
+            "tenant_id":"tenant",
+            "client_id":"client",
+            "client_secret":"secret",
+            "unexpected_secret":"secret"
+        }"#;
+        assert!(serde_json::from_str::<CredentialProviderConfig>(json).is_err());
     }
 
     /// A `VertexOauth2` credential provider must survive a TOML load and a JSON round-trip,

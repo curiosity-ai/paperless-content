@@ -7,6 +7,152 @@ use crate::types::internal::{ElementKind, InternalDocument, InternalElement};
 use serial_test::serial;
 use std::borrow::Cow;
 
+#[cfg(feature = "summarization")]
+struct SummarizationLifecycleTestProcessor {
+    priority: i32,
+    fail_initialize: bool,
+    fail_shutdown: bool,
+    marker: Option<&'static str>,
+}
+
+#[cfg(feature = "tokio-runtime")]
+struct HandoffRaceProcessor {
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    executed_after_shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mutation_error: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
+}
+
+#[cfg(feature = "tokio-runtime")]
+impl crate::plugins::Plugin for HandoffRaceProcessor {
+    fn name(&self) -> &str {
+        "handoff-race"
+    }
+
+    fn version(&self) -> String {
+        "test".to_string()
+    }
+
+    fn shutdown(&self) -> Result<()> {
+        self.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "tokio-runtime")]
+#[async_trait::async_trait]
+impl crate::plugins::PostProcessor for HandoffRaceProcessor {
+    async fn process(&self, _: &mut crate::types::ExtractedDocument, _: &ExtractionConfig) -> Result<()> {
+        if let Some(error_slot) = &self.mutation_error {
+            let error = crate::plugins::unregister_post_processor("handoff-race")
+                .expect_err("lifecycle mutation during processing must be rejected");
+            *error_slot.lock().unwrap() = Some(error.to_string());
+        }
+        if self.shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+            self.executed_after_shutdown
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    fn processing_stage(&self) -> crate::plugins::ProcessingStage {
+        crate::plugins::ProcessingStage::Early
+    }
+}
+
+#[cfg(feature = "summarization")]
+impl crate::plugins::Plugin for SummarizationLifecycleTestProcessor {
+    fn name(&self) -> &str {
+        "summarization"
+    }
+
+    fn version(&self) -> String {
+        "test".to_string()
+    }
+
+    fn initialize(&self) -> Result<()> {
+        if self.fail_initialize {
+            return Err(crate::XbergError::Other("test initialization failure".to_string()));
+        }
+        Ok(())
+    }
+
+    fn shutdown(&self) -> Result<()> {
+        if self.fail_shutdown {
+            return Err(crate::XbergError::Other("test shutdown failure".to_string()));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "summarization")]
+#[async_trait::async_trait]
+impl crate::plugins::PostProcessor for SummarizationLifecycleTestProcessor {
+    async fn process(&self, result: &mut crate::types::ExtractedDocument, _: &ExtractionConfig) -> Result<()> {
+        if let Some(marker) = self.marker {
+            result
+                .metadata
+                .additional
+                .insert(Cow::Borrowed("lifecycle_test"), serde_json::json!(marker));
+        }
+        Ok(())
+    }
+
+    fn processing_stage(&self) -> crate::plugins::ProcessingStage {
+        crate::plugins::ProcessingStage::Middle
+    }
+
+    fn priority(&self) -> i32 {
+        self.priority
+    }
+}
+
+#[cfg(feature = "summarization")]
+fn summarization_test_config() -> ExtractionConfig {
+    ExtractionConfig {
+        summarization: Some(crate::core::config::SummarizationConfig::default()),
+        ..Default::default()
+    }
+}
+
+#[cfg(feature = "summarization")]
+fn restore_builtin_summarization() {
+    crate::plugins::unregister_post_processor("summarization").unwrap();
+    crate::plugins::processor::builtin::summarization::register().unwrap();
+}
+
+/// Maximum attempts before a lifecycle mutation is treated as genuinely stuck.
+///
+/// Carries `retry_while_registry_in_use`'s own cfg: without it the constants outlive the only
+/// function that reads them on any feature set that compiles it out, and `-D warnings` turns
+/// that into a hard error on the narrow no-ORT legs while every wide-feature leg stays green. ~keep
+#[cfg(any(all(feature = "quality", feature = "summarization"), feature = "tokio-runtime"))]
+const REGISTRY_MUTATION_ATTEMPTS: usize = 100;
+
+/// Delay between attempts, long enough for a concurrent extraction to drop its snapshot lease.
+#[cfg(any(all(feature = "quality", feature = "summarization"), feature = "tokio-runtime"))]
+const REGISTRY_MUTATION_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Retry a post-processor lifecycle mutation while the registry reports it is in use.
+///
+/// `with_registration_update` refuses a mutation whenever a snapshot lease is live, and the
+/// documented contract (`initialization.rs`) is that this failure is *retryable* -- so
+/// `.unwrap()`ing it asserts an exclusivity this binary cannot provide. `#[serial]` only orders a
+/// test against the crate's other `#[serial]` tests, while dozens of non-serial tests here run
+/// real extractions and hold that lease. Honour the contract instead of racing it. ~keep
+#[cfg(any(all(feature = "quality", feature = "summarization"), feature = "tokio-runtime"))]
+fn retry_while_registry_in_use<T>(mut mutation: impl FnMut() -> crate::Result<T>) -> T {
+    for _ in 0..REGISTRY_MUTATION_ATTEMPTS {
+        match mutation() {
+            Ok(value) => return value,
+            Err(crate::XbergError::Other(message)) if message.contains("retry the lifecycle mutation") => {
+                std::thread::sleep(REGISTRY_MUTATION_RETRY_DELAY);
+            }
+            Err(error) => panic!("post-processor lifecycle mutation failed: {error}"),
+        }
+    }
+    panic!("post-processor registry still in use by a concurrent extraction after retrying");
+}
+
 /// Build an `InternalDocument` with a single paragraph element for pipeline tests.
 fn make_doc(content: &str, mime: &str) -> InternalDocument {
     let mut doc = InternalDocument::new("plain");
@@ -31,8 +177,6 @@ const POSTPROCESSOR_VALIDATION_MARKER: &str = "postprocessor_validation_test";
 const ORDER_VALIDATION_MARKER: &str = "order_validation_test";
 
 /// Ensure the quality processor is registered and cache is fresh.
-/// Needed because other tests may call `shutdown_all()` on the registry,
-/// and the `OnceLock` in `initialize_features` prevents re-registration.
 #[cfg(feature = "quality")]
 fn ensure_quality_processor() {
     let registry = crate::plugins::registry::get_post_processor_registry();
@@ -75,6 +219,374 @@ async fn test_pipeline_with_quality_processing() {
 
     let processed = run_pipeline(doc, &config).await.unwrap();
     assert!(processed.quality_score.is_some());
+}
+
+#[tokio::test]
+#[serial]
+#[cfg(all(feature = "quality", feature = "summarization"))]
+async fn builtin_processors_recover_after_public_registry_clear() {
+    initialization::initialize_features();
+    crate::plugins::clear_post_processors().unwrap();
+
+    let doc = make_doc(
+        "The first paragraph explains the problem. The second paragraph provides enough text for a summary.",
+        "text/plain",
+    );
+    let config = ExtractionConfig {
+        enable_quality_processing: true,
+        summarization: Some(crate::core::config::SummarizationConfig::default()),
+        ..Default::default()
+    };
+
+    let processed = run_pipeline(doc, &config).await.unwrap();
+    assert!(processed.quality_score.is_some());
+    assert!(processed.summary.is_some());
+
+    crate::plugins::unregister_post_processor("summarization").unwrap();
+    let doc = make_doc(
+        "The first paragraph explains the problem. The second paragraph provides enough text for a summary.",
+        "text/plain",
+    );
+    let processed = run_pipeline(doc, &config).await;
+    let restore_result = crate::plugins::processor::builtin::summarization::register();
+    restore_result.unwrap();
+    let processed = processed.unwrap();
+    assert!(processed.quality_score.is_some());
+    assert!(processed.summary.is_none());
+}
+
+#[tokio::test]
+#[serial]
+#[cfg(all(feature = "quality", feature = "summarization"))]
+async fn unregister_remains_effective_during_pending_builtin_recovery() {
+    retry_while_registry_in_use(crate::plugins::clear_post_processors);
+    retry_while_registry_in_use(|| crate::plugins::unregister_post_processor("summarization"));
+
+    let config = ExtractionConfig {
+        enable_quality_processing: true,
+        summarization: Some(crate::core::config::SummarizationConfig::default()),
+        ..Default::default()
+    };
+    let processed = run_pipeline(
+        make_doc(
+            "Enough document content exists to produce an extractive summary.",
+            "text/plain",
+        ),
+        &config,
+    )
+    .await;
+    let restore_result = crate::plugins::processor::builtin::summarization::register();
+
+    restore_result.unwrap();
+    let processed = processed.unwrap();
+    assert!(processed.quality_score.is_some());
+    assert!(processed.summary.is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+#[cfg(feature = "tokio-runtime")]
+async fn lifecycle_wait_keeps_async_runtime_schedulable() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    initialization::initialize_processor_cache().unwrap();
+    let (started_sender, started_receiver) = mpsc::channel();
+    let (release_sender, release_receiver) = mpsc::channel();
+    let update_thread = std::thread::spawn(move || {
+        with_post_processor_suppressed("async-runtime-test", || {
+            started_sender.send(()).unwrap();
+            Ok::<_, crate::XbergError>(release_receiver.recv().unwrap())
+        })
+    });
+    started_receiver.recv().unwrap();
+
+    let watchdog_sender = release_sender.clone();
+    let watchdog = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        let _ = watchdog_sender.send("watchdog");
+    });
+    let release_from_async = async move {
+        tokio::task::yield_now().await;
+        let _ = release_sender.send("async");
+    };
+    let config = ExtractionConfig::default();
+    let (pipeline_result, ()) = tokio::join!(
+        run_pipeline(make_doc("test", "text/plain"), &config),
+        release_from_async
+    );
+
+    let release_source = update_thread.join().unwrap().unwrap();
+    watchdog.join().unwrap();
+    pipeline_result.unwrap();
+    assert_eq!(release_source, "async");
+}
+
+#[test]
+#[serial]
+#[cfg(feature = "tokio-runtime")]
+fn processor_handoff_rejects_a_snapshot_after_concurrent_shutdown() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let executed_after_shutdown = Arc::new(AtomicBool::new(false));
+    // Setup, before this test holds any lease of its own, so retrying is safe here — unlike the
+    // later `unregister`, which runs while this test's pipeline is deliberately parked and must
+    // NOT be retried. ~keep
+    retry_while_registry_in_use(|| {
+        crate::plugins::register_post_processor(Arc::new(HandoffRaceProcessor {
+            shutdown: Arc::clone(&shutdown),
+            executed_after_shutdown: Arc::clone(&executed_after_shutdown),
+            mutation_error: None,
+        }))
+    });
+    initialization::initialize_processor_cache().unwrap();
+
+    let (snapshot_sender, snapshot_receiver) = mpsc::channel();
+    let (resume_sender, resume_receiver) = mpsc::channel();
+    let pipeline_thread = std::thread::spawn(move || {
+        initialization::test_support::set_before_processor_snapshot_hook(Box::new(move || {
+            snapshot_sender.send(()).unwrap();
+            resume_receiver.recv().unwrap();
+        }));
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(run_pipeline(
+                make_doc("test", "text/plain"),
+                &ExtractionConfig::default(),
+            ))
+    });
+    snapshot_receiver.recv().unwrap();
+    crate::plugins::unregister_post_processor("handoff-race").unwrap();
+    assert!(shutdown.load(Ordering::SeqCst));
+    resume_sender.send(()).unwrap();
+    pipeline_thread.join().unwrap().unwrap();
+
+    assert!(!executed_after_shutdown.load(Ordering::SeqCst));
+}
+
+#[test]
+#[serial]
+#[cfg(feature = "tokio-runtime")]
+fn processor_handoff_lease_rejects_shutdown_until_pipeline_finishes() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let executed_after_shutdown = Arc::new(AtomicBool::new(false));
+    // Setup, before this test holds any lease of its own, so retrying is safe here — unlike the
+    // later `unregister`, which runs while this test's pipeline is deliberately parked and must
+    // NOT be retried. ~keep
+    retry_while_registry_in_use(|| {
+        crate::plugins::register_post_processor(Arc::new(HandoffRaceProcessor {
+            shutdown: Arc::clone(&shutdown),
+            executed_after_shutdown: Arc::clone(&executed_after_shutdown),
+            mutation_error: None,
+        }))
+    });
+    initialization::initialize_processor_cache().unwrap();
+
+    let (handoff_sender, handoff_receiver) = mpsc::channel();
+    let (pipeline_resume_sender, pipeline_resume_receiver) = mpsc::channel();
+    let pipeline_thread = std::thread::spawn(move || {
+        initialization::test_support::set_after_processor_snapshot_validated_hook(Box::new(move || {
+            handoff_sender.send(()).unwrap();
+            pipeline_resume_receiver.recv().unwrap();
+        }));
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(run_pipeline(
+                make_doc("test", "text/plain"),
+                &ExtractionConfig::default(),
+            ))
+    });
+    handoff_receiver.recv().unwrap();
+
+    let (mutation_sender, mutation_receiver) = mpsc::channel();
+    let unregister_thread = std::thread::spawn(move || {
+        initialization::test_support::set_after_registration_update_began_hook(Box::new(move || {
+            mutation_sender.send(()).unwrap();
+        }));
+        crate::plugins::unregister_post_processor("handoff-race")
+    });
+    mutation_receiver.recv().unwrap();
+    assert!(!shutdown.load(Ordering::SeqCst));
+    pipeline_resume_sender.send(()).unwrap();
+    pipeline_thread.join().unwrap().unwrap();
+    let concurrent_unregister = unregister_thread.join().unwrap();
+    crate::plugins::unregister_post_processor("handoff-race").unwrap();
+
+    assert!(concurrent_unregister.is_err());
+    assert!(shutdown.load(Ordering::SeqCst));
+    assert!(!executed_after_shutdown.load(Ordering::SeqCst));
+}
+
+#[test]
+#[serial]
+#[cfg(feature = "tokio-runtime")]
+fn reentrant_lifecycle_mutation_returns_in_use_error_without_deadlock() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
+
+    let mutation_error = Arc::new(Mutex::new(None));
+    let thread_error = Arc::clone(&mutation_error);
+    // Registered BEFORE the thread is spawned, and so before `recv_timeout` starts counting.
+    // This is setup, not the behaviour under test: it races the lease held by every non-serial
+    // extraction test and the contract for that failure is to retry. Doing it inside the thread
+    // charges the retry against the 250ms deadlock window, which turns a slow-but-correct retry
+    // on a loaded runner into a spurious "must not deadlock: Timeout"; unwrapping it instead
+    // panics the thread, drops the sender, and reports the same assertion as "Disconnected".
+    // Both disguise a retryable setup error as a deadlock. The assertion that matters is on
+    // `mutation_error`, captured mid-pipeline and untouched by this. ~keep
+    retry_while_registry_in_use(|| {
+        crate::plugins::register_post_processor(Arc::new(HandoffRaceProcessor {
+            shutdown: Arc::new(AtomicBool::new(false)),
+            executed_after_shutdown: Arc::new(AtomicBool::new(false)),
+            mutation_error: Some(Arc::clone(&thread_error)),
+        }))
+    });
+    let (result_sender, result_receiver) = mpsc::channel();
+    let pipeline_thread = std::thread::spawn(move || {
+        let pipeline_result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(run_pipeline(
+                make_doc("test", "text/plain"),
+                &ExtractionConfig::default(),
+            ));
+        result_sender.send(pipeline_result).unwrap();
+    });
+
+    let pipeline_result = result_receiver
+        .recv_timeout(Duration::from_millis(250))
+        .expect("reentrant lifecycle mutation must not deadlock the pipeline");
+    pipeline_thread.join().unwrap();
+    retry_while_registry_in_use(|| crate::plugins::unregister_post_processor("handoff-race"));
+
+    pipeline_result.unwrap();
+    let error = mutation_error.lock().unwrap().clone().unwrap();
+    assert!(error.contains("in use by an active extraction"));
+}
+
+#[tokio::test]
+#[serial]
+#[cfg(feature = "summarization")]
+async fn failed_explicit_builtin_registration_preserves_suppression() {
+    crate::plugins::clear_post_processors().unwrap();
+    crate::plugins::unregister_post_processor("summarization").unwrap();
+    let registration =
+        crate::plugins::register_post_processor(std::sync::Arc::new(SummarizationLifecycleTestProcessor {
+            priority: 90,
+            fail_initialize: true,
+            fail_shutdown: false,
+            marker: None,
+        }));
+
+    let processed = run_pipeline(
+        make_doc("Enough content exists to create a summary.", "text/plain"),
+        &summarization_test_config(),
+    )
+    .await;
+    restore_builtin_summarization();
+
+    assert!(registration.is_err());
+    assert!(processed.unwrap().summary.is_none());
+}
+
+#[tokio::test]
+#[serial]
+#[cfg(feature = "summarization")]
+async fn failed_builtin_replacement_triggers_automatic_recovery() {
+    crate::plugins::clear_post_processors().unwrap();
+    initialization::initialize_processor_cache().unwrap();
+    crate::plugins::register_post_processor(std::sync::Arc::new(SummarizationLifecycleTestProcessor {
+        priority: 90,
+        fail_initialize: false,
+        fail_shutdown: true,
+        marker: None,
+    }))
+    .unwrap();
+    let replacement =
+        crate::plugins::register_post_processor(std::sync::Arc::new(SummarizationLifecycleTestProcessor {
+            priority: 91,
+            fail_initialize: false,
+            fail_shutdown: false,
+            marker: None,
+        }));
+
+    let processed = run_pipeline(
+        make_doc("Enough content exists to create a summary.", "text/plain"),
+        &summarization_test_config(),
+    )
+    .await;
+    restore_builtin_summarization();
+
+    assert!(replacement.is_err());
+    assert!(processed.unwrap().summary.is_some());
+}
+
+#[tokio::test]
+#[serial]
+#[cfg(feature = "summarization")]
+async fn bootstrap_preserves_custom_processor_with_builtin_name() {
+    let custom: std::sync::Arc<dyn crate::plugins::PostProcessor> =
+        std::sync::Arc::new(SummarizationLifecycleTestProcessor {
+            priority: 97,
+            fail_initialize: false,
+            fail_shutdown: false,
+            marker: Some("custom-summarization"),
+        });
+    crate::plugins::clear_post_processors().unwrap();
+    crate::plugins::register_post_processor(std::sync::Arc::clone(&custom)).unwrap();
+
+    let processed = run_pipeline(make_doc("test", "text/plain"), &ExtractionConfig::default()).await;
+    let registered = crate::plugins::registry::get_post_processor_registry()
+        .read()
+        .get_for_stage(crate::plugins::ProcessingStage::Middle)
+        .into_iter()
+        .find(|processor| processor.name() == "summarization")
+        .unwrap();
+    let identity_preserved = std::sync::Arc::ptr_eq(&registered, &custom);
+    let priority = registered.priority();
+    restore_builtin_summarization();
+
+    let processed = processed.unwrap();
+    assert!(identity_preserved);
+    assert_eq!(priority, 97);
+    assert_eq!(processed.metadata.additional["lifecycle_test"], "custom-summarization");
+}
+
+#[test]
+#[serial]
+#[cfg(all(feature = "quality", feature = "summarization"))]
+fn concurrent_builtin_recovery_waits_for_complete_registration() {
+    const CALLER_COUNT: usize = 8;
+
+    crate::plugins::clear_post_processors().unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(CALLER_COUNT));
+    let callers = (0..CALLER_COUNT)
+        .map(|_| {
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                initialization::initialize_features();
+                crate::plugins::registry::get_post_processor_registry().read().list()
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for caller in callers {
+        let processor_names = caller.join().unwrap();
+        assert!(processor_names.iter().any(|name| name == "quality-processing"));
+        assert!(processor_names.iter().any(|name| name == "summarization"));
+    }
 }
 
 #[tokio::test]
@@ -865,7 +1377,7 @@ async fn captioning_prepass_keeps_redaction_and_chunks_consistent() {
         }
     }
 
-    initialize_features();
+    initialization::initialize_features();
     crate::plugins::processor::builtin::redaction::register().unwrap();
     let registry = crate::plugins::registry::get_post_processor_registry();
     registry.write().register(Arc::new(StubCaptioningProcessor)).unwrap();
@@ -1038,7 +1550,7 @@ async fn captioning_prepass_preserves_full_code_intelligence_scratch_payload() {
         }
     }
 
-    initialize_features();
+    initialization::initialize_features();
     let registry = crate::plugins::registry::get_post_processor_registry();
     registry.write().register(Arc::new(NoopCaptioningProcessor)).unwrap();
     clear_processor_cache().unwrap();
@@ -1496,7 +2008,7 @@ mod output_format_pass_tests {
     use crate::core::config::extraction::{ImageExtractionConfig, ImageOutputFormat};
     use crate::types::{ExtractedDocument, ExtractedImage};
 
-    use super::apply_output_format_pass;
+    use super::{apply_output_format_pass, apply_output_format_pass_with_security_limits};
 
     fn make_jpeg_bytes() -> Bytes {
         use image::codecs::jpeg::JpegEncoder;
@@ -1642,6 +2154,38 @@ mod output_format_pass_tests {
         assert_eq!(images[0].format.as_ref(), "jpeg", "format must be untouched");
         assert!(result.processing_warnings.is_empty());
     }
+
+    #[test]
+    fn request_security_limit_reaches_output_encoder() {
+        let original = make_png_bytes();
+        let mut result = ExtractedDocument {
+            images: Some(vec![make_image(original.clone(), "png")]),
+            ..Default::default()
+        };
+        let config = ImageExtractionConfig {
+            output_format: ImageOutputFormat::Jpeg { quality: 85 },
+            ..Default::default()
+        };
+        let limits = crate::extractors::security::SecurityLimits {
+            max_content_size: 100,
+            ..Default::default()
+        };
+
+        apply_output_format_pass_with_security_limits(&mut result, &config, Some(&limits));
+
+        let image = &result.images.as_ref().expect("image result")[0];
+        assert_eq!(
+            image.data, original,
+            "rejected output conversion must preserve source data"
+        );
+        assert_eq!(image.format.as_ref(), "png");
+        assert_eq!(result.processing_warnings.len(), 1);
+        assert!(
+            result.processing_warnings[0]
+                .message
+                .contains("security_limits.max_content_size")
+        );
+    }
 }
 
 /// Unit tests for `apply_data_base64_pass`.
@@ -1728,44 +2272,15 @@ mod data_base64_pass_tests {
     }
 }
 
-#[tokio::test]
-#[serial]
-async fn test_pdf_run_fallback_not_suppressed_without_images_config() {
-    use crate::core::config::ImageExtractionConfig;
-
-    let default_no_images = crate::core::config::ExtractionConfig::default();
-    assert!(
-        default_no_images.images.is_none(),
-        "baseline: default config has no images section"
-    );
-
-    let skip_fallback = default_no_images
-        .images
-        .as_ref()
-        .map(|i| i.run_ocr_on_images)
-        .unwrap_or(false);
-    assert!(
-        !skip_fallback,
-        "RunFallback must NOT be suppressed when config.images is None"
-    );
-
-    let with_images_opted_in = crate::core::config::ExtractionConfig {
-        images: Some(ImageExtractionConfig {
-            run_ocr_on_images: true,
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    let skip_fallback_opted_in = with_images_opted_in
-        .images
-        .as_ref()
-        .map(|i| i.run_ocr_on_images)
-        .unwrap_or(false);
-    assert!(
-        skip_fallback_opted_in,
-        "RunFallback must be suppressed when images.run_ocr_on_images=true"
-    );
-}
+// #1576: `images.run_ocr_on_images` (per-extracted-image OCR) is a different setting from
+// document-level page OCR. A test here used to re-derive the buggy suppression logic inline
+// (`config.images.map(|i| i.run_ocr_on_images).unwrap_or(false)`) and assert that
+// `run_ocr_on_images=true` suppressed `RunFallback` -- that assertion WAS the bug, not the
+// contract. `extractors/pdf/mod.rs`'s `OcrGateOutcome::RunFallback` arm no longer reads
+// `config.images` at all, so there is nothing left to unit-test at that granularity; the
+// regression coverage is an end-to-end extraction in
+// `extractors::pdf::tests::images_config_does_not_suppress_scanned_page_ocr`. Left as a plain
+// comment, not a doc comment: it documents a removed test, not the module below it. ~keep
 
 mod document_counts {
     use super::super::populate_document_counts;
@@ -1794,6 +2309,7 @@ mod document_counts {
             speaker_notes: None,
             section_name: None,
             sheet_name: None,
+            ocr_confidence: None,
         }
     }
 

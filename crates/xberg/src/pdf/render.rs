@@ -14,6 +14,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// gap is upstream vs. xberg-side.
 const PDF_RENDER_WARNING_SOURCE: &str = "pdf-render";
 
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline", feature = "layout-detection"))]
+const ROTATED_PNG_ENCODE_BYTES_PER_PIXEL: u64 = 4;
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline", feature = "layout-detection"))]
+const ROTATED_PNG_ENCODE_FIXED_BYTES: u64 = 256 * 1024;
+
 thread_local! {
     /// Buffer for `xberg_native_pdf`'s `tracing::warn!` records emitted while a render
     /// call made by this thread is in flight. `None` when no render call is
@@ -39,8 +44,10 @@ static ENGINE_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
 ///
 /// `xberg_native_pdf`'s rasterizer can silently drop a glyph — no font resolves for
 /// the current run (`text_rasterizer.rs`: "No font found for '{}'..."),
-/// parsing an embedded font fails (`page_renderer.rs`: "Failed to parse font
-/// '{}'..."), the CJK predefined-CIDFont substitution face is unavailable, or
+/// parsing an embedded font fails (`page_renderer.rs`'s `load_resources` logs the
+/// sanitized static message "rendering text with fallback font data", carrying the
+/// actual diagnosis in structured tracing fields instead), the CJK predefined-CIDFont
+/// substitution face is unavailable, or
 /// direct CID/CFF glyph-outline rendering errors mid-run. In every one of
 /// those cases `xberg_native_pdf` still returns `Ok(RenderedImage { .. })` — the
 /// page just has a gap where the glyph should be, with the text-space cursor
@@ -255,23 +262,6 @@ pub fn install_pdf_render_diagnostics() -> bool {
 /// Turn one captured `xberg_native_pdf` log line into a `(page, message)`
 /// [`ProcessingWarning`], naming the page so a multi-page document does not
 /// read as "somewhere in this PDF, something happened".
-/// Whether a captured engine warning actually means glyph ink went missing.
-///
-/// Everything this sink captures used to be wrapped as a glyph drop unconditionally. That was
-/// invisible while the capture was broken (#697) because nothing was ever wrapped, but the
-/// engine also emits warnings about situations it handled correctly, and telling a user that
-/// "glyph ink is missing" when the text rendered fine is worse than saying nothing.
-///
-/// The engine hands us a formatted string and no structured kind, so this has to match on the
-/// message. It is deliberately an EXCLUDE-list, not an include-list: an unrecognised warning is
-/// still reported as a glyph drop, so a new failure mode is over-reported rather than silently
-/// swallowed -- the failure direction #697 already cost us once.
-fn indicates_dropped_glyph_ink(cause: &str) -> bool {
-    // "No font provided for N bytes, using Latin-1 fallback (PDF spec compliant)" -- the text
-    // is rendered via the fallback, so there is no missing ink to warn about.
-    !cause.contains("PDF spec compliant")
-}
-
 fn glyph_drop_warning(page_index: usize, cause: &str) -> ProcessingWarning {
     warning(
         PDF_RENDER_WARNING_SOURCE,
@@ -329,7 +319,13 @@ fn render_page_capturing_glyph_drops(
     if !captured.is_empty() {
         ENGINE_PENDING_WARNINGS.with(|pending| {
             let mut pending = pending.borrow_mut();
-            for cause in captured.iter().filter(|cause| indicates_dropped_glyph_ink(cause)) {
+            // GH#1548: this used to also filter out any cause containing "PDF spec compliant",
+            // to exclude the Latin-1-fallback message. That message now stays below the
+            // capture threshold (TRACE, gated on <= WARN by `EngineWarningCapture::interested`)
+            // so it can never reach here, and the substring match was a trap for whoever next
+            // wrote a genuinely actionable warning that happened to share the phrase. Every
+            // captured cause is classified below instead of pre-filtered. ~keep
+            for cause in captured.iter() {
                 let processing_warning = if indicates_unrenderable_image(cause) {
                     image_render_failure_warning(page_index, cause)
                 } else {
@@ -572,7 +568,7 @@ mod pixel_bbox_tests {
 /// crate asserted the old value was ever used for anything, so nothing
 /// relies on it. See `get_page_rotations`' test module for the pinning test.
 ///
-/// See [`get_page_rotations_from_bytes`] for callers that hold only the raw bytes.
+/// See `get_page_rotations_from_bytes` for callers that hold only the raw bytes.
 #[cfg(any(feature = "ocr", feature = "ocr-pipeline", feature = "layout-detection"))]
 pub(crate) fn get_page_rotations(doc: &xberg_native_pdf::PdfDocument, page_count: usize) -> Vec<u32> {
     (0..page_count)
@@ -599,7 +595,7 @@ pub(crate) fn get_page_rotations(doc: &xberg_native_pdf::PdfDocument, page_count
 ///
 /// Returns all-zero rotations if the document cannot be opened: this is a rendering hint,
 /// and a document that will not open fails for better reasons elsewhere.
-#[cfg(any(feature = "ocr", feature = "ocr-pipeline", feature = "layout-detection"))]
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
 pub(crate) fn get_page_rotations_from_bytes(content: &[u8], page_count: usize) -> Vec<u32> {
     match xberg_native_pdf::PdfDocument::from_bytes(content.to_vec()) {
         Ok(doc) => get_page_rotations(&doc, page_count),
@@ -637,19 +633,53 @@ pub(crate) fn ocr_page_correction_degrees(rotation_degrees: u32) -> u32 {
 /// actually carry /Rotate. Returns the (possibly new) PNG bytes with the
 /// post-rotation width and height.
 #[cfg(any(feature = "ocr", feature = "ocr-pipeline", feature = "layout-detection"))]
+#[cfg(test)]
 pub(crate) fn rotate_png_page_if_needed(
     png_data: Vec<u8>,
     width: u32,
     height: u32,
     rotation_degrees: u32,
 ) -> Result<(Vec<u8>, u32, u32)> {
+    rotate_png_page_if_needed_with_security_limits(
+        png_data,
+        width,
+        height,
+        rotation_degrees,
+        &crate::extractors::security::SecurityLimits::default(),
+    )
+}
+
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline", feature = "layout-detection"))]
+pub(crate) fn rotate_png_page_if_needed_with_security_limits(
+    png_data: Vec<u8>,
+    width: u32,
+    height: u32,
+    rotation_degrees: u32,
+    security_limits: &crate::extractors::security::SecurityLimits,
+) -> Result<(Vec<u8>, u32, u32)> {
     if rotation_degrees.is_multiple_of(360) {
         return Ok((png_data, width, height));
     }
-    let img = image::load_from_memory(&png_data).map_err(|e| XbergError::Parsing {
-        message: format!("failed to decode rendered page for rotation correction: {e}"),
-        source: None,
+    let pixel_count = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| crate::extraction::image_decode::image_dimension_error(width, height, u64::MAX, u64::MAX))?;
+    let additional_live_bytes = pixel_count
+        .checked_mul(3 + ROTATED_PNG_ENCODE_BYTES_PER_PIXEL)
+        .and_then(|bytes| bytes.checked_add(ROTATED_PNG_ENCODE_FIXED_BYTES))
+        .ok_or_else(|| crate::extraction::image_decode::image_dimension_error(width, height, u64::MAX, u64::MAX))?;
+    let rgb = crate::extraction::image_decode::decode_standard_rgb8_with_additional_live_bytes_and_security_limits(
+        &png_data,
+        security_limits,
+        additional_live_bytes,
+    )
+    .map_err(|error| match error {
+        error @ XbergError::Validation { .. } => error,
+        error => XbergError::Parsing {
+            message: format!("failed to decode rendered page for rotation correction: {error}"),
+            source: Some(Box::new(error)),
+        },
     })?;
+    let img = image::DynamicImage::ImageRgb8(rgb);
     let rotated = rotate_dynamic_image(img, rotation_degrees);
     let (w, h) = (rotated.width(), rotated.height());
     let mut buf = Vec::new();
@@ -668,6 +698,7 @@ pub(crate) fn rotate_png_page_if_needed(
 /// inverse transform exactly once so text is upright before layout and OCR
 /// inference consume the shared raster. ~keep
 #[cfg(any(feature = "ocr", feature = "ocr-pipeline", feature = "layout-detection"))]
+#[cfg(test)]
 pub(crate) fn normalize_rendered_page_for_ocr(
     png_data: Vec<u8>,
     width: u32,
@@ -675,6 +706,23 @@ pub(crate) fn normalize_rendered_page_for_ocr(
     rotation_degrees: u32,
 ) -> Result<(Vec<u8>, u32, u32)> {
     rotate_png_page_if_needed(png_data, width, height, ocr_page_correction_degrees(rotation_degrees))
+}
+
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline", feature = "layout-detection"))]
+pub(crate) fn normalize_rendered_page_for_ocr_with_security_limits(
+    png_data: Vec<u8>,
+    width: u32,
+    height: u32,
+    rotation_degrees: u32,
+    security_limits: &crate::extractors::security::SecurityLimits,
+) -> Result<(Vec<u8>, u32, u32)> {
+    rotate_png_page_if_needed_with_security_limits(
+        png_data,
+        width,
+        height,
+        ocr_page_correction_degrees(rotation_degrees),
+        security_limits,
+    )
 }
 
 /// Contain a panic raised while rasterizing one page, turning it into an
@@ -1046,9 +1094,10 @@ mod tests {
 
     /// The raster's own pixel width is the only honest record of the resolution a page was
     /// rendered at, because `render_page_with_safeguards` throws `choose_safe_dpi`'s effective
-    /// value away. A Letter page rendered at the OCR route's requested 150 DPI is 1275px wide,
-    /// and that must read back as 150 — not as the 72 the preprocessor assumes when nobody
-    /// tells it otherwise.
+    /// value away. A Letter page rendered at an arbitrary requested 150 DPI (any DPI works;
+    /// the actual default the PDF OCR route requests is `effective_pdf_render_dpi`, #1577) is
+    /// 1275px wide, and that must read back as 150 — not as the 72 the preprocessor assumes
+    /// when nobody tells it otherwise.
     #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
     #[test]
     fn should_derive_render_dpi_from_raster_width_and_mediabox() {
@@ -1172,6 +1221,25 @@ mod tests {
         let img = image::DynamicImage::new_rgb8(100, 150);
         let rotated = rotate_dynamic_image(img, 270);
         assert_eq!((rotated.width(), rotated.height()), (150, 100));
+    }
+
+    #[cfg(any(feature = "ocr", feature = "ocr-pipeline", feature = "layout-detection"))]
+    #[test]
+    fn rotated_png_rejects_request_limit_before_peak_allocation() {
+        let image = image::RgbImage::from_pixel(2, 2, image::Rgb([255, 255, 255]));
+        let mut encoded = Vec::new();
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(&mut std::io::Cursor::new(&mut encoded), image::ImageFormat::Png)
+            .expect("encode rotation fixture");
+        let limits = crate::extractors::security::SecurityLimits {
+            max_content_size: 1_000,
+            ..Default::default()
+        };
+
+        let error = rotate_png_page_if_needed_with_security_limits(encoded, 2, 2, 90, &limits)
+            .expect_err("rotation, PNG encoder workspace, and output must honor request limits");
+
+        assert!(matches!(error, XbergError::Validation { .. }));
     }
 
     /// Count pixels darker than mid-gray inside one glyph cell of the
@@ -1433,6 +1501,43 @@ mod tests {
         assert!(
             !is_pdf_engine_target("xberg::extractors::pdf"),
             "xberg's own records must not be captured"
+        );
+    }
+
+    /// GH#1548: `render_page_capturing_glyph_drops` used to exclude any captured cause
+    /// containing the literal substring "PDF spec compliant" -- originally meant only to skip
+    /// the Latin-1-fallback message, which is now emitted at TRACE and never reaches this
+    /// capture at all (see `EngineWarningCapture::interested`, gated on `<= Level::WARN`).
+    /// A genuine WARN-level engine event whose text incidentally shares that phrase must still
+    /// surface as a `ProcessingWarning` rather than being silently dropped by a substring trap.
+    #[test]
+    fn genuine_warning_sharing_the_old_substring_is_not_silently_excluded() {
+        assert!(
+            install_pdf_render_diagnostics(),
+            "no other component should own the tracing dispatcher in this test binary"
+        );
+        let _ = take_xberg_native_pdf_render_warnings();
+
+        let result = render_page_capturing_glyph_drops(0, || {
+            tracing::warn!(
+                target: "xberg_native_pdf::fonts",
+                "a genuine problem that happens to mention PDF spec compliant wording"
+            );
+            Ok(xberg_native_pdf::rendering::RenderedImage {
+                data: vec![0u8; 4],
+                width: 1,
+                height: 1,
+                format: xberg_native_pdf::rendering::ImageFormat::RawRgba8,
+            })
+        });
+        assert!(result.is_ok(), "capturing a warning must not change the render outcome");
+
+        let warnings = take_xberg_native_pdf_render_warnings();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "a captured WARN-level engine event must be reported even when its text incidentally \
+             contains the retired Latin-1-fallback substring; got: {warnings:?}"
         );
     }
 }

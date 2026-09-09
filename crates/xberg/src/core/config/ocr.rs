@@ -81,9 +81,10 @@ where
 
 /// Quality thresholds for OCR fallback decisions and pipeline quality gating.
 ///
-/// All fields default to the values that match the previous hardcoded behavior,
-/// so `OcrQualityThresholds::default()` preserves existing semantics exactly.
+/// Fields default to conservative extraction behavior. Suspected OCR recognition noise is
+/// reported but retained unless destructive filtering is explicitly enabled.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OcrQualityThresholds {
     /// Minimum total non-whitespace characters to consider text substantive.
     #[serde(default = "default_min_total_non_whitespace")]
@@ -119,7 +120,7 @@ pub struct OcrQualityThresholds {
     pub critical_fragmented_word_ratio: f64,
 
     /// Maximum fraction of short (1-2 char) words an *OCR result* may carry before the page
-    /// is rejected as recognition noise rather than accepted as content.
+    /// is reported as suspected recognition noise.
     ///
     /// This is a different decision, and a different operating point, from
     /// [`Self::max_fragmented_word_ratio`] / [`Self::critical_fragmented_word_ratio`]: those
@@ -131,34 +132,37 @@ pub struct OcrQualityThresholds {
     ///
     /// Measured over the 16 pages of a recorded municipal ordinance (13 prose pages, 3 scanned
     /// survey drawings): prose ran 0.04-0.28, the drawings 0.42-0.47. The default sits in that
-    /// gap with margin on both sides. Raise it to keep more marginal text, lower it to be
-    /// stricter — but note the cost is asymmetric, since a false positive deletes real content
-    /// while a false negative only leaves noise in place.
+    /// gap with margin on both sides. By default, crossing the threshold emits a processing
+    /// warning but retains the recognized text. Set [`Self::discard_suspected_ocr_noise`] to
+    /// `true` to restore destructive filtering.
     #[serde(default = "default_max_ocr_output_fragmented_word_ratio")]
     pub max_ocr_output_fragmented_word_ratio: f64,
 
-    /// Minimum mean OCR confidence (0-100) a page must reach for its text to be accepted.
+    /// Minimum mean OCR confidence (0-100) below which a page is reported as suspected noise.
     ///
     /// This is the engine's own uncertainty about what it read, and it is a far sharper
     /// instrument than any statistic derived from the output text. Measured per page over a
     /// recorded municipal ordinance (10 prose pages, 6 scanned survey/architectural drawings)
     /// with Tesseract 5.5.3:
     ///
-    ///     prose      86.3 - 95.3
-    ///     drawings   18.5 - 64.3
+    /// ```text
+    /// prose      86.3 - 95.3
+    /// drawings   18.5 - 64.3
+    /// ```
     ///
     /// The default sits in that gap with ~11 points of margin on each side. Compare the
     /// short-word ratio, which separated the same two groups by 0.09 on a 0-1 scale.
     ///
     /// A backend that reports no confidence (no `mean_text_conf` in its result metadata)
     /// skips this check entirely and falls back to
-    /// [`Self::max_ocr_output_fragmented_word_ratio`]. Set to 0.0 to disable.
+    /// [`Self::max_ocr_output_fragmented_word_ratio`]. By default, the signal emits a warning
+    /// without discarding content. Set to 0.0 to disable the signal.
     #[serde(default = "default_min_ocr_mean_confidence")]
     pub min_ocr_mean_confidence: f64,
 
-    /// Minimum word count before [`Self::max_ocr_output_fragmented_word_ratio`] may reject a
+    /// Minimum word count before [`Self::max_ocr_output_fragmented_word_ratio`] may report a
     /// page. Short pages (a signature block, an exhibit title) are legitimately dominated by
-    /// short words, so the ratio is not meaningful on them and the veto stays disabled.
+    /// short words, so the ratio is not meaningful on them and the signal stays disabled.
     #[serde(default = "default_min_words_for_ocr_output_check")]
     pub min_words_for_ocr_output_check: usize,
 
@@ -175,11 +179,16 @@ pub struct OcrQualityThresholds {
     /// ordinance's prose vs. drawing pages), this ratio has not yet had a page-level
     /// measurement run over a labeled corpus. The default therefore disables the check
     /// entirely (`1.01`, above the `[0.0, 1.0]` range a ratio can reach) rather than guess an
-    /// operating point. Do not lower this without running that measurement first — the cost
-    /// of a wrong threshold here is the same as for the fragmented-word-ratio veto: a false
-    /// positive deletes real content, a false negative only leaves noise in place.
+    /// operating point. Do not lower this without running that measurement first.
     #[serde(default = "default_max_ocr_output_dict_invalid_word_ratio")]
     pub max_ocr_output_dict_invalid_word_ratio: f64,
+
+    /// Discard non-empty OCR text when any configured recognition-noise signal fires.
+    ///
+    /// Defaults to `false`: suspected noise is retained and surfaced through
+    /// `processing_warnings`. Set to `true` to preserve the legacy destructive behavior.
+    #[serde(default)]
+    pub discard_suspected_ocr_noise: bool,
 
     /// Minimum average word length. Below this with enough words indicates garbled extraction.
     #[serde(default = "default_min_avg_word_length")]
@@ -320,6 +329,7 @@ impl Default for OcrQualityThresholds {
             max_ocr_output_fragmented_word_ratio: default_max_ocr_output_fragmented_word_ratio(),
             min_words_for_ocr_output_check: default_min_words_for_ocr_output_check(),
             max_ocr_output_dict_invalid_word_ratio: default_max_ocr_output_dict_invalid_word_ratio(),
+            discard_suspected_ocr_noise: false,
             min_avg_word_length: 2.0,
             min_words_for_avg_length_check: 50,
             min_consecutive_repeat_ratio: 0.08,
@@ -416,6 +426,7 @@ fn default_min_provenance_fallback_ratio() -> f64 {
 
 /// A single backend stage in the OCR pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OcrPipelineStage {
     /// Backend name: "tesseract", "paddleocr", "paddle-ocr", "sceptre", "vlm", or a custom registered name.
     /// Sceptre uses ONNX Runtime on desktop/server and tract on Android/iOS; browser WebAssembly has a separate
@@ -517,7 +528,10 @@ pub(crate) enum OcrPipelineSelection {
     /// only runs because the earlier stage(s) were judged inadequate — so a later
     /// non-empty result is a deliberate override, not noise, even when it scores
     /// lower than an earlier stage's output (#1341). An empty result never
-    /// overwrites a prior non-empty one.
+    /// overwrites a prior non-empty one, nor does a non-empty result that is a
+    /// materially worse replacement for an already-dense incumbent — a one-sided
+    /// quality guard, not a reversion to score-based selection (F46; see
+    /// `should_replace_best_effort_result` in `extractors::pdf::ocr`).
     PreferLastNonEmpty,
 }
 
@@ -530,6 +544,7 @@ pub(crate) enum OcrPipelineSelection {
 /// stage's result is returned as the best effort (`vlm_fallback` pipelines prefer their
 /// last non-empty stage; explicit and classical pipelines stay score-based).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OcrPipelineConfig {
     /// Ordered list of backends to try. Sorted by priority (descending) at runtime.
     pub stages: Vec<OcrPipelineStage>,
@@ -581,7 +596,7 @@ pub struct OcrPipelineConfig {
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum VlmFallbackPolicy {
     /// No VLM fallback (default). Behaves identically to the pre-policy single-backend mode.
@@ -591,17 +606,46 @@ pub enum VlmFallbackPolicy {
     /// Try the classical OCR backend first. If the quality score is below
     /// `quality_threshold`, send the page to the VLM.
     ///
-    /// `quality_threshold` is in the `[0.0, 1.0]` range produced by
-    /// `text::quality::calculate_quality_score`. A value of `0.5` is a
-    /// reasonable starting point; calibrate with the Stage 0 benchmark harness.
+    /// `quality_threshold` is in the `[0.0, 1.0]` range, but it is **not** the same
+    /// quantity reported on [`crate::types::page::PageOcrConfidence::score`] (GH#1584).
+    /// The accept decision blends text-shape quality with confidence, weighted 0.7/0.3
+    /// (`extractors::pdf::ocr::pipeline_stage_score`) -- when the backend's confidence is on
+    /// a known scale it contributes only 30% of the compared score, so a page can clear this
+    /// threshold on clean-looking text even while its own `PageOcrConfidence.score` reads
+    /// below it. Do not calibrate this value by reading `PageOcrConfidence.score` off a
+    /// sample page and expecting an equal `quality_threshold` to reproduce the same
+    /// accept/reject outcome. A value of `0.5` is a reasonable starting point; calibrate with
+    /// the Stage 0 benchmark harness.
     OnLowQuality {
-        /// Minimum acceptable quality score from the classical backend.
-        /// Pages scoring below this are retried with VLM.
+        /// Minimum acceptable quality score from the classical backend. Pages scoring below
+        /// this are retried with VLM -- see this variant's doc comment for what "scoring"
+        /// means here.
         quality_threshold: f64,
     },
 
     /// Skip the classical OCR backend entirely. Every page is sent to the VLM.
     Always,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+enum VlmFallbackPolicyWire {
+    Disabled {},
+    OnLowQuality { quality_threshold: f64 },
+    Always {},
+}
+
+impl<'de> Deserialize<'de> for VlmFallbackPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match VlmFallbackPolicyWire::deserialize(deserializer)? {
+            VlmFallbackPolicyWire::Disabled {} => Self::Disabled,
+            VlmFallbackPolicyWire::OnLowQuality { quality_threshold } => Self::OnLowQuality { quality_threshold },
+            VlmFallbackPolicyWire::Always {} => Self::Always,
+        })
+    }
 }
 
 /// Default confidence a page must reach before [`OcrStrategy::ScannedPages`] OCRs it.
@@ -624,7 +668,7 @@ pub const DEFAULT_SCANNED_MIN_CONFIDENCE: f64 = 0.70;
 /// };
 /// assert!(matches!(config.ocr_strategy, OcrStrategy::ScannedPages { .. }));
 /// ```
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum OcrStrategy {
     /// OCR only when the native text layer fails a quality check (default).
@@ -652,6 +696,25 @@ pub enum OcrStrategy {
     },
 }
 
+#[derive(Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+enum OcrStrategyWire {
+    Auto {},
+    ScannedPages { min_confidence: f64 },
+}
+
+impl<'de> Deserialize<'de> for OcrStrategy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match OcrStrategyWire::deserialize(deserializer)? {
+            OcrStrategyWire::Auto {} => Self::Auto,
+            OcrStrategyWire::ScannedPages { min_confidence } => Self::ScannedPages { min_confidence },
+        })
+    }
+}
+
 impl OcrStrategy {
     pub(crate) fn validate(&self) -> Result<(), XbergError> {
         if let Self::ScannedPages { min_confidence } = self {
@@ -677,6 +740,7 @@ impl OcrStrategy {
 
 /// OCR configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OcrConfig {
     /// Whether OCR is enabled.
     ///
@@ -820,6 +884,20 @@ pub struct OcrConfig {
     #[serde(skip)]
     pub acceleration: Option<super::acceleration::AccelerationConfig>,
 
+    /// Security limits applied when decoding raw image bytes for OCR (GH#1554).
+    ///
+    /// Not user-configurable via config files — injected at runtime from
+    /// `ExtractionConfig::security_limits` before each `process_image` call, the same
+    /// pattern [`Self::acceleration`] uses. `ExtractionConfig::security_limits` is the
+    /// single source of truth: this field only ever holds a copy the caller placed here
+    /// immediately before dispatch, so the two cannot drift. A backend consulting a
+    /// `backend_options` override for this call may still let that override win, but in
+    /// the absence of one this field is what backends should fall back to instead of
+    /// `SecurityLimits::default()`. `None` means "use `SecurityLimits::default()`", never
+    /// "disable the check". ~keep
+    #[serde(skip)]
+    pub security_limits: Option<crate::extractors::security::SecurityLimits>,
+
     /// Caller-supplied Tesseract `traineddata` bytes per language code.
     ///
     /// Primary use case is the WASM build, which has no filesystem and cannot
@@ -861,6 +939,7 @@ impl Default for OcrConfig {
             vlm_config: None,
             vlm_prompt: None,
             acceleration: None,
+            security_limits: None,
             tessdata_bytes: None,
             tessdata_path: None,
         }
@@ -964,6 +1043,7 @@ impl OcrConfig {
     #[cfg(any(
         feature = "ocr",
         feature = "ocr-wasm",
+        feature = "ocr-pipeline",
         paddle_ocr,
         all(feature = "liter-llm", not(target_arch = "wasm32")),
     ))]
@@ -979,6 +1059,33 @@ impl OcrConfig {
             vec![DEFAULT_OCR_LANGUAGE.to_string()]
         } else {
             langs
+        }
+    }
+
+    /// Resolve the language Tesseract should use, reconciling [`Self::language`] with
+    /// `tesseract_config.language` (#1572).
+    ///
+    /// Both fields default to `["eng"]`, so neither can represent "unset" on its own. An
+    /// explicit (non-default) [`Self::language`] always wins, matching the convention already
+    /// used to decide whether to propagate a language into a synthesised pipeline stage (see
+    /// [`Self::effective_pipeline`]). Otherwise a non-empty `tesseract_config.language` wins,
+    /// so a caller who only configures `TesseractConfig` still gets their language. Both
+    /// native (`ocr::tesseract_backend`) and WASM (`ocr::tesseract_wasm_backend`) Tesseract
+    /// backends call this so they agree on which field wins.
+    #[cfg(any(
+        feature = "ocr",
+        feature = "ocr-wasm",
+        feature = "ocr-pipeline",
+        paddle_ocr,
+        all(feature = "liter-llm", not(target_arch = "wasm32")),
+    ))]
+    pub(crate) fn effective_tesseract_language(&self) -> Vec<String> {
+        if self.language != [DEFAULT_OCR_LANGUAGE.to_string()] {
+            return self.effective_languages();
+        }
+        match &self.tesseract_config {
+            Some(tess) if !tess.language.is_empty() => tess.language.clone(),
+            _ => self.effective_languages(),
         }
     }
 
@@ -1176,10 +1283,12 @@ fn validate_tesseract_tuning(tesseract_config: Option<&crate::types::TesseractCo
     let Some(tesseract_config) = tesseract_config else {
         return Ok(());
     };
-    crate::core::config_validation::validate_tesseract_psm(tesseract_config.psm)?;
+    if let Some(psm) = tesseract_config.psm {
+        crate::core::config_validation::validate_tesseract_psm(psm)?;
+    }
     crate::core::config_validation::validate_tesseract_oem(tesseract_config.oem)?;
     if let Some(ref preprocessing) = tesseract_config.preprocessing {
-        crate::core::config_validation::validate_binarization_method(&preprocessing.binarization_method)?;
+        crate::core::config_validation::validate_image_preprocessing_config(preprocessing)?;
     }
     Ok(())
 }
@@ -1209,7 +1318,7 @@ mod tests {
 
     fn tesseract_config_with(psm: i32, oem: i32) -> crate::types::TesseractConfig {
         crate::types::TesseractConfig {
-            psm,
+            psm: Some(psm),
             oem,
             ..Default::default()
         }
@@ -1226,6 +1335,20 @@ mod tests {
     }
 
     #[test]
+    fn should_accept_ocr_config_when_tesseract_psm_is_unset() {
+        let config = OcrConfig {
+            tesseract_config: Some(crate::types::TesseractConfig {
+                psm: None,
+                oem: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
     fn should_reject_ocr_config_when_tesseract_psm_is_above_range() {
         let config = OcrConfig {
             tesseract_config: Some(tesseract_config_with(14, 1)),
@@ -1234,11 +1357,35 @@ mod tests {
 
         let message = config
             .validate()
-            .expect_err("psm 14 is out of the 0-13 range")
+            .expect_err("psm 14 is out of the 1-13 range")
             .to_string();
         assert!(
             message.contains("PSM"),
             "error should name the PSM field; got: {message}"
+        );
+    }
+
+    /// GH#1586: PSM 0 is `PSM_OSD_ONLY`, so Tesseract recognises no characters and the
+    /// extraction completed successfully with an empty document. Rejecting it here is the
+    /// only place a caller finds out before losing the content. ~keep
+    #[test]
+    fn should_reject_ocr_config_when_tesseract_psm_is_osd_only() {
+        let config = OcrConfig {
+            tesseract_config: Some(tesseract_config_with(0, 1)),
+            ..Default::default()
+        };
+
+        let message = config
+            .validate()
+            .expect_err("psm 0 recognises no text and must not be accepted")
+            .to_string();
+        assert!(
+            message.contains("PSM 0") || message.contains("PSM value '0'"),
+            "error should name PSM 0 specifically; got: {message}"
+        );
+        assert!(
+            message.contains("orientation"),
+            "error should explain that PSM 0 is orientation detection only; got: {message}"
         );
     }
 
@@ -1278,6 +1425,30 @@ mod tests {
         assert!(
             message.contains("binarization"),
             "error should name the binarization method; got: {message}"
+        );
+    }
+
+    #[test]
+    fn should_reject_ocr_config_when_deskew_has_no_binarization() {
+        let mut tesseract_config = tesseract_config_with(6, 1);
+        tesseract_config.preprocessing = Some(crate::types::ImagePreprocessingConfig {
+            deskew: true,
+            binarization_method: "none".to_string(),
+            ..Default::default()
+        });
+        let config = OcrConfig {
+            tesseract_config: Some(tesseract_config),
+            ..Default::default()
+        };
+
+        let message = config
+            .validate()
+            .expect_err("grayscale-preserving deskew is unavailable")
+            .to_string();
+
+        assert_eq!(
+            message,
+            "Validation error: deskew must be false when binarization_method is none or off"
         );
     }
 
@@ -1940,6 +2111,22 @@ mod tests {
         assert_eq!(thresholds.min_meaningful_words, 3);
         assert_eq!(thresholds.min_garbage_chars, 5);
         assert!((thresholds.pipeline_min_quality - 0.5).abs() < f64::EPSILON);
+        assert!(!thresholds.discard_suspected_ocr_noise);
+    }
+
+    #[test]
+    fn destructive_ocr_noise_filter_defaults_disabled() {
+        assert!(!OcrQualityThresholds::default().discard_suspected_ocr_noise);
+    }
+
+    #[test]
+    fn should_roundtrip_destructive_ocr_noise_filter_opt_in() {
+        let thresholds: OcrQualityThresholds = serde_json::from_str(r#"{"discard_suspected_ocr_noise":true}"#).unwrap();
+        assert!(thresholds.discard_suspected_ocr_noise);
+
+        let serialized = serde_json::to_string(&thresholds).unwrap();
+        let roundtripped: OcrQualityThresholds = serde_json::from_str(&serialized).unwrap();
+        assert!(roundtripped.discard_suspected_ocr_noise);
     }
 
     fn config_with_quality_thresholds(thresholds: OcrQualityThresholds) -> crate::ExtractionConfig {
@@ -2276,4 +2463,12 @@ mod tests {
         assert_eq!(returned_opts["device"], "gpu");
         assert_eq!(returned_opts["batch"], 8);
     }
+}
+#[test]
+fn tagged_ocr_policies_reject_fields_for_unit_variants() {
+    let strategy = r#"{"mode":"auto","min_confidence":0.95}"#;
+    assert!(serde_json::from_str::<OcrStrategy>(strategy).is_err());
+
+    let fallback = r#"{"mode":"disabled","quality_threshold":0.8}"#;
+    assert!(serde_json::from_str::<VlmFallbackPolicy>(fallback).is_err());
 }
