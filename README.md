@@ -108,6 +108,16 @@ SkiaSharp, and `PaddleOCR.Pdf`, which brings PDFium to rasterise scanned pages. 
 never sets `Ocr` loads neither. Nothing is downloaded on your behalf: point
 `OcrOptions.ModelDirectory` at a checkpoint you already have.
 
+## Repository layout
+
+```
+dotnet/           the X-Ray.Content package, its tests and its dev tools
+.reference/       the upstream Xberg tree, verbatim — not built, not published
+test_documents/   the fixture corpus (submodule; binaries fetched separately)
+CLAUDE.md         architecture, scope, porting conventions
+.devops/          the Azure Pipelines job that publishes the package
+```
+
 ## Building from source
 
 ```sh
@@ -130,7 +140,7 @@ reference, which is the primary parity signal:
 dotnet run --project tools/XRay.Content.TestRunner -c Release -- ../test_documents --ext docx --diff
 ```
 
-See [`dotnet/Claude.md`](dotnet/Claude.md) for the architecture, the porting conventions and how
+See [`CLAUDE.md`](CLAUDE.md) for the architecture, the porting conventions and how
 goldens are regenerated, and [`dotnet/TODO.md`](dotnet/TODO.md) for per-format status.
 
 ## Relationship to Xberg
@@ -140,11 +150,14 @@ document-intelligence framework with a Rust core. `X-Ray.Content` is a **native 
 extraction engine — every extractor, type and renderer reimplemented in managed C#, not a
 wrapper over the Rust library or a binding to it.
 
-The upstream Rust sources are retained in this tree (`crates/`, `packages/`, `docs-site/` and
-friends) and deliberately left untouched, so upstream work can be merged and the port
-re-synchronised against it. Nothing outside `dotnet/` is part of this package. For the Rust
-engine, its CLI and server, and its bindings for Python, Node, Go, Java, C# and others, see the
-upstream project and [docs.xberg.io](https://docs.xberg.io).
+The whole upstream tree is retained under [`.reference/`](.reference), byte-identical and
+deliberately untouched, so upstream work can be pulled in and the port re-derived against it.
+Nothing there is built, published, or part of this package — see
+[`.reference/UPSTREAM.md`](.reference/UPSTREAM.md) for its sync state, and
+[`.claude/skills/sync-upstream-reference`](.claude/skills/sync-upstream-reference/SKILL.md) for how
+upstream commits are replayed onto it. For the Rust engine, its CLI and server, and its bindings
+for Python, Node, Go, Java, C# and others, use the upstream project itself and
+[docs.xberg.io](https://docs.xberg.io).
 
 Upstream also publishes `XbergIo.Xberg` on NuGet. That is an FFI binding over the Rust core and
 is unrelated to this package — different implementation, different maintainers.

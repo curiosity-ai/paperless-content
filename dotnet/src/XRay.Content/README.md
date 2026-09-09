@@ -105,7 +105,7 @@ your behalf: point `OcrOptions.ModelDirectory` at a checkpoint you already have.
 ## Links
 
 - [Source](https://github.com/curiosity-ai/x-ray-content/tree/main/dotnet) — the port lives under `dotnet/` in the `curiosity-ai/x-ray-content` repository
-- [Architecture, scope and conventions](https://github.com/curiosity-ai/x-ray-content/blob/main/dotnet/Claude.md)
+- [Architecture, scope and conventions](https://github.com/curiosity-ai/x-ray-content/blob/main/CLAUDE.md)
 - [Port status and work breakdown](https://github.com/curiosity-ai/x-ray-content/blob/main/dotnet/TODO.md)
 - [Issues](https://github.com/curiosity-ai/x-ray-content/issues)
 

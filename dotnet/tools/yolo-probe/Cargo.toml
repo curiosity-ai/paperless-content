@@ -16,7 +16,7 @@ name = "yolo-probe"
 path = "src/main.rs"
 
 [dependencies]
-xberg = { path = "../../../crates/xberg", default-features = false, features = [
+xberg = { path = "../../../.reference/crates/xberg", default-features = false, features = [
     "layout-detection",
 ] }
 image = "0.25"

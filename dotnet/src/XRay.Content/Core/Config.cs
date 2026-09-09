@@ -107,7 +107,7 @@ public sealed class ExtractionConfig
     /// </summary>
     /// <remarks>
     /// This is not upstream's OCR configuration. OCR is a deviation for this port, on a
-    /// different engine; see "Deviation: optional OCR" in <c>dotnet/Claude.md</c>.
+    /// different engine; see "Deviation: optional OCR" in <c>CLAUDE.md</c>.
     /// </remarks>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public OcrOptions? Ocr { get; set; }

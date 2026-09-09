@@ -4,7 +4,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[-]` out of scope (dro
 
 Each format is "done" when the `XRay.Content.TestRunner` output matches the locally generated
 `{filename}-results-rust.json` golden files for its fixtures (documented deviations allowed).
-See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate them.
+See "Re-syncing after an upstream merge" in `../CLAUDE.md` for how to regenerate them.
 
 > **Status — read this before trusting any number below.** Upstream has been merged twice since
 > the last measurement: on **2026-08-27** (413 commits, to `c09caac0`) and again on
@@ -901,7 +901,7 @@ Upstream `xberg-io/xberg` was merged at `5717407b` — 391 commits since the las
 and `.gitignore`), so everything below is the re-derivation of the port's behaviour against it.
 
 **The corpus is materialized again** — `test_documents` at its pinned commit plus the 693 bucket
-objects (589 MiB), fetched with the two commands in `Claude.md`. **The goldens have still not been
+objects (589 MiB), fetched with the two commands in `../CLAUDE.md`. **The goldens have still not been
 regenerated against this merge**, so every corpus figure elsewhere in this file describes
 pre-`c09caac0` Rust; regenerating them is still the next session's first job.
 
@@ -1042,7 +1042,7 @@ the local header and the central directory.
   rejection, `fix(image)`/`fix(security)` Rust feature gating, `chore`/`refactor`/`ci`/`docs`/alef
   regeneration.** No counterpart in the port's surface.
 - **Everything OCR**, and the OCR-only halves of the PDF and image extractors — out of scope per
-  `Claude.md`. That covers `fix(pdf): preserve stronger native page text`, the image-budget series
+  `../CLAUDE.md`. That covers `fix(pdf): preserve stronger native page text`, the image-budget series
   (`fix(security): bound decoded image allocations`, `… account for live image buffers`,
   `… enforce image peak budgets`, `… close image budget gaps`), and the tesseract/paddle/VLM work.
 
@@ -1115,7 +1115,7 @@ container and `tools/xberg-reference-gen` was not run, so every corpus figure el
 file still describes the pre-merge Rust. The port's own unit tests are green (2011 passing; the 5
 failures are `OxPageExtractor`/`OxCharXOffsets` fixture reads against the absent
 `test_documents`). Regenerating and re-measuring is the first thing the next session should do —
-see "Re-syncing after an upstream merge" in `Claude.md`.
+see "Re-syncing after an upstream merge" in `../CLAUDE.md`.
 
 ### Ported in this pass
 
@@ -1188,7 +1188,7 @@ Each entry names the upstream commit subject it comes from.
   which on a surrogate pair splits between the halves and reassembles them unchanged — no throw and
   no corruption. Nothing to change.
 - **Everything OCR.** Tesseract/Paddle/candle/VLM, hOCR parsing, the OCR structure heuristics and
-  the OCR-only halves of the PDF and image extractors are out of scope per `Claude.md`.
+  the OCR-only halves of the PDF and image extractors are out of scope per `../CLAUDE.md`.
 - **`feat(pdf): implement the pdfium extraction engine`, `feat(pdf): add the PdfBackend extraction
   dispatch seam`, `refactor(native-pdf)!: remove the writer and editor stacks`.** A native-library
   binding and a writer stack; the port is pure-managed and extraction-only.
@@ -1735,11 +1735,11 @@ attributed to it.
 ## Phase 0 — Setup & reference data
 
 - [x] Analyze the Rust repo; identify the content-extraction subset.
-- [x] Write `dotnet/Claude.md` (architecture + mapping).
+- [x] Write `../CLAUDE.md` (architecture + mapping).
 - [x] Create the `dotnet/` solution: `XRay.Content` (lib), `XRay.Content.Tests`, `XRay.Content.TestRunner` (CLI).
 - [x] Write the Rust golden-reference generator (`tools/xberg-reference-gen`).
 - [x] Run the generator over `../test_documents` to produce the `*-results-rust.json`
-      goldens (generated locally, not committed — see `Claude.md`).
+      goldens (generated locally, not committed — see `../CLAUDE.md`).
 - [x] Wire `XRay.Content.TestRunner` to load fixtures + golden files and diff per format.
 
 ## Phase 1 — Core spine (foundational; everything depends on it)
@@ -2162,7 +2162,7 @@ and each probe lives in `dotnet/tools/` alongside the reference generator.
 
 ## Optional OCR (added 2026-09-09) — a deviation, not a port
 
-Requested feature, not upstream parity. Recorded as a deviation in `Claude.md`
+Requested feature, not upstream parity. Recorded as a deviation in `../CLAUDE.md`
 ("Deviation: optional OCR"); the short version, for anyone re-syncing:
 
 - [x] **`Core/OcrOptions.cs`** — `OcrMode { Disabled, ScanOnly, AllImages }` plus
@@ -2191,7 +2191,7 @@ Requested feature, not upstream parity. Recorded as a deviation in `Claude.md`
 - [x] **`XRay.Content.csproj`** — `PaddleOCR` + `PaddleOCR.Pdf` 26.8.4668, and the `<Description>`
       corrected: it claimed "No native dependencies", which these packages make false.
       They bring SkiaSharp and PDFium transitively, which is why the feature is off by default
-      and why this breaks the "pure managed" convention in `Claude.md`.
+      and why this breaks the "pure managed" convention in `../CLAUDE.md`.
 - [x] **`OcrProcessorTests.cs`** — 16 tests through a fake recognizer. Thirteen mutations of
       `OcrProcessor` were applied one at a time and each watched to fail a specific test.
       The first pass found one hole: the `Disabled` test used an image document, which the later
@@ -2255,7 +2255,7 @@ Three caveats worth carrying:
 
 - [-] OCR **as upstream implements it** — Tesseract/Paddle/candle bindings, hOCR parsing, the
       OCR structure heuristics, doc orientation. The port instead ships its own opt-in OCR pass
-      on a different engine; see *Optional OCR* below and the deviation section of `Claude.md`.
+      on a different engine; see *Optional OCR* below and the deviation section of `../CLAUDE.md`.
 - [-] Audio/video transcription.
 - [-] Embeddings, reranking, NER/GLiNER, keyword extraction, chunking-for-RAG.
 - [-] LLM / structured LLM extraction, captioning.

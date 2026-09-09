@@ -5,7 +5,7 @@ namespace XRay.Content.Core;
 /// </summary>
 /// <remarks>
 /// OCR is a deviation from the Rust original's scope for this port — see "Deviation: optional
-/// OCR" in <c>dotnet/Claude.md</c>. It is off unless a caller turns it on, and it never replaces
+/// OCR" in <c>CLAUDE.md</c>. It is off unless a caller turns it on, and it never replaces
 /// native text: a page that yields text without OCR keeps that text.
 /// </remarks>
 public enum OcrMode

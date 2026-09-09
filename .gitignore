@@ -1,365 +1,41 @@
-# Build artifacts
-target/
-build/
-dist/
-.polylint/
-# Ad-hoc PDF/image debug binaries
-/check_*
-# Hand-authored WASM JS distribution files (intentionally committed)
-!crates/xberg-wasm/dist/index.js
-!crates/xberg-wasm/dist/extraction/files.js
-!crates/xberg-wasm/dist/ocr/enabler.js
-.lycheecache
-dist-musl/
-*.so
-*.dylib
-*.dll
-*.pdb
-*.node
-*.whl
-*.tar.gz
-*.gem
-*.jar
-wheels/
-**/bin/
-!**/src/bin/
-**/obj/
+# X-Ray.Content — this fork's own ignore rules. Upstream Xberg's rules live in
+# .reference/.gitignore, where their tree-root-anchored paths still resolve, and where an
+# upstream patch touching .gitignore lands. Do not merge the two files.
 
-# Rust
-*.rs.bk
-*.profraw
-rust-coverage.lcov
-rust_out
-
-# Python
-*.py[cod]
-*$py.class
-*.egg-info/
-__pycache__/
-.venv/
-.mypy_cache/
-.ruff_cache/
-.pytest_cache/
-.hypothesis/
-.coverage
-.coverage*
-.e2e-logs/
-htmlcov/
-share/python-wheels/
-prompt_template.egg-info/
-packages/python/xberg/xberg-cli
-
-# Node.js / WASM
-node_modules/
-*.tsbuildinfo
-npm-debug.log*
-pnpm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-# NAPI-RS generated files (index.js and index.d.ts are committed for TypeScript type resolution)
-crates/xberg-node/*.tgz
-# ORT dylibs are copied to crates/xberg-node/ at build time and included in npm publish
-# despite the global *.dylib/*.so/*.dll rules below
-!crates/xberg-node/*.dylib
-!crates/xberg-node/*.so
-!crates/xberg-node/*.dll
-libpdfium.a
-.wrangler/
-.pnpm-store/
-
-# Ruby
-packages/ruby/.bundle/
-packages/ruby/vendor/
-!packages/ruby/vendor/rb-sys/
-!vendor/rb-sys/build/
-!vendor/rb-sys/build/**
-*.Cache
-.yardoc/
-
-# PHP
-vendor/
-!crates/xberg-candle-ocr/src/vendor/
-!crates/xberg-native-pdf/src/vendor/
-!crates/xberg-libwpd/vendor/
-# The vendored WordPerfect source archives are committed on purpose; re-include
-# them past the global `*.tar.gz` rule above (a dir negation alone won't).
-!crates/xberg-libwpd/vendor/*.tar.gz
-php-xberg.ini
-packages/php/php-xberg.ini
-packages/php/tests.xml
-packages/php/var/
-.php-cs-fixer.cache
-
-# Swift / SwiftPM / Xcode
-.build/
-.swiftpm/
-# Legacy SwiftPM resolved-packages dir — anchored to packages/swift/ so it
-# does NOT match our top-level packages/ directory on macOS case-insensitive
-# filesystems (where the bare `Packages/` pattern previously matched and
-# silently dropped packages/dart/pubspec.yaml + 9 other scaffold files from
-# the index during regen).
-packages/swift/**/Packages/
-Package.resolved
-*.xcodeproj/
-*.xcworkspace/
-DerivedData/
-
-# Java / C# / .NET
-*.suo
-*.user
-*.cscfg
-*.cobertura.xml
-TestResults/
-
-# Generated test apps (e2e-generator --mode published)
-test_apps/
-
-# Elixir
-.nox/
-
-# Go
-packages/go/v*/install
-
-# C FFI
-crates/xberg-ffi/tests/c/test_*
-!crates/xberg-ffi/tests/c/test_*.c
-crates/xberg-ffi/tests/c/*.o
-crates/xberg-ffi/tests/c/*.dSYM/
-e2e/c/test_*
-!e2e/c/test_*.c
-e2e/c/*.o
-e2e/c/*.dSYM/
-
-# Generated pkg-config
-*.pc
-
-# Coverage
-coverage/
-coverage.info
-coverage.json
-coverage.lcov
-coverage.out
-coverage.xml
-packages/*/.coverage
-packages/*/coverage.json
-packages/*/coverage.out
-packages/*/htmlcov/
-packages/*/test-results/
-packages/*/TestResults/
-
-# IDE / Editor
-.idea/
-*.iml
-.vscode/
-.run/
-.DS_store
-
-# CI / Tools
-.cache/
-.tmp/
-*temp/
-*.temp
-*.tmp
-*.log
-**/logs/
-**/test_output.log
-.mvn/
-.tox/
-.artifacts/
-.remote-cache/
-.rumdl_cache/
-docker-logs/
-
-# Benchmarks
-benchmark-results/
-benchmark_results.json
-benchmarks/results/
-!benchmarks/baselines/
-aggregated-results/
-results/
-reports/
-tests/benchmarks/results/
-profiling-results/
-profiling-results-*/
-
-# Local perf-iteration artifacts (flamegraphs/ is committed; intermediate outputs are not)
-profile.json.gz
-profile.pb.gz
-*.heap
-bench/
-
-# Docs
-docs/_build/
-docs/build/
-docs/benchmarks/charts/
-site/
-
-# Elixir build artifacts (lock files MUST stay tracked — see CLAUDE.md
-# task-runner / dependency-awareness rules and the brotli/alloc-no-stdlib
-# regression that bit CI run 27492590406 because the NIF lock wasn't
-# committed and the resolver picked a fresh broken combo).
-packages/elixir/_build/
-packages/elixir/deps/
-e2e/elixir/_build/
-e2e/elixir/deps/
-e2e/elixir/config/
-test_documents/_build/
-test_documents/deps/
-
-# Never commit a local e2e/test_documents symlink/checkout — it previously shipped as a
-# committed symlink to a machine-specific, pre-rename path (kreuzberg-dev/kreuzberg) and
-# dangled on every other machine and CI runner. The submodule at repo-root `test_documents/`
-# is the only supported source; e2e helpers walk up to find it.
-e2e/test_documents
-
-# Maven plugin artifacts
-*.versionsBackup
-
-# Gradle (Kotlin e2e)
-e2e/kotlin/.gradle/
-e2e/kotlin/build/
-e2e/kotlin_android/.gradle/
-e2e/kotlin_android/build/
-
-# Ruby native build artifacts
-packages/ruby/lib/*.bundle
-packages/ruby/tmp/
-
-# Tests
-test_report.json
-tests/e2e/logs/
-tests/e2e/test_report.json
-temp-test-*
-packages/csharp/test_html_debug.cs
-# CI renders this from runtime.json.template at publish time; template is the source of truth.
-packages/csharp/Xberg/runtime.json
-
-# Pdfium test artifacts
-crates/xberg-pdfium-render/*.jpg
-
-# AI / MCP / Agent config
-.claude/
-.codex/
-.gemini/
-.xberg/
-# Root-only: local Claude Code MCP config. NOT anchored with a bare pattern -- that
-# also matched plugin/.mcp.json, a generated, committed plugin bundle output (ai-rulez
-# `[[plugin.mcp]]`), which made CI's "Plugin bundle freshness" check fail on checkout.
-/.mcp.json
-# Alef-generated agent skills (mirrors of .ai-rulez/skills; .claude/.codex covered above)
-.agents/skills/
-.github/skills/
-.playwright-mcp/
-.fastembed_cache/
-*/.fastembed_cache/
-AGENTS.md
-CLAUDE.md
-GEMINI.md
-.cursorrules
-.windsurfrules
-[Tt][Oo][Dd][Oo]*
-
-# Git worktrees
-.worktrees/
-
-# Misc
-.env
-output.txt
-examples.txt
-requirements.txt
-docker-compose.yaml
-/tmp/xberg-docker-test-results.json
-tools/benchmark-harness/datasets/
-tools/benchmark-harness/.fixtures-pdf-subset/
-tools/benchmark-harness/vendored/docling/md/iso_21111_10.md
-visualizations/
-
-
-# Additional generated artifacts
-.alef/
-*.pyd
-.gems/
-vendor/bundle/
-*.h.bak
-*.test
-*.class
-bin/
-obj/
+# ── .NET build output ─────────────────────────────────────────────────────────
+# Anchored to /dotnet/ on purpose. A bare `**/bin/` would also exclude directories inside
+# .reference/, and git will not descend into an excluded directory, so upstream's own
+# negations (e.g. !packages/dart/bin/download_libs.dart) could not re-include anything there.
+/dotnet/**/bin/
+/dotnet/**/obj/
 *.nupkg
-pkg/
+*.snupkg
+/artifacts/
 
-# Dart's alef-generated install-time downloader must ship in the pub.dev package,
-# so it is exempt from the blanket bin/ ignore above.
-!packages/dart/bin/
-!packages/dart/bin/download_libs.dart
+# ── IDE / editor ──────────────────────────────────────────────────────────────
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.userprefs
+*.DotSettings.user
 
+# ── Rust dev helpers under dotnet/tools/ ──────────────────────────────────────
+/dotnet/tools/*/target/
 
-# Local dev artifacts
-docs-site/public/demo-dev.html
-docs-site/dist/
-docs-site/.astro/
-demo-loaded.png
-scratch/
-
-
-.php-cs-fixer.*
-
-e2e/zig/.zig-cache/
-
-# Swift e2e build artifacts (Swift Package Manager)
-e2e/swift/.build/
-e2e/swift/.swiftpm/
-e2e/swift/Package.resolved
-e2e/swift_e2e/.build/
-e2e/swift_e2e/.swiftpm/
-e2e/swift_e2e/Package.resolved
-
-# Dart e2e build artifacts (lock file tracked for reproducibility)
-e2e/dart/.dart_tool/
-e2e/dart/build/
-
-# Dart FRB codegen cache (incremental build optimization)
-packages/dart/rust/.frb_codegen_hash
-
-# Go e2e build artifacts
-e2e/go/vendor/
-
-erl_crash.dump
-
-
-.gradle/
-
-packages/go/.lib/
-
-# Native libraries staged into the package trees by `alef build`. The Go leg above was
-# already covered; the C# and Java legs were not, leaving 689 MB untracked-but-not-ignored --
-# enough that a stray `git add -A` would commit them. Scoped to the artifact directories
-# rather than the package roots, so real package sources stay visible. ~keep
-packages/csharp/src/Xberg/runtimes/
-packages/java/src/main/resources/natives/
-
-.build/
-
-# basemind code-map index (local tooling)
-.basemind/
-
-.bench-rc32/
-.private-bench/
-build-output-musl-node/
-
-poly.local.toml
-
-# Alef snippet validator scratch workspaces and caches ~keep
-**/.alef-snippet-*/
-**/.alef-cache/
-**/.alef/
-
-# Golden reference sets for the C# port. Generated locally by
-# `dotnet/tools/xberg-reference-gen`, one directory per xberg feature configuration
-# (`--out`), and regenerated rather than committed — they are large, machine-specific
-# in places (pdf_oxide's font cache), and tied to whatever the Rust tree is at.
+# ── Golden reference sets for the C# port ─────────────────────────────────────
+# Generated locally by `dotnet/tools/xberg-reference-gen`, one directory per xberg feature
+# configuration (`--out`), and regenerated rather than committed — they are large,
+# machine-specific in places (pdf_oxide's font cache), and tied to whatever the Rust tree
+# in .reference/ is at.
 /test_documents-goldens-*/
 
-# BEGIN ai-rulez (DO NOT EDIT - managed by ai-rulez)
-.ai-rulez/.generated-manifest.json
-# END ai-rulez
+# ── OS noise ──────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*~
+
+# ── Local environment ─────────────────────────────────────────────────────────
+.env
+.env.local
