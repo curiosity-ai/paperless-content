@@ -1112,9 +1112,19 @@ internal static partial class PdfTableReconstruct
         // Normalize cells.
         for (int i = 0; i < processed[0].Count; i++)
             processed[0][i] = processed[0][i].Trim().Replace("  ", " ");
+        // Gated per column rather than applied to every data cell: the dash and exponent
+        // rewriting is right for a financial column (an em-dash cell means nil, `1.5E-05` is
+        // scientific notation) and corrupts a prose one (`Functionaliteit—12`, a part code
+        // `HRE - HReco`). Row 0 never reaches this loop (xberg-io/xberg#1582).
+        var numericColumns = new bool[processed[0].Count];
+        for (int c = 0; c < numericColumns.Length; c++)
+            numericColumns[c] = ColumnIsNumericForNormalization(processed, c);
+
         for (int r = 1; r < processed.Count; r++)
             for (int c = 0; c < processed[r].Count; c++)
-                processed[r][c] = NormalizeDataCell(processed[r][c]);
+                processed[r][c] = c < numericColumns.Length && numericColumns[c]
+                    ? NormalizeDataCell(processed[r][c])
+                    : processed[r][c].Trim();
 
         return processed;
     }
@@ -1160,19 +1170,97 @@ internal static partial class PdfTableReconstruct
 
     private static string NormalizeDataCell(string cell)
     {
-        string text = cell.Trim();
-        if (text.Length == 0) return "";
+        string trimmed = cell.Trim();
+        if (trimmed.Length == 0) return "";
 
-        text = text.Replace('—', '-').Replace('–', '-').Replace('−', '-');
-
-        if (text.StartsWith("- ")) text = "-" + text.Substring(2).TrimStart();
-
-        text = text.Replace("- ", "-");
-        text = text.Replace(" -", "-");
+        string text = NormalizeDashGlyphsAndSpacing(trimmed);
         text = text.Replace("E-", "e-").Replace("E+", "e+");
 
-        if (text == "-") return "";
+        return text == "-" ? "" : text;
+    }
+
+    /// <summary>
+    /// Rewrite em-dash, en-dash and minus-sign glyphs to an ASCII hyphen and collapse the
+    /// whitespace around a leading or embedded one (<c>"- 3"</c> → <c>"-3"</c>), without the
+    /// exponent lowercasing or lone-dash clearing that follow it.
+    /// </summary>
+    /// <remarks>
+    /// Shared with <see cref="ColumnIsNumericForNormalization"/>, which needs the same
+    /// dash-normalized preview to decide whether a cell is numeric <em>before</em> the full
+    /// normalization runs: testing the raw text would miss <c>"- 3"</c>, which only reads as a
+    /// number once this rewrite has run.
+    /// </remarks>
+    private static string NormalizeDashGlyphsAndSpacing(string text)
+    {
+        text = text.Replace('\u2014', '-').Replace('\u2013', '-').Replace('\u2212', '-');
+        if (text.StartsWith("- ", StringComparison.Ordinal)) text = "-" + text.Substring(2).TrimStart();
+        text = text.Replace("- ", "-");
+        text = text.Replace(" -", "-");
         return text;
+    }
+
+    /// <summary>
+    /// Minimum percentage of a column's non-ambiguous data cells that must parse as a bare
+    /// numeric literal for the column to receive the dash and exponent rewriting.
+    /// </summary>
+    private const int NumericColumnMinNumericPercent = 60;
+
+    /// <summary>
+    /// Whether a column's data rows are predominantly bare numeric literals once dash glyphs are
+    /// normalized — the gate that keeps the numeric rewriting off a prose column.
+    /// </summary>
+    /// <remarks>
+    /// A cell that is nothing but a dash is nil-or-N/A and cannot decide the question on its own,
+    /// so it is excluded from the vote and left to the column's other cells.
+    /// </remarks>
+    private static bool ColumnIsNumericForNormalization(List<List<string>> table, int col)
+    {
+        int evidence = 0, numeric = 0;
+        for (int r = 1; r < table.Count; r++)
+        {
+            if (col >= table[r].Count) continue;
+            string trimmed = table[r][col].Trim();
+            if (trimmed.Length == 0 || IsLoneDashCell(trimmed)) continue;
+            evidence++;
+            if (LooksLikeNumericLiteral(NormalizeDashGlyphsAndSpacing(trimmed))) numeric++;
+        }
+        return evidence > 0 && numeric * 100 >= evidence * NumericColumnMinNumericPercent;
+    }
+
+    /// <summary>Whether the cell is nothing but one dash glyph — ambiguous nil-or-N/A content
+    /// that carries no evidence either way.</summary>
+    private static bool IsLoneDashCell(string text) =>
+        text is "-" or "\u2014" or "\u2013" or "\u2212";
+
+    /// <summary>
+    /// Whether the text — already dash-normalized — is a bare numeric literal: an optional
+    /// leading <c>-</c>, digits with at most one <c>.</c>, and an optional exponent. Anything
+    /// carrying a letter outside the exponent marker, or no digits at all, is not a number.
+    /// </summary>
+    private static bool LooksLikeNumericLiteral(string text)
+    {
+        if (text.StartsWith('-')) text = text.Substring(1);
+        int e = text.IndexOfAny(['e', 'E']);
+        string mantissa = e < 0 ? text : text.Substring(0, e);
+        if (!IsNumericMantissa(mantissa)) return false;
+        if (e < 0) return true;
+
+        string exponent = text.Substring(e + 1);
+        if (exponent.StartsWith('-') || exponent.StartsWith('+')) exponent = exponent.Substring(1);
+        return exponent.Length > 0 && exponent.All(char.IsAsciiDigit);
+    }
+
+    /// <summary>Whether the text is one or more ASCII digits with at most one <c>.</c>.</summary>
+    private static bool IsNumericMantissa(string text)
+    {
+        bool seenDot = false, seenDigit = false;
+        foreach (char c in text)
+        {
+            if (char.IsAsciiDigit(c)) seenDigit = true;
+            else if (c == '.' && !seenDot) seenDot = true;
+            else return false;
+        }
+        return seenDigit;
     }
 
     // ── header/column repair (pdf/table_reconstruct.rs) ─────────────────────
