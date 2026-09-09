@@ -22,14 +22,21 @@ internal static class PdfTextRepair
     /// <summary>
     /// Repair ligature corruption using contextual heuristics. Some PDF fonts have broken
     /// ToUnicode CMaps that map ligature glyphs to punctuation: <c>!</c> → fi/ff,
-    /// <c>"</c> → ffi, <c>#</c> → fi, <c>*</c> → tt, <c>:</c> → ti, and an uppercase
-    /// <c>M</c> between lowercase letters → tti.
+    /// <c>"</c> → ffi, <c>#</c> → fi, <c>*</c> → tt.
     /// <para>
     /// Every rule is gated on its neighbours, so ordinary punctuation is untouched: there is
     /// deliberately no letter + <c>!</c> + end-of-string rule, because a sentence-final
     /// exclamation mark looks exactly like the corrupted form.
     /// </para>
     /// </summary>
+    /// <remarks>
+    /// There is no <c>:</c> → ti rule and no uppercase <c>M</c> → tti rule. Both characters
+    /// occur constantly in healthy text — ratios, times, URLs, units like "nM", identifiers —
+    /// so those arms corrupted ordinary words, turning "aMb" into "attib". They were introduced
+    /// behind a per-font broken-CMap signal that no longer exists here, and were left
+    /// unconditional when it went away. Re-add only alongside real document-level evidence
+    /// (xberg-io/xberg#1556).
+    /// </remarks>
     public static string RepairContextualLigatures(string text)
     {
         if (text.Length < 2) return text;
@@ -62,15 +69,6 @@ internal static class PdfTextRepair
                     result.Append("fi"); repaired = true; break;
                 case '*' when prevIsAlpha && nextIsAlpha:
                     result.Append("tt"); repaired = true; break;
-                case ':' when prevIsAlpha && nextIsLower:
-                    result.Append("ti"); repaired = true; break;
-                case 'M' when prevIsAlpha && !prevIsSpaceOrStart:
-                {
-                    bool prevWasLower = i > 0 && char.IsLower(text[i - 1]);
-                    if (prevWasLower && nextIsLower) { result.Append("tti"); repaired = true; }
-                    else result.Append(ch);
-                    break;
-                }
                 default:
                     result.Append(ch); break;
             }

@@ -3019,7 +3019,7 @@ public static class PdfStructure
                 var nextSeg = all[runStart];
                 string prevLast = prevSeg.Text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).LastOrDefault() ?? "";
                 string nextFirst = nextSeg.Text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
-                if (ShouldDehyphenate(prevLast, nextFirst)) { if (text.Length > 0) text.Remove(text.Length - 1, 1); }
+                if (ShouldDehyphenate(prevLast, nextFirst, prevSeg, nextSeg)) { if (text.Length > 0) text.Remove(text.Length - 1, 1); }
                 else if (SegmentsNeedSpace(prevSeg, prevLast, nextSeg, nextFirst)) text.Append(' ');
             }
 
@@ -3030,7 +3030,7 @@ public static class PdfStructure
                 {
                     var (prev, prevIdx) = runWords[wi - 1];
                     var (word, wordIdx) = runWords[wi];
-                    if (ShouldDehyphenate(prev, word)) { if (text.Length > 0) text.Remove(text.Length - 1, 1); }
+                    if (ShouldDehyphenate(prev, word, all[prevIdx], all[wordIdx])) { if (text.Length > 0) text.Remove(text.Length - 1, 1); }
                     else if (prevIdx == wordIdx) { if (NeedsSpaceBetween(prev, word)) text.Append(' '); }
                     else if (SegmentsNeedSpace(all[prevIdx], prev, all[wordIdx], word)) text.Append(' ');
                 }
@@ -3072,7 +3072,7 @@ public static class PdfStructure
                         if (wordsPerLine[p].Count > 0) { prev = wordsPerLine[p][^1]; break; }
                 if (prev is not { } previous) { result.Append(word); continue; }
 
-                if (ShouldDehyphenate(previous.Word, word))
+                if (ShouldDehyphenate(previous.Word, word, previous.Segment, seg))
                 {
                     if (result.Length > 0) result.Remove(result.Length - 1, 1);
                     result.Append(word);
@@ -3124,12 +3124,49 @@ public static class PdfStructure
         return advanceGap > nextSeg.FontSize * SEGMENT_GAP_SPACE_RATIO;
     }
 
-    private static bool ShouldDehyphenate(string prev, string next)
+    /// <summary>
+    /// Whether a line-ending hyphen should be dropped and the two words joined.
+    /// </summary>
+    /// <remarks>
+    /// The text pattern alone — trailing <c>-</c>, a letter before it, lowercase after — is
+    /// also what a <em>suspended</em> hyphen looks like mid-line: Dutch "onderhouds- en" and
+    /// "CV- en" matched it and were welded into "onderhoudsen" and "CVen", neither of which is a
+    /// word. So the two runs must additionally sit on genuinely different visual lines
+    /// (xberg-io/xberg#1581). The check strictly narrows the predicate, so it cannot create a
+    /// join anywhere one did not already happen.
+    /// </remarks>
+    private static bool ShouldDehyphenate(string prev, string next, SegmentData prevSeg, SegmentData nextSeg)
     {
         if (prev.Length < 2 || !prev.EndsWith('-')) return false;
         char? beforeHyphen = prev.Length >= 2 ? prev[^2] : (char?)null;
         if (!(beforeHyphen.HasValue && char.IsLetter(beforeHyphen.Value))) return false;
-        return next.Length > 0 && char.IsLower(next[0]);
+        if (!(next.Length > 0 && char.IsLower(next[0]))) return false;
+        return CrossesVisualLineBreak(prevSeg, nextSeg);
+    }
+
+    /// <summary>
+    /// Maximum baseline difference, in points, for two runs to count as one visual line rather
+    /// than two split by a real line break.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately its own constant rather than a reuse of
+    /// <see cref="INLINE_STYLE_BASELINE_TOLERANCE"/> (same value): that one drives the
+    /// inline-style grouping call sites, and coupling dehyphenation to it would let an unrelated
+    /// change there silently retune this.
+    /// </remarks>
+    private const float LINE_BREAK_BASELINE_TOLERANCE = 0.5f;
+
+    /// <summary>
+    /// Whether two runs sit on genuinely different visual lines, rather than being one line
+    /// split by a style-run or font-resource boundary.
+    /// </summary>
+    private static bool CrossesVisualLineBreak(SegmentData trailing, SegmentData leading)
+    {
+        if (!trailing.HasSameRotation(leading)) return false;
+        float trailingBaseline = trailing.UprightBaseline();
+        float leadingBaseline = leading.UprightBaseline();
+        return float.IsFinite(trailingBaseline) && float.IsFinite(leadingBaseline)
+            && Math.Abs(trailingBaseline - leadingBaseline) > LINE_BREAK_BASELINE_TOLERANCE;
     }
 
     private static bool NeedsSpaceBetween(string prev, string next)
