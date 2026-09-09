@@ -20,11 +20,11 @@ impl Database {
     /// Loads `ttf`/`otf`/`ttc`/`otc` fonts; skips (and warns on) malformed
     /// files rather than failing.
     ///
-    /// `load_system_fonts` is the only caller and has no wasm32 branch (no
-    /// target directory list matches wasm32-unknown-unknown), so this and
+    /// `load_system_fonts` is the only caller and has no wasm32 or Android
+    /// branch (no target directory list matches either target), so this and
     /// the two helpers below are structurally unreachable — not called,
-    /// not dead by mistake — on that target. ~keep
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    /// not dead by mistake — on those targets. ~keep
+    #[cfg_attr(any(target_arch = "wasm32", target_os = "android"), allow(dead_code))]
     fn load_fonts_dir_impl(&mut self, dir: &Path, seen: &mut HashSet<PathBuf>) {
         let fonts_dir = match std::fs::read_dir(dir) {
             Ok(dir) => dir,
@@ -53,7 +53,7 @@ impl Database {
     /// Reads `path` and loads every face it contains, warning (and
     /// continuing) per malformed face rather than failing the directory
     /// scan over one bad file.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg_attr(any(target_arch = "wasm32", target_os = "android"), allow(dead_code))]
     fn load_font_file(&mut self, path: &Path) {
         let data = match std::fs::read(path) {
             Ok(data) => data,
@@ -269,7 +269,7 @@ impl Database {
     /// loop can't re-load a file the walk already visited via a different
     /// path. This keeps the common case (no symlinks) free of a HashSet
     /// lookup per entry. ~keep
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg_attr(any(target_arch = "wasm32", target_os = "android"), allow(dead_code))]
     fn canonicalize(
         &self,
         path: PathBuf,

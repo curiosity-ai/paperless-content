@@ -968,12 +968,22 @@ pub fn extract_image_from_xobject(
         .and_then(resolve_int)
         .ok_or_else(|| Error::Image("Image missing /Height".to_string()))? as u32;
 
-    // /BitsPerComponent may likewise be indirect (§7.3.10). ~keep
-    let bits_per_component = dict.get("BitsPerComponent").and_then(resolve_int).unwrap_or(8) as u8;
-
-    let color_space_obj = dict
-        .get("ColorSpace")
-        .ok_or_else(|| Error::Image("Image missing /ColorSpace".to_string()))?;
+    let is_image_mask = dict
+        .get("ImageMask")
+        .is_some_and(|value| matches!(value, Object::Boolean(true)));
+    // ImageMask defaults to one bit when /BitsPerComponent is omitted;
+    // ordinary sampled images retain the historical eight-bit default. ~keep
+    let default_bits_per_component = if is_image_mask { 1 } else { 8 };
+    let bits_per_component = dict
+        .get("BitsPerComponent")
+        .and_then(resolve_int)
+        .unwrap_or(default_bits_per_component) as u8;
+    let default_mask_color_space = Object::Name("DeviceGray".to_string());
+    let color_space_obj = match dict.get("ColorSpace") {
+        Some(color_space) => color_space,
+        None if is_image_mask => &default_mask_color_space,
+        None => return Err(Error::Image("Image missing /ColorSpace".to_string())),
+    };
 
     let resolved_color_space = if let Some(d) = doc {
         let res = if let Some(obj_ref) = color_space_obj.as_reference() {
@@ -1087,12 +1097,17 @@ pub fn extract_image_from_xobject(
     let is_ccitt = filter_names.iter().any(|n| n.eq_ignore_ascii_case("CCITTFaxDecode"));
 
     let ccitt_params = if is_ccitt {
-        let mut params = crate::object::extract_ccitt_params_with_width(dict.get("DecodeParms"), Some(width))
-            .unwrap_or(crate::decoders::CcittParams {
-                columns: width,
-                rows: Some(height),
-                ..crate::decoders::CcittParams::default()
-            });
+        let ccitt_index = filter_names
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case("CCITTFaxDecode"))
+            .unwrap_or(0);
+        let mut params =
+            crate::object::extract_ccitt_params_with_width_at_index(dict.get("DecodeParms"), ccitt_index, Some(width))
+                .unwrap_or(crate::decoders::CcittParams {
+                    columns: width,
+                    rows: Some(height),
+                    ..crate::decoders::CcittParams::default()
+                });
         if params.rows.is_none() {
             params.rows = Some(height);
         }
@@ -3380,7 +3395,13 @@ pub(crate) fn image_handle_from_xobject<'doc>(
     // /BitsPerComponent and /Length are likewise permitted to be indirect
     // (§7.3.10); /Length in particular is routinely indirect in the wild
     // (issue #1444's fixture has `/Length 9 0 R`). ~keep
-    let bpc = xobject_dict.get("BitsPerComponent").and_then(resolve_int).unwrap_or(8) as u8;
+    let is_image_mask = xobject_dict
+        .get("ImageMask")
+        .is_some_and(|value| matches!(value, crate::object::Object::Boolean(true)));
+    let bpc = xobject_dict
+        .get("BitsPerComponent")
+        .and_then(resolve_int)
+        .unwrap_or(if is_image_mask { 1 } else { 8 }) as u8;
     let byte_size = xobject_dict
         .get("Length")
         .and_then(resolve_int)

@@ -1,5 +1,6 @@
 """Tests for crewai-xberg tools."""
 
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -154,7 +155,13 @@ def test_extract_tool_name() -> None:
 def test_extract_tool_description() -> None:
     """Tool has a description mentioning format support."""
     tool = XbergExtractTool()
-    assert "101 file formats" in tool.description
+    # Assert the SHAPE of the claim, not the number. The count has exactly one owner --
+    # the MIME registry, propagated by scripts/sync_supported_counts.py, which rewrites
+    # the "Supports N file formats" advertisement in tools.py. Repeating the digit here
+    # made this test a second owner, and it drifted the moment the registry went 106 ->
+    # 107: the source was updated, the assertion was not, and CI Integrations failed on
+    # a number that was never wrong.
+    assert re.search(r"Supports \d+ file formats", tool.description)
 
 
 def test_extract_tool_args_schema() -> None:
@@ -221,7 +228,7 @@ def test_extract_tool_sync_run_bridge() -> None:
 async def test_extract_tool_file_not_found() -> None:
     """A missing file surfaces as a RuntimeError from xberg."""
     tool = XbergExtractTool()
-    with pytest.raises(RuntimeError, match="does not exist"):
+    with pytest.raises(RuntimeError, match=r"^IO error:"):
         await tool.arun(file_path=MISSING_FILE)
 
 
@@ -313,5 +320,5 @@ async def test_metadata_tool_includes_counts() -> None:
 async def test_metadata_tool_file_not_found() -> None:
     """A missing file surfaces as a RuntimeError from xberg."""
     tool = XbergExtractMetadataTool()
-    with pytest.raises(RuntimeError, match="does not exist"):
+    with pytest.raises(RuntimeError, match=r"^IO error:"):
         await tool.arun(file_path=MISSING_FILE)

@@ -13,7 +13,6 @@ import { Content as Snip_python_getting_started_hello_world } from "../../../sni
 import { Content as Snip_ruby_getting_started_install_verify } from "../../../snippets/ruby/getting-started/install_verify.md";
 import { Content as Snip_elixir_getting_started_basic_usage } from "../../../snippets/elixir/getting-started/basic_usage.md";
 import { Content as Snip_wasm_getting_started_basic_extract } from "../../../snippets/wasm/getting-started/basic-extract.md";
-import { Content as Snip_wasm_getting_started_runtime_detection } from "../../../snippets/wasm/getting-started/runtime-detection.md";
 
 Polyglot SDKs plus a standalone CLI. Most packages ship **prebuilt binaries** for Linux (x86_64/aarch64), macOS, and Windows — no compile step needed.
 
@@ -36,6 +35,14 @@ curl -fsSL https://raw.githubusercontent.com/xberg-io/xberg/main/scripts/install
 ```bash
 brew trust xberg-io/tap
 brew install xberg-io/tap/xberg
+```
+
+</TabItem>
+<TabItem label="Scoop (Windows)">
+
+```powershell
+scoop bucket add xberg https://github.com/xberg-io/scoop-bucket
+scoop install xberg
 ```
 
 </TabItem>
@@ -155,7 +162,7 @@ Apple Silicon (arm64) macOS is fully supported across every package. On **Intel 
   ***
 
   ```groovy
-  implementation 'io.xberg:xberg:1.0.14'
+  implementation 'io.xberg:xberg:1.1.3'
   ```
 
   [API Reference](/reference/api-java/)
@@ -166,7 +173,7 @@ Apple Silicon (arm64) macOS is fully supported across every package. On **Intel 
   ***
 
   ```kotlin
-  implementation("io.xberg:xberg-android:1.0.14")
+  implementation("io.xberg:xberg-android:1.1.3")
   ```
 
   [API Reference](/reference/api-kotlin-android/)
@@ -188,7 +195,7 @@ Apple Silicon (arm64) macOS is fully supported across every package. On **Intel 
   ***
 
   ```swift
-  .package(url: "https://github.com/xberg-io/xberg.git", from: "1.0.14")
+  .package(url: "https://github.com/xberg-io/xberg.git", from: "1.1.3")
   ```
 
   [API Reference](/reference/api-swift/)
@@ -254,7 +261,7 @@ Apple Silicon (arm64) macOS is fully supported across every package. On **Intel 
   ***
 
   ```bash
-  zig fetch --save https://github.com/xberg-io/xberg/archive/refs/tags/v1.0.14.tar.gz
+  zig fetch --save https://github.com/xberg-io/xberg/archive/refs/tags/v1.1.3.tar.gz
   ```
 
   [API Reference](/reference/api-zig/)
@@ -337,7 +344,8 @@ The Wasm package (`@xberg-io/xberg-wasm`) has **zero** system dependencies.
 ### HEIF / HEIC / AVIF support
 
 Pixel decoding for Apple HEIC photos, HEIF still images, AVIF, HEIC sequences
-(`.heics`), and AVCS requires the **`heic` Cargo feature** plus the system
+(`.heics`), HEIF sequences (`.heifs`), `.hif`, and AVCS requires the **`heic`
+Cargo feature** plus the system
 `libheif` library (with `libde265` for HEVC and `libaom` for AV1):
 
 - **macOS**: `brew install libheif`
@@ -401,9 +409,9 @@ auto-install-peers=true
 
 ```html
 <script type="module">
-  import { ExtractInputKind, initWasm, extract } from "@xberg-io/xberg-wasm";
+  import init, { ExtractInputKind, extract } from "@xberg-io/xberg-wasm";
 
-  await initWasm();
+  await init();
 
   const input = document.getElementById("file");
   input.addEventListener("change", async (e) => {
@@ -428,9 +436,9 @@ auto-install-peers=true
 :::note[Wasm — Deno]
 
 ```typescript
-import { ExtractInputKind, initWasm, extract } from "npm:@xberg-io/xberg-wasm";
+import init, { ExtractInputKind, extract } from "npm:@xberg-io/xberg-wasm";
 
-await initWasm();
+await init();
 const output = await extract({
   kind: ExtractInputKind.Uri,
   uri: "./document.pdf",
@@ -443,11 +451,11 @@ console.log(output.results[0].content);
 :::note[Wasm — Cloudflare Workers]
 
 ```typescript
-import { ExtractInputKind, initWasm, extract } from "@xberg-io/xberg-wasm";
+import init, { ExtractInputKind, extract } from "@xberg-io/xberg-wasm";
 
 export default {
   async fetch(request: Request): Promise<Response> {
-    await initWasm();
+    await init();
     const bytes = new Uint8Array(await request.arrayBuffer());
     const output = await extract({
       kind: ExtractInputKind.Bytes,
@@ -463,10 +471,6 @@ export default {
 
 **Supported runtimes:** Chrome 74+, Firefox 79+, Safari 14+, Edge 79+, Node.js 22+, Deno 1.35+, Cloudflare Workers.
 
-The package reports the host runtime and its Wasm capabilities. Read them before you call `initWasm` if your code must branch on workers or `SharedArrayBuffer`:
-
-<Snip_wasm_getting_started_runtime_detection />
-
 :::note[Wasm — package layout (`web` target only)]
 `@xberg-io/xberg-wasm` publishes a single wasm-pack **`web`** target — a standard ES module you
 `import` directly in the browser, over a CDN (jsDelivr/unpkg), in Deno via `npm:`, in Cloudflare
@@ -474,7 +478,7 @@ Workers, and in Node.js 22+ (ESM). Dedicated `bundler`, Node-CommonJS, and Deno 
 **not** shipped: each is a full copy of the ~100MB wasm binary, and shipping all four pushed the
 npm package past jsDelivr's 150MB per-package CDN limit (which broke the live demo's CDN load).
 Modern bundlers (Vite, webpack 5, Rollup, esbuild) consume the `web` target directly. Initialize
-with `await initWasm()` (or the default `init()` export) before calling `extract`.
+with the package's default `init()` export before calling `extract`.
 :::
 
 :::caution[Wasm Platform Limitations]
@@ -500,7 +504,7 @@ Layout detection (RT-DETR) and document-orientation detection **do** run in Wasm
 <dependency>
     <groupId>io.xberg</groupId>
     <artifactId>xberg</artifactId>
-    <version>1.0.14</version>
+    <version>1.1.3</version>
 </dependency>
 ```
 
@@ -508,7 +512,7 @@ Layout detection (RT-DETR) and document-orientation detection **do** run in Wasm
 <TabItem label="Gradle">
 
 ```groovy
-implementation 'io.xberg:xberg:1.0.14'
+implementation 'io.xberg:xberg:1.1.3'
 ```
 
 </TabItem>

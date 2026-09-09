@@ -9,6 +9,19 @@ pub(crate) mod diagram;
 pub(crate) mod doctags;
 #[cfg(any(feature = "html", feature = "email"))]
 pub(crate) mod grid_flatten;
+#[cfg(any(
+    all(feature = "pdf", feature = "heuristics"),
+    feature = "ocr",
+    feature = "ocr-wasm",
+    feature = "ocr-pipeline",
+    feature = "image-encode",
+    feature = "qr-codes",
+    feature = "layout-detection",
+    feature = "layout-tract",
+    feature = "auto-rotate",
+    feature = "auto-rotate-tract"
+))]
+pub(crate) mod image_decode;
 pub mod image_kind;
 pub mod structured;
 pub mod transform;

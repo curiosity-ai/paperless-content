@@ -270,7 +270,7 @@ impl InternalDocumentExtractor for DbfExtractor {
     }
 
     fn supported_mime_types(&self) -> &[&str] {
-        &["application/x-dbf", "application/dbase"]
+        &["application/vnd.dbf", "application/x-dbf", "application/dbase"]
     }
 
     fn priority(&self) -> i32 {
@@ -290,7 +290,7 @@ mod tests {
         assert_eq!(extractor.priority(), 50);
         assert_eq!(
             extractor.supported_mime_types(),
-            &["application/x-dbf", "application/dbase"]
+            &["application/vnd.dbf", "application/x-dbf", "application/dbase"]
         );
     }
 

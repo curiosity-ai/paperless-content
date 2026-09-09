@@ -484,6 +484,9 @@ impl OcrBackend for GlmOcrBackend {
             LayoutMode::WholePage => {
                 let task = opts.task;
                 let device = opts.device;
+                crate::extraction::image_decode::validate_standard_image_with_default_security_limits(
+                    &image_bytes_owned,
+                )?;
                 let content = tokio::task::spawn_blocking(move || {
                     let engine = get_or_init_engine(device, dtype, cache_dir, revision)?;
                     let output = engine.process_image_with_task(&image_bytes_owned, task).map_err(|e| {
@@ -591,13 +594,17 @@ async fn process_paired(
     use crate::layout::LayoutModelManager;
     use crate::layout::models::LayoutModel;
 
+    const CROP_PNG_ENCODE_BYTES_PER_PIXEL: u64 = 4;
+    const CROP_PNG_ENCODE_FIXED_BYTES: u64 = 256 * 1024;
+
     tokio::task::spawn_blocking(move || {
-        let img = image::load_from_memory(&image_bytes)
-            .map_err(|e| crate::XbergError::Ocr {
-                message: format!("GLM-OCR paired: image decode failed: {e}"),
-                source: Some(Box::new(e)),
-            })?
-            .to_rgb8();
+        let img = crate::extraction::image_decode::decode_standard_rgb8_with_default_security_limits(&image_bytes)
+            .map_err(|error| crate::XbergError::Ocr {
+                message: format!("GLM-OCR paired: image decode failed: {error}"),
+                source: Some(Box::new(error)),
+            })?;
+        let security_limits = crate::extractors::security::SecurityLimits::default();
+        crate::layout::engine::validate_layout_batch_peak(&[&img], &security_limits)?;
 
         let manager = LayoutModelManager::new(None);
         let model_path = manager
@@ -668,6 +675,28 @@ async fn process_paired(
             let y = (bbox.y1.max(0.0) as u32).min(img_height.saturating_sub(1));
             let w = ((bbox.x2 - bbox.x1).max(1.0) as u32).min(img_width - x);
             let h = ((bbox.y2 - bbox.y1).max(1.0) as u32).min(img_height - y);
+
+            let current_bytes = u64::try_from(img.as_raw().len()).map_err(|_| {
+                crate::extraction::image_decode::image_dimension_error(img_width, img_height, u64::MAX, u64::MAX)
+            })?;
+            let crop_and_encode_bytes =
+                crate::extraction::image_decode::decoded_byte_count(w, h, 3 + CROP_PNG_ENCODE_BYTES_PER_PIXEL)?
+                    .checked_add(CROP_PNG_ENCODE_FIXED_BYTES)
+                    .ok_or_else(|| {
+                        crate::extraction::image_decode::image_dimension_error(
+                            img_width,
+                            img_height,
+                            u64::MAX,
+                            u64::MAX,
+                        )
+                    })?;
+            crate::extraction::image_decode::validate_image_live_bytes(
+                img_width,
+                img_height,
+                current_bytes,
+                crop_and_encode_bytes,
+                &security_limits,
+            )?;
 
             let crop = image::imageops::crop_imm(&img, x, y, w, h).to_image();
 
@@ -770,6 +799,21 @@ mod tests {
         assert!(langs.contains(&"eng".to_string()));
         assert!(langs.contains(&"zho".to_string()));
         assert!(langs.contains(&"fra".to_string()));
+    }
+
+    #[tokio::test]
+    async fn should_reject_oversized_declared_dimensions_before_loading_glm_model() {
+        let backend = GlmOcrBackend::new(GlmOcrTask::default(), LayoutMode::WholePage);
+        let bytes = crate::extraction::image_decode::bmp_with_declared_dimensions(6000, 6000);
+
+        let error = backend
+            .process_image(&bytes, &OcrConfig::default())
+            .await
+            .expect_err("GLM-OCR must validate the decoded-byte budget before model initialization");
+
+        assert!(matches!(error, crate::XbergError::Validation { .. }));
+        assert!(error.to_string().contains("6000x6000"));
+        assert!(error.to_string().contains("security_limits.max_content_size"));
     }
 
     #[test]

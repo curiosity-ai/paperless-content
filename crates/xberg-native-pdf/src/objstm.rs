@@ -31,6 +31,41 @@ use crate::object::Object;
 use crate::parser::parse_object;
 use std::collections::HashMap;
 
+const MAX_OBJECT_STREAM_OBJECTS: i64 = 1_000_000;
+const MAX_OBJECT_STREAM_FIRST_OFFSET: i64 = 10_000_000;
+
+pub(crate) struct ObjectStreamParseOutcome {
+    pub(crate) objects: HashMap<u32, Object>,
+    recovery: Option<ObjectStreamRecovery>,
+}
+
+struct ObjectStreamRecovery {
+    invalid_offset_count: usize,
+    parse_failure_count: usize,
+}
+
+impl ObjectStreamParseOutcome {
+    pub(crate) fn has_recovery(&self) -> bool {
+        self.recovery.is_some()
+    }
+
+    pub(crate) fn trace_recovery(&self) {
+        let Some(recovery) = &self.recovery else {
+            return;
+        };
+        let skipped_count = recovery.invalid_offset_count + recovery.parse_failure_count;
+        tracing::warn!(
+            target: crate::LOG_TARGET_ROOT,
+            operation = "parse_object_stream",
+            error_code = "invalid_embedded_object",
+            skipped_count,
+            parse_failure_count = recovery.parse_failure_count,
+            invalid_offset_count = recovery.invalid_offset_count,
+            "object stream entries were skipped"
+        );
+    }
+}
+
 /// Parse an object stream and extract all objects.
 ///
 /// This is a convenience method that calls `parse_object_stream_with_decryption`
@@ -89,6 +124,17 @@ pub fn parse_object_stream_with_decryption(
     obj_num: u32,
     gen_num: u32,
 ) -> Result<HashMap<u32, Object>> {
+    let outcome = parse_object_stream_with_decryption_outcome(stream_obj, decryption_fn, obj_num, gen_num)?;
+    outcome.trace_recovery();
+    Ok(outcome.objects)
+}
+
+pub(crate) fn parse_object_stream_with_decryption_outcome(
+    stream_obj: &Object,
+    decryption_fn: Option<&dyn Fn(&[u8]) -> Result<Vec<u8>>>,
+    obj_num: u32,
+    gen_num: u32,
+) -> Result<ObjectStreamParseOutcome> {
     let dict = match stream_obj {
         Object::Stream { dict, .. } => dict,
         _ => return Err(Error::InvalidPdf("object stream is not a Stream object".to_string())),
@@ -114,11 +160,11 @@ pub fn parse_object_stream_with_decryption(
         .and_then(|o| o.as_integer())
         .ok_or_else(|| Error::InvalidPdf("object stream missing /First entry".to_string()))?;
 
-    if !(0..=1_000_000).contains(&n) {
+    if !(0..=MAX_OBJECT_STREAM_OBJECTS).contains(&n) {
         return Err(Error::InvalidPdf(format!("invalid object stream /N value: {}", n)));
     }
 
-    if !(0..=10_000_000).contains(&first) {
+    if !(0..=MAX_OBJECT_STREAM_FIRST_OFFSET).contains(&first) {
         return Err(Error::InvalidPdf(format!(
             "invalid object stream /First value: {}",
             first
@@ -141,18 +187,18 @@ pub fn parse_object_stream_with_decryption(
     let pairs_data = &decoded_data[..first];
     let pairs = parse_object_number_pairs(pairs_data, n)?;
 
-    let objects_data = &decoded_data[first..];
+    Ok(parse_embedded_objects(&decoded_data[first..], pairs))
+}
+
+fn parse_embedded_objects(objects_data: &[u8], pairs: Vec<(u32, usize)>) -> ObjectStreamParseOutcome {
     let mut result = HashMap::new();
+    let mut invalid_offset_count = 0usize;
+    let mut parse_failure_count = 0usize;
 
     for (obj_num, offset_in_data) in pairs {
         // The offset is relative to the start of objects_data ~keep
         if offset_in_data >= objects_data.len() {
-            tracing::warn!(
-                object_id = obj_num,
-                offset = offset_in_data,
-                bytes = objects_data.len(),
-                "object offset is beyond stream data length, skipping"
-            );
+            invalid_offset_count += 1;
             continue;
         }
 
@@ -161,20 +207,22 @@ pub fn parse_object_stream_with_decryption(
             Ok((_remaining, obj)) => {
                 result.insert(obj_num, obj);
             }
-            Err(e) => {
-                tracing::warn!(
-                    object_id = obj_num,
-                    offset = offset_in_data,
-                    error = ?e,
-                    "failed to parse object from stream, skipping"
-                );
+            Err(_) => {
+                parse_failure_count += 1;
                 // Continue parsing other objects even if one fails ~keep
                 continue;
             }
         }
     }
 
-    Ok(result)
+    let recovery = (invalid_offset_count + parse_failure_count > 0).then_some(ObjectStreamRecovery {
+        invalid_offset_count,
+        parse_failure_count,
+    });
+    ObjectStreamParseOutcome {
+        objects: result,
+        recovery,
+    }
 }
 
 /// Parse the pairs section of an object stream.
@@ -272,7 +320,60 @@ fn read_integer_string(data: &[u8]) -> Option<(&[u8], String)> {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    #[derive(Clone, Debug)]
+    struct CapturedEvent {
+        level: tracing::Level,
+        target: String,
+        fields: BTreeMap<String, String>,
+    }
+
+    #[derive(Clone, Default)]
+    struct EventCapture(Arc<Mutex<Vec<CapturedEvent>>>);
+
+    impl<S> Layer<S> for EventCapture
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(&self, event: &tracing::Event<'_>, _context: tracing_subscriber::layer::Context<'_, S>) {
+            let mut visitor = FieldCapture::default();
+            event.record(&mut visitor);
+            self.0.lock().unwrap().push(CapturedEvent {
+                level: *event.metadata().level(),
+                target: event.metadata().target().to_string(),
+                fields: visitor.0,
+            });
+        }
+    }
+
+    #[derive(Default)]
+    struct FieldCapture(BTreeMap<String, String>);
+
+    impl tracing::field::Visit for FieldCapture {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_string(), format!("{value:?}"));
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    fn capture_events<T>(operation: impl FnOnce() -> T) -> (T, Vec<CapturedEvent>) {
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let result = tracing::subscriber::with_default(subscriber, operation);
+        let events = capture.0.lock().unwrap().clone();
+        (result, events)
+    }
 
     #[test]
     fn test_skip_whitespace() {
@@ -428,5 +529,55 @@ mod tests {
 
         let result = parse_object_stream(&stream);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn malformed_entries_emit_one_bounded_summary_without_parser_input() {
+        const CONFIDENTIAL_MARKER: &str = "CONFIDENTIAL_OBJSTM_PAYLOAD_944d";
+        let pairs_data = b"10 0 11 1 12 2 13 999";
+        let mut combined = pairs_data.to_vec();
+        combined.push(b' ');
+        combined.extend_from_slice(CONFIDENTIAL_MARKER.as_bytes());
+
+        let mut dict = HashMap::new();
+        dict.insert("Type".to_string(), Object::Name("ObjStm".to_string()));
+        dict.insert("N".to_string(), Object::Integer(4));
+        dict.insert("First".to_string(), Object::Integer((pairs_data.len() + 1) as i64));
+        let stream = Object::Stream {
+            dict,
+            data: Bytes::from(combined),
+        };
+
+        let (result, events) = capture_events(|| parse_object_stream(&stream));
+
+        assert!(result.is_ok());
+        assert_eq!(
+            events.len(),
+            1,
+            "one object stream must emit at most one recovery event"
+        );
+        assert_eq!(events[0].level, tracing::Level::WARN);
+        assert_eq!(events[0].target, crate::LOG_TARGET_ROOT);
+        assert_eq!(
+            events[0].fields.get("operation").map(String::as_str),
+            Some("parse_object_stream")
+        );
+        assert_eq!(
+            events[0].fields.get("error_code").map(String::as_str),
+            Some("invalid_embedded_object")
+        );
+        assert_eq!(events[0].fields.get("skipped_count").map(String::as_str), Some("4"));
+        assert_eq!(
+            events[0].fields.get("parse_failure_count").map(String::as_str),
+            Some("3")
+        );
+        assert_eq!(
+            events[0].fields.get("invalid_offset_count").map(String::as_str),
+            Some("1")
+        );
+        assert!(
+            !format!("{events:?}").contains(CONFIDENTIAL_MARKER),
+            "object-stream telemetry exposed parser input: {events:?}"
+        );
     }
 }

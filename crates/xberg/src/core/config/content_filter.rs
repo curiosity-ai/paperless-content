@@ -16,6 +16,7 @@ fn default_true() -> bool {
 /// When `None` on `ExtractionConfig`, each extractor uses its current
 /// default behavior unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContentFilterConfig {
     /// Include running headers in extraction output.
     ///

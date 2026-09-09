@@ -68,6 +68,34 @@ class TestWorkflowMatrixValidation(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "validation gates must precede publication"):
             VALIDATOR.workflow_cells(mutated)
 
+    def test_tika_jar_is_downloaded_once_and_shared(self) -> None:
+        jobs = VALIDATOR.split_jobs(WORKFLOW)
+
+        VALIDATOR.validate_tika_artifact(jobs)
+
+    def test_tika_matrix_cannot_download_from_maven(self) -> None:
+        mutated = WORKFLOW.replace(
+            "      - name: Download Apache Tika artifact\n        uses: actions/download-artifact@v8",
+            "      - name: Download Apache Tika artifact\n        run: curl https://repo1.maven.org/tika.jar",
+            1,
+        )
+
+        with self.assertRaisesRegex(ValueError, "must not download Apache Tika independently"):
+            VALIDATOR.workflow_cells(mutated)
+
+    def test_tika_download_must_verify_pinned_checksum(self) -> None:
+        mutated = WORKFLOW.replace("${TIKA_SHA256}  ${jar_path}", "unchecked ${jar_path}", 1)
+
+        with self.assertRaisesRegex(ValueError, "verify the pinned Apache Tika checksum"):
+            VALIDATOR.workflow_cells(mutated)
+
+    def test_tika_maven_download_must_be_unique(self) -> None:
+        url = "repo.maven.apache.org/maven2/org/apache/tika/"
+        mutated = WORKFLOW.replace(url, f"{url}{url}", 1)
+
+        with self.assertRaisesRegex(ValueError, "download Apache Tika exactly once"):
+            VALIDATOR.workflow_cells(mutated)
+
 
 if __name__ == "__main__":
     unittest.main()

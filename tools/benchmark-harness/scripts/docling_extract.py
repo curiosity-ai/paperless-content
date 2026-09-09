@@ -81,8 +81,8 @@ def create_converter(ocr_enabled: bool, ocr_language: str | None = None) -> Docu
 
 def _render(document: Any, output_format: str) -> str:
     if output_format == "plaintext":
-        return document.export_to_text()
-    return document.export_to_markdown()
+        return document.export_to_text(traverse_pictures=True)
+    return document.export_to_markdown(traverse_pictures=True)
 
 
 def extract_sync(file_path: str, converter: DocumentConverter, output_format: str = "markdown") -> dict[str, Any]:

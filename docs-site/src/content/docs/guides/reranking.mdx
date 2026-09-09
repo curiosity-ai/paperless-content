@@ -21,50 +21,39 @@ Use the `fast` preset to rerank three documents against a query.
 <Tabs syncKey="lang">
 <TabItem label="Python">
 
+The Python binding has no standalone `rerank`/`rerank_sync` entry point — only reranker-backend
+registration (`register_reranker_backend`, `list_reranker_backends`, `unregister_reranker_backend`)
+and the `RerankerConfig`/`RerankerModelType` types are exposed. To run the dispatcher shown below,
+call it from Rust (or a language whose binding does expose it):
+
 ```python
-from xberg import rerank_sync, RerankerConfig, RerankerModelType
+from xberg import RerankerConfig, RerankerModelType
 
-query = "How to train a dog"
-documents = [
-    "Dog training requires patience and consistency.",
-    "Cats are independent animals that prefer to play alone.",
-    "Bird care includes proper cage setup and regular cleaning.",
-]
-
+# NOTE: The Python binding has no standalone reranking entry point — RerankerConfig
+# and RerankerModelType are exposed so you can build config for a plugin backend, but
+# there is no rerank()/rerank_sync() function to call it with. See the "In-process
+# plugin backend" section below to register your own model instead.
 config = RerankerConfig(
     model=RerankerModelType(type="preset", name="fast"),
     top_k=2,
 )
-
-results = rerank_sync(query, documents, config)
-for result in results:
-    print(f"#{result.index}: {result.score:.3f} — {result.document}")
 ```
 
 </TabItem>
 <TabItem label="TypeScript">
 
 ```typescript
-import { rerankSync, RerankerConfig } from "@xberg-io/xberg";
+// NOTE: The Node/TypeScript binding has no standalone rerank()/rerankSync() entry
+// point — only reranker-backend registration (registerRerankerBackend,
+// listRerankerBackends, unregisterRerankerBackend) and the RerankerConfig type are
+// exposed. See the "In-process plugin backend" section below to register your own
+// model instead of calling a dispatcher directly.
+import type { RerankerConfig } from "@xberg-io/xberg";
 
 const config: RerankerConfig = {
   model: { type: "preset", name: "fast" },
   top_k: 2,
 };
-
-const results = rerankSync(
-  "How to train a dog",
-  [
-    "Dog training requires patience and consistency.",
-    "Cats are independent animals that prefer to play alone.",
-    "Bird care includes proper cage setup and regular cleaning.",
-  ],
-  config,
-);
-
-for (const r of results) {
-  console.log(`#${r.index}: ${r.score.toFixed(3)} — ${r.document}`);
-}
 ```
 
 </TabItem>
@@ -97,26 +86,15 @@ for r in results {
 <TabItem label="Go">
 
 ```go
+// NOTE: The Go binding has no standalone Rerank() entry point — only reranker-backend
+// registration (RegisterRerankerBackend, ListRerankerBackends, UnregisterRerankerBackend)
+// and the RerankerConfig type are exposed. See the "In-process plugin backend" section
+// below to register your own model instead of calling a dispatcher directly.
 import "github.com/xberg-io/xberg"
 
 config := xberg.RerankerConfig{
     Model: &xberg.RerankerModelTypePreset{Name: "fast"},
     TopK:  xberg.Ptr(uint(2)),
-}
-results, err := xberg.Rerank(
-    "How to train a dog",
-    []string{
-        "Dog training requires patience and consistency.",
-        "Cats are independent animals that prefer to play alone.",
-        "Bird care includes proper cage setup and regular cleaning.",
-    },
-    &config,
-)
-if err != nil {
-    log.Fatal(err)
-}
-for _, r := range results {
-    fmt.Printf("#%d: %.3f — %s\n", r.Index, r.Score, r.Document)
 }
 ```
 
@@ -124,26 +102,17 @@ for _, r := range results {
 <TabItem label="Java">
 
 ```java
+// NOTE: The Java binding has no standalone Xberg.rerank() entry point — only
+// reranker-backend registration (Xberg.registerRerankerBackend, listRerankerBackends,
+// unregisterRerankerBackend) and the RerankerConfig type are exposed. See the
+// "In-process plugin backend" section below to register your own model instead of
+// calling a dispatcher directly.
 import io.xberg.*;
 
 RerankerConfig config = new RerankerConfig.Builder()
     .model(new RerankerModelType.Preset("fast"))
     .topK(2L)
     .build();
-
-var results = Xberg.rerank(
-    "How to train a dog",
-    java.util.List.of(
-        "Dog training requires patience and consistency.",
-        "Cats are independent animals that prefer to play alone.",
-        "Bird care includes proper cage setup and regular cleaning."
-    ),
-    config
-);
-
-for (var r : results) {
-    System.out.printf("#%d: %.3f — %s%n", r.getIndex(), r.getScore(), r.getDocument());
-}
 ```
 
 </TabItem>
@@ -165,7 +134,10 @@ All four download lazily from HuggingFace on first use and cache under `~/.cache
 To use any ONNX cross-encoder from HuggingFace, point the `Custom` variant at its repository ID. The repo must contain an `onnx/model.onnx` file.
 
 ```python
-from xberg import rerank_sync, RerankerConfig, RerankerModelType
+# NOTE: The Python binding has no standalone rerank()/rerank_sync() entry point —
+# RerankerConfig/RerankerModelType are exposed to build config, but there is no
+# function to run the dispatcher shown here directly from Python.
+from xberg import RerankerConfig, RerankerModelType
 
 config = RerankerConfig(
     model=RerankerModelType(
@@ -174,8 +146,6 @@ config = RerankerConfig(
         max_length=512,
     ),
 )
-
-results = rerank_sync("query text", ["doc1", "doc2"], config)
 ```
 
 ## LLM rerank via liter-llm
@@ -183,8 +153,11 @@ results = rerank_sync("query text", ["doc1", "doc2"], config)
 For provider-hosted rerankers, use the `Llm` variant with a liter-llm model identifier. The model string must include the provider prefix (`cohere/`, `jina/`, `voyage/`).
 
 ```python
+# NOTE: The Python binding has no standalone rerank()/rerank_sync() entry point —
+# RerankerConfig/RerankerModelType/LlmConfig are exposed to build config, but there
+# is no function to run the dispatcher shown here directly from Python.
 import os
-from xberg import rerank_sync, RerankerConfig, RerankerModelType, LlmConfig
+from xberg import RerankerConfig, RerankerModelType, LlmConfig
 
 config = RerankerConfig(
     model=RerankerModelType(
@@ -196,8 +169,6 @@ config = RerankerConfig(
     ),
     top_k=5,
 )
-
-results = rerank_sync("query text", documents, config)
 ```
 
 Set `COHERE_API_KEY` (or `JINA_API_KEY`, `VOYAGE_API_KEY`) in the environment. The Llm variant requires the `liter-llm` Cargo feature.
@@ -211,9 +182,13 @@ The protocol returns **raw scores in input order**. The dispatcher handles sorti
 Scores can be any sequence of floats — a NumPy array or a plain list. The bridge reads both, so a model that already returns an array needs no conversion.
 
 ```python
+# NOTE: register_reranker_backend() is real and registers your model in xberg's
+# Rust-side registry, but the Python binding exposes no rerank()/rerank_sync() to
+# invoke it afterward — invocation must come from a caller that does have a rerank
+# entry point (currently only the Rust crate).
 from collections.abc import Iterable
 
-from xberg import register_reranker_backend, rerank_sync, RerankerConfig, RerankerModelType
+from xberg import register_reranker_backend, RerankerConfig, RerankerModelType
 
 class MyReranker:
     def __init__(self):
@@ -240,7 +215,6 @@ class MyReranker:
 register_reranker_backend(MyReranker())
 
 config = RerankerConfig(model=RerankerModelType(type="plugin", name="my-reranker"))
-results = rerank_sync("query text", ["doc1", "doc2"], config)
 ```
 
 The Plugin variant loads no ONNX Runtime model, but the rerank dispatch is still gated behind the `reranker` feature. On no-ORT targets — WebAssembly and the Android x86_64 emulator — `rerank` and `rerank_async` compile to stubs that return an error, so the Plugin variant is not available there.

@@ -1,9 +1,17 @@
 ```kotlin title="Kotlin"
 import io.xberg.*
-import java.util.Optional
+
+private const val DEFAULT_MAX_ARCHIVE_DEPTH = 3L
+private const val DEFAULT_EXTRACTION_TIMEOUT_SECS = 600L
+private const val DEFAULT_MAX_EMBEDDED_FILE_BYTES = 50L * 1024L * 1024L
 
 fun main() {
-    val config = ExtractionConfig.builder().build()
+    val config = ExtractionConfig(
+        extractionTimeoutSecs = DEFAULT_EXTRACTION_TIMEOUT_SECS,
+        maxEmbeddedFileBytes = DEFAULT_MAX_EMBEDDED_FILE_BYTES,
+        url = UrlExtractionConfig(crawl = CrawlConfig(ssrf = SsrfPolicy())),
+        maxArchiveDepth = DEFAULT_MAX_ARCHIVE_DEPTH,
+    )
     val resultOutput = Xberg.extract(
         ExtractInput(kind = ExtractInputKind.URI, uri = "document.pdf"),
         config,
@@ -14,54 +22,45 @@ fun main() {
     metadata.title?.let { println("Title: $it") }
     metadata.authors?.let { println("Authors: ${it.joinToString(", ")}") }
 
-    // Format-specific metadata via discriminated union
-    metadata.format?.pdf?.let { pdf ->
-        pdf.pageCount?.let { println("Pages: $it") }
-        pdf.producer?.let { println("Producer: $it") }
-        pdf.pdfVersion?.let { println("PDF Version: $it") }
+    when (val format = metadata.format) {
+        is FormatMetadata.Pdf -> {
+            format.metadata.pageCount?.let { println("Pages: $it") }
+            format.metadata.producer?.let { println("Producer: $it") }
+            format.metadata.pdfVersion?.let { println("PDF Version: $it") }
+        }
+        else -> Unit
     }
 
-    // Access HTML metadata
     val htmlResultOutput = Xberg.extract(
         ExtractInput(kind = ExtractInputKind.URI, uri = "page.html"),
         config,
     )
     val htmlResult = htmlResultOutput.results.first()
-    htmlResult.metadata.format?.html?.let { html ->
-        html.title?.let { println("Title: $it") }
-        html.description?.let { println("Description: $it") }
-        html.canonicalUrl?.let { println("Canonical URL: $it") }
-        html.language?.let { println("Language: $it") }
-
-        // Access keywords list
-        println("Keywords: ${html.keywords}")
-
-        // Open Graph fields are exposed as a Map<String, String>
-        html.openGraph["image"]?.let { println("Open Graph Image: $it") }
-        html.openGraph["title"]?.let { println("Open Graph Title: $it") }
-
-        // Twitter Card fields as a Map<String, String>
-        html.twitterCard["card"]?.let { println("Twitter Card Type: $it") }
-
-        // Headers
-        for (header in html.headers) {
-            println("Header (level ${header.level}): ${header.text}")
+    when (val format = htmlResult.metadata.format) {
+        is FormatMetadata.Html -> {
+            val html = format.metadata
+            html.title?.let { println("Title: $it") }
+            html.description?.let { println("Description: $it") }
+            html.canonicalUrl?.let { println("Canonical URL: $it") }
+            html.language?.let { println("Language: $it") }
+            println("Keywords: ${html.keywords}")
+            html.openGraph["image"]?.let { println("Open Graph Image: $it") }
+            html.openGraph["title"]?.let { println("Open Graph Title: $it") }
+            html.twitterCard["card"]?.let { println("Twitter Card Type: $it") }
+            for (header in html.headers) {
+                println("Header (level ${header.level}): ${header.text}")
+            }
+            for (link in html.links) {
+                println("Link: ${link.href} (${link.text})")
+            }
+            for (image in html.images) {
+                println("Image: ${image.src}")
+            }
+            if (html.structuredData.isNotEmpty()) {
+                println("Structured data items: ${html.structuredData.size}")
+            }
         }
-
-        // Links
-        for (link in html.links) {
-            println("Link: ${link.href} (${link.text})")
-        }
-
-        // Images
-        for (image in html.images) {
-            println("Image: ${image.src}")
-        }
-
-        // Structured data
-        if (html.structuredData.isNotEmpty()) {
-            println("Structured data items: ${html.structuredData.size}")
-        }
+        else -> Unit
     }
 }
 ```

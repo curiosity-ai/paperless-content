@@ -335,7 +335,7 @@ fn rotated_run_span_extent_follows_the_writing_axis() {
 /// dropped `2`, `O`, one `Tm`+`Tj` each. The drop is 3pt PERPENDICULAR to the
 /// writing axis — inside the axis test's tolerance (0.5 × font size) — while
 /// the along-axis steps (8pt, then 14pt from the start) stay inside the
-/// `|d|`-scaled raw `f` band the axis test is ANDed with. The rotation must
+/// `|d|`-scaled raw `f` band the axis test is combined with. The rotation must
 /// stay shallow: at quadrant angles that band (`d == 0` → 0.5pt) vetoes any
 /// along-axis advance before the axis test runs, so its tolerance is
 /// reachable there only through the veto path pinned by

@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://cdn.jsdelivr.net/gh/xberg-io/assets@v1/banner/readme-banner-dark.svg">
+    <img alt="Xberg" width="420" src="https://cdn.jsdelivr.net/gh/xberg-io/assets@v1/banner/readme-banner-light.svg">
+  </picture>
+</p>
+
 # Xberg
 
 {% include 'partials/badges.html.jinja' %}
@@ -8,7 +15,7 @@
 
 Point Xberg at anything — a PDF, a scanned image, a spreadsheet, an audio file, a URL, a whole archive, or a source tree — and get back clean text, tables, metadata, and structured data. One engine handles format detection, reading, OCR, and extraction, so you never stitch a pipeline together from a dozen libraries.
 
-**100 formats · 120 file extensions** · **371 code languages** · **15 language bindings** · **6 output formats** · OCR · transcription · embeddings
+**107 formats · 141 file extensions** · **371 code languages** · **15 language bindings** · **6 output formats** · OCR · transcription · embeddings
 
 The fastest, most precise open-source document and PDF-to-Markdown engine — [see the benchmarks](https://xberg.io/benchmarks).
 
@@ -26,7 +33,7 @@ Point Xberg at anything — a PDF, a spreadsheet, a scanned image, an audio file
 
 | Capability | What you get |
 |---|---|
-| **100 document formats** | PDFs, Office, images, HTML, email, e-books, scientific publications, and structured data across 120 file extensions, with intelligent MIME detection and bounded extraction controls. |
+| **107 document formats** | PDFs, Office, images, HTML, email, e-books, scientific publications, and structured data across 141 file extensions, with intelligent MIME detection and bounded extraction controls. |
 | **URLs & the web** | Point Xberg at an `http(s)` URL — it fetches and extracts a single document, or crawls and follows links (Auto / Document / Crawl modes via the [crawlberg](https://github.com/xberg-io/crawlberg) engine). *Requires the `url-ingestion` feature.* |
 | **Audio & video transcription** | Speech-to-text from MP3, M4A, WAV, WebM, and MP4 tracks via Whisper ONNX (tiny → large-v3). *Requires the `transcription` feature.* |
 | **Archives, traversed** | List and **recursively** extract nested `.zip`, `.tar`, `.gz`, `.7z` — documents inside documents — guarded by zip-bomb, compression-ratio, and nesting-depth limits. |
@@ -200,6 +207,13 @@ Build from source as part of this workspace. See [C (FFI) README](https://github
 brew install xberg-io/tap/xberg
 ```
 
+Windows users can install the same binary through [Scoop](https://scoop.sh):
+
+```powershell
+scoop bucket add xberg https://github.com/xberg-io/scoop-bucket
+scoop install xberg
+```
+
 14 commands: `extract`, `batch`, `detect`, `formats`, `version`, `cache`, `tree-sitter`, `doctor`, `serve`, `mcp`, `api`, `embed`, `chunk`, and `completions`.
 
 See [CLI usage guide](https://docs.xberg.io/cli/usage/) for detailed documentation.
@@ -357,9 +371,9 @@ Common use cases — see [Quick start guide](https://docs.xberg.io/getting-start
 <details>
 <summary><strong>Full feature list</strong></summary>
 
-### Supported File Formats (100 formats · 120 file extensions)
+### Supported File Formats (107 formats · 141 file extensions · 56 MIME aliases)
 
-100 formats across 120 file extensions in 8 major categories with intelligent format detection and comprehensive metadata extraction.
+107 formats across 140 unique file extensions, with 56 compatibility MIME aliases, intelligent format detection, and comprehensive metadata extraction.
 
 #### Office Documents
 
@@ -367,10 +381,10 @@ Common use cases — see [Quick start guide](https://docs.xberg.io/getting-start
 |----------|---------|--------------|
 | **Word Processing** | `.docx`, `.docm`, `.doc`, `.dotx`, `.dotm`, `.dot`, `.odt`, `.pages`, `.wpd`, `.wp`, `.wp5`, `.wp6` | Full text, tables, images, metadata, styles |
 | **Spreadsheets** | `.xlsx`, `.xlsm`, `.xlsb`, `.xls`, `.xla`, `.xlam`, `.xltm`, `.xltx`, `.xlt`, `.ods`, `.numbers` | Sheet data, formulas, cell metadata, charts |
-| **Presentations** | `.pptx`, `.pptm`, `.ppt`, `.ppsx`, `.potx`, `.potm`, `.pot`, `.odp`, `.key` | Slides, speaker notes, images, metadata |
+| **Presentations** | `.pptx`, `.pptm`, `.ppt`, `.pps`, `.ppsx`, `.potx`, `.potm`, `.pot`, `.odp`, `.key` | Slides, speaker notes, images, metadata |
 | **PDF** | `.pdf` | Text, tables, images, metadata, OCR support |
 | **eBooks** | `.epub`, `.fb2` | Chapters, metadata, embedded resources |
-| **Database** | `.dbf` | Table data extraction, field type support |
+| **Database** | `.dbf`, `.sqlite`, `.sqlite3`, `.db`, `.gpkg`, `.gpkx` | Bounded table extraction, schema metadata, GeoPackage detection |
 | **Hangul** | `.hwp`, `.hwpx` | Korean document format, text extraction |
 
 #### Images (OCR-Enabled)
@@ -378,8 +392,8 @@ Common use cases — see [Quick start guide](https://docs.xberg.io/getting-start
 | Category | Formats | Features |
 |----------|---------|----------|
 | **Raster** | `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.bmp`, `.tiff`, `.tif` | OCR, table detection, EXIF metadata, dimensions, color space |
-| **Advanced** | `.jp2`, `.jpx`, `.jpm`, `.mj2`, `.jbig2`, `.jb2`, `.pnm`, `.pbm`, `.pgm`, `.ppm` | OCR via pure-Rust JPEG2000 decoder, JBIG2 support, table detection |
-| **HEIC family** | `.heic`, `.heics`, `.heif`, `.avif`, `.avcs` | EXIF metadata, optional pixel decoding |
+| **Advanced** | `.jp2`, `.jpg2`, `.j2c`, `.j2k`, `.jpc`, `.jbig2`, `.jb2`, `.pnm`, `.pbm`, `.pgm`, `.ppm` | OCR via pure-Rust JPEG2000 decoder, JBIG2 support, table detection |
+| **HEIC family** | `.heic`, `.heics`, `.heif`, `.heifs`, `.hif`, `.avif`, `.avcs` | EXIF metadata, optional pixel decoding |
 | **Vector** | `.svg` | DOM parsing, embedded text, graphics metadata |
 
 #### Audio & Video
@@ -387,15 +401,17 @@ Common use cases — see [Quick start guide](https://docs.xberg.io/getting-start
 | Category | Formats | Features |
 |----------|---------|----------|
 | **Audio** | `.mp3`, `.mpga`, `.m4a`, `.wav`, `.webm` | Whisper transcription |
-| **Video audio track** | `.mp4`, `.mpeg`, `.webm` | Audio-track transcription only |
+| **MP4 audio track** | `.mp4`, `.mpg4`, `.mp4v`, `.m4v` | Audio-track transcription only |
+| **MPEG audio track** | `.mpeg`, `.mpg`, `.mpe`, `.m1v`, `.m2v` | Audio-track transcription only |
+| **WebM audio track** | `.webm` | Audio-track transcription only |
 
 #### Web & Data
 
 | Category | Formats | Features |
 |----------|---------|----------|
-| **Markup** | `.html`, `.htm`, `.xhtml`, `.xml`, `.svg` | DOM parsing, metadata (Open Graph, Twitter Card), link extraction |
-| **Structured Data** | `.json`, `.yaml`, `.yml`, `.toml`, `.csv`, `.tsv` | Schema detection, nested structures, validation |
-| **Text & Markdown** | `.txt`, `.md`, `.markdown`, `.djot`, `.mdx`, `.rst`, `.org`, `.rtf` | CommonMark, GFM, Djot, MDX, reStructuredText, Org Mode |
+| **Markup** | `.html`, `.htm`, `.xhtml`, `.xht`, `.xml`, `.kml`, `.svg` | DOM parsing, metadata (Open Graph, Twitter Card), link extraction |
+| **Structured Data** | `.json`, `.geojson`, `.jsonl`, `.ndjson`, `.yaml`, `.yml`, `.toml`, `.csv`, `.tsv` | Schema detection, nested structures, validation |
+| **Text & Markdown** | `.txt`, `.adoc`, `.asciidoc`, `.vtt`, `.md`, `.markdown`, `.commonmark`, `.qmd`, `.rmd`, `.djot`, `.dj`, `.mdx`, `.doctags`, `.rst`, `.org`, `.rtf` | AsciiDoc, CommonMark, MyST Markdown, Quarto, R Markdown, Djot, MDX, DocTags, reStructuredText, Org Mode |
 
 #### Email & Archives
 
@@ -409,7 +425,8 @@ Common use cases — see [Quick start guide](https://docs.xberg.io/getting-start
 | Category | Formats | Features |
 |----------|---------|----------|
 | **Citations** | `.bib`, `.ris`, `.nbib`, `.enw` | Structured parsing: RIS, PubMed/MEDLINE, EndNote XML, BibTeX/BibLaTeX |
-| **Scientific** | `.tex`, `.latex`, `.typ`, `.typst`, `.jats`, `.ipynb` | LaTeX, Typst, Jupyter notebooks, PubMed JATS |
+| **Scientific** | `.tex`, `.latex`, `.typ`, `.typst`, `.jats`, `.nxml` | LaTeX, Typst, PubMed JATS |
+| **Text notebooks** | `.ipynb`, `.md`, `.py`, `.R`, `.jl` | Jupyter, MyST-NB, Jupytext percent/light, saved outputs, cell visibility tags |
 | **Publishing** | `.fb2`, `.docbook`, `.dbk`, `.docbook4`, `.docbook5`, `.opml` | FictionBook, DocBook XML, OPML outlines |
 
 ### Code Intelligence (371 Languages)
@@ -578,7 +595,7 @@ Join our [Discord community](https://discord.gg/xt9WY3GnKR) for questions and di
 
 ## Part of Xberg.io
 
-- [Xberg](https://github.com/xberg-io/xberg) — the open-source content-intelligence engine: text, tables, and metadata from 100 formats (120 file extensions), with OCR, transcription, and code intelligence. MIT.
+- [Xberg](https://github.com/xberg-io/xberg) — the open-source content-intelligence engine: text, tables, and metadata from 107 formats (141 file extensions), with OCR, transcription, and code intelligence. MIT.
 - [Xberg Pro](https://xberg.io) — a complete self-hosted content-intelligence backend in a single container. Commercial.
 - [Xberg Enterprise](https://xberg.io) — the distributed, governed content-intelligence platform, scaled on Kubernetes with team governance and support. Commercial.
 - [crawlberg](https://github.com/xberg-io/crawlberg) — web crawling and scraping with HTML→Markdown and headless-Chrome fallback.

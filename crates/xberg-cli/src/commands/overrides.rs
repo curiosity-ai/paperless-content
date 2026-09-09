@@ -147,7 +147,7 @@ impl ReductionLevelArg {
 #[derive(Debug, Default, clap::Args)]
 pub struct ExtractionOverrides {
     /// Enable or disable OCR. When true, configures an OCR backend
-    /// (default: tesseract). When false, removes any OCR configuration.
+    /// (default: tesseract). When false, hard-disables OCR and removes its configuration.
     #[cfg(feature = "ocr-surface")]
     #[arg(long)]
     pub ocr: Option<bool>,
@@ -522,6 +522,17 @@ impl ExtractionOverrides {
 
         #[cfg(feature = "ocr-surface")]
         {
+            if self.ocr == Some(false) && self.ocr_scanned_pages {
+                bail!("--ocr false cannot be combined with --ocr-scanned-pages");
+            }
+            if self.ocr == Some(false) && self.force_ocr == Some(true) {
+                bail!("--ocr false cannot be combined with --force-ocr true");
+            }
+            if let (Some(ocr), Some(disable_ocr)) = (self.ocr, self.disable_ocr)
+                && ocr == disable_ocr
+            {
+                bail!("--ocr and --disable-ocr specify contradictory values");
+            }
             if self.ocr_scanned_pages && self.disable_ocr == Some(true) {
                 bail!("--ocr-scanned-pages cannot be combined with --disable-ocr");
             }
@@ -689,9 +700,14 @@ impl ExtractionOverrides {
     fn apply_ocr(&self, config: &mut ExtractionConfig) {
         if self.ocr == Some(false) {
             config.ocr = None;
+            config.disable_ocr = true;
+            config.force_ocr = false;
+            config.ocr_strategy = xberg::OcrStrategy::Auto;
+            config.force_ocr_pages = None;
         } else {
             if self.ocr == Some(true) {
                 config.ocr.get_or_insert_with(OcrConfig::default).enabled = true;
+                config.disable_ocr = false;
             } else if self.has_ocr_field_flag() {
                 config.ocr.get_or_insert_with(OcrConfig::default);
             }
@@ -700,13 +716,17 @@ impl ExtractionOverrides {
             }
         }
 
-        if let Some(force_ocr_flag) = self.force_ocr {
+        if self.ocr != Some(false)
+            && let Some(force_ocr_flag) = self.force_ocr
+        {
             config.force_ocr = force_ocr_flag;
         }
-        if let Some(disable_ocr_flag) = self.disable_ocr {
+        if self.ocr.is_none()
+            && let Some(disable_ocr_flag) = self.disable_ocr
+        {
             config.disable_ocr = disable_ocr_flag;
         }
-        if self.ocr_scanned_pages {
+        if self.ocr != Some(false) && self.ocr_scanned_pages {
             config.ocr_strategy = xberg::OcrStrategy::ScannedPages {
                 min_confidence: self
                     .scanned_min_confidence
@@ -805,6 +825,7 @@ impl ExtractionOverrides {
                 vlm_fallback: Default::default(),
                 vlm_prompt: None,
                 acceleration: None,
+                security_limits: None,
                 tessdata_bytes: None,
                 tessdata_path: None,
                 backend_options,
@@ -1526,6 +1547,7 @@ mod tests {
                 vlm_fallback: Default::default(),
                 vlm_prompt: None,
                 acceleration: None,
+                security_limits: None,
                 tessdata_bytes: None,
                 tessdata_path: None,
                 backend_options: None,
@@ -1565,6 +1587,7 @@ mod tests {
                 vlm_fallback: Default::default(),
                 vlm_prompt: None,
                 acceleration: None,
+                security_limits: None,
                 tessdata_bytes: None,
                 tessdata_path: None,
                 backend_options: None,
@@ -1662,7 +1685,7 @@ mod tests {
     fn test_ocr_no_cache_changes_only_use_cache_when_tesseract_config_already_set() {
         let non_default_tesseract_config = xberg::TesseractConfig {
             language: vec!["fra".to_string(), "deu".to_string()],
-            psm: 11,
+            psm: Some(11),
             output_format: "hocr".to_string(),
             oem: 1,
             min_confidence: 42.5,
@@ -1707,6 +1730,7 @@ mod tests {
                 vlm_fallback: Default::default(),
                 vlm_prompt: None,
                 acceleration: None,
+                security_limits: None,
                 tessdata_bytes: None,
                 tessdata_path: None,
                 backend_options: None,
@@ -1852,6 +1876,7 @@ mod tests {
                 vlm_fallback: Default::default(),
                 vlm_prompt: None,
                 acceleration: None,
+                security_limits: None,
                 tessdata_bytes: None,
                 tessdata_path: None,
                 backend_options: None,
@@ -1938,6 +1963,120 @@ mod tests {
         };
         overrides.apply(&mut config);
         assert!(config.ocr.is_none());
+    }
+
+    #[cfg(feature = "ocr-surface")]
+    #[test]
+    fn should_enable_ocr_when_cli_true_overrides_loaded_disable() {
+        let mut config = ExtractionConfig {
+            disable_ocr: true,
+            ..ExtractionConfig::default()
+        };
+        let overrides = ExtractionOverrides {
+            ocr: Some(true),
+            ..default_overrides()
+        };
+
+        overrides.apply(&mut config);
+
+        assert!(
+            !config.disable_ocr,
+            "explicit --ocr true should override loaded disable_ocr=true"
+        );
+        assert!(config.ocr.expect("--ocr true should configure OCR").enabled);
+    }
+
+    #[cfg(feature = "ocr-surface")]
+    #[test]
+    fn should_preserve_loaded_disable_ocr_when_ocr_flag_is_absent() {
+        let mut config = ExtractionConfig {
+            disable_ocr: true,
+            ..ExtractionConfig::default()
+        };
+
+        default_overrides().apply(&mut config);
+
+        assert!(config.disable_ocr, "an absent OCR flag should preserve loaded config");
+    }
+
+    #[cfg(feature = "ocr-surface")]
+    #[test]
+    fn should_clear_loaded_ocr_routing_when_cli_false_hard_disables_ocr() {
+        let mut config = ExtractionConfig {
+            force_ocr: true,
+            ocr_strategy: xberg::OcrStrategy::ScannedPages { min_confidence: 0.8 },
+            force_ocr_pages: Some(vec![2, 4]),
+            ..ExtractionConfig::default()
+        };
+        let overrides = ExtractionOverrides {
+            ocr: Some(false),
+            ..default_overrides()
+        };
+
+        overrides.apply(&mut config);
+
+        assert!(!config.force_ocr, "--ocr false should override loaded force_ocr=true");
+        assert_eq!(config.ocr_strategy, xberg::OcrStrategy::Auto);
+        assert!(
+            config.force_ocr_pages.is_none(),
+            "--ocr false should clear forced page selection"
+        );
+    }
+
+    #[cfg(feature = "ocr-surface")]
+    #[test]
+    fn should_reject_ocr_false_with_force_ocr_true() {
+        let overrides = ExtractionOverrides {
+            ocr: Some(false),
+            force_ocr: Some(true),
+            ..default_overrides()
+        };
+
+        assert_eq!(
+            overrides
+                .validate()
+                .expect_err("disabling and forcing OCR should conflict")
+                .to_string(),
+            "--ocr false cannot be combined with --force-ocr true"
+        );
+    }
+
+    #[cfg(feature = "ocr-surface")]
+    #[test]
+    fn should_reject_ocr_false_with_scanned_pages() {
+        let overrides = ExtractionOverrides {
+            ocr: Some(false),
+            ocr_scanned_pages: true,
+            ..default_overrides()
+        };
+
+        assert_eq!(
+            overrides
+                .validate()
+                .expect_err("disabling OCR and selecting scanned pages should conflict")
+                .to_string(),
+            "--ocr false cannot be combined with --ocr-scanned-pages"
+        );
+    }
+
+    #[cfg(feature = "ocr-surface")]
+    #[test]
+    fn should_reject_contradictory_ocr_and_disable_ocr_values() {
+        for (ocr, disable_ocr) in [(true, true), (false, false)] {
+            let overrides = ExtractionOverrides {
+                ocr: Some(ocr),
+                disable_ocr: Some(disable_ocr),
+                ..default_overrides()
+            };
+
+            assert_eq!(
+                overrides
+                    .validate()
+                    .expect_err("contradictory OCR flags should be rejected")
+                    .to_string(),
+                "--ocr and --disable-ocr specify contradictory values"
+            );
+        }
     }
 
     #[cfg(feature = "ocr-surface")]

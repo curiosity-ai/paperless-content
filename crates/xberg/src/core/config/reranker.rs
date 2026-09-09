@@ -16,6 +16,7 @@ use super::llm::LlmConfig;
 /// behavior for local ONNX models.
 ///
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RerankerConfig {
     /// The reranker model to use (defaults to "balanced" preset if not specified).
     #[serde(default = "default_reranker_model", deserialize_with = "deserialize_null_model")]
@@ -164,7 +165,7 @@ impl std::str::FromStr for RerankerHead {
 /// Reranker model types supported by Xberg.
 ///
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RerankerModelType {
     /// Use a preset cross-encoder model (recommended).
     Preset {
@@ -306,6 +307,18 @@ mod tests {
         let back: RerankerConfig = serde_json::from_str(&json).unwrap();
         assert!(matches!(back.model, RerankerModelType::Preset { ref name } if name == "fast"));
         assert_eq!(back.top_k, Some(5));
+    }
+
+    #[test]
+    fn config_rejects_unknown_fields() {
+        let json = r#"{"model":{"type":"preset","name":"balanced"},"batch_limit":16}"#;
+        assert!(serde_json::from_str::<RerankerConfig>(json).is_err());
+    }
+
+    #[test]
+    fn model_type_rejects_unknown_fields() {
+        let json = r#"{"type":"preset","name":"balanced","extra_name":"other"}"#;
+        assert!(serde_json::from_str::<RerankerModelType>(json).is_err());
     }
 
     #[test]

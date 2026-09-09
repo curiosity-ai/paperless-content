@@ -6,13 +6,14 @@ import { Tabs, TabItem } from "@astrojs/starlight/components";
 
 A map of what Xberg can do. Each section links to the guide or reference page with configuration details and code examples.
 
-![Xberg features overview -- 100 input formats flow through extraction, OCR, and processing to produce text, tables, chunks, and metadata](../../assets/feature-overview.png)
+![Xberg features overview -- 106 input formats flow through extraction, OCR, and processing to produce text, tables, chunks, and metadata](../../assets/feature-overview.png)
 
 ---
 
 ## Format Support
 
-100 file formats (120 file extensions) handled by native Rust extractors — no LibreOffice or other external tools required.
+107 file formats across 140 unique file extensions, with 53 compatibility MIME aliases, are handled by native Rust
+extractors — no LibreOffice or other external tools required.
 
 <Tabs syncKey="lang">
 <TabItem label="Documents">
@@ -21,12 +22,12 @@ A map of what Xberg can do. Each section links to the guide or reference page wi
 <span class="format-chip">PDF <code>.pdf</code></span>
 <span class="format-chip">Word <code>.docx .doc</code></span>
 <span class="format-chip">Pages <code>.pages</code></span>
-<span class="format-chip">PowerPoint <code>.pptx .ppt</code></span>
+<span class="format-chip">PowerPoint <code>.pptx .ppt .pps</code></span>
 <span class="format-chip">Keynote <code>.key</code></span>
 <span class="format-chip">OpenDocument <code>.odt .odp</code></span>
 <span class="format-chip">Plain text <code>.txt</code></span>
 <span class="format-chip">Markdown <code>.md</code></span>
-<span class="format-chip">Djot <code>.djot</code></span>
+<span class="format-chip">Djot <code>.djot .dj</code></span>
 <span class="format-chip">MDX <code>.mdx</code></span>
 <span class="format-chip">RTF <code>.rtf</code></span>
 <span class="format-chip">reStructuredText <code>.rst</code></span>
@@ -38,7 +39,7 @@ A map of what Xberg can do. Each section links to the guide or reference page wi
 <TabItem label="Spreadsheets">
 
 <div class="format-chips">
-<span class="format-chip">Excel <code>.xlsx .xls .xlsm .xlsb</code></span>
+<span class="format-chip">Excel <code>.xlsx .xls .xlsm .xlsb .xltm</code></span>
 <span class="format-chip">Numbers <code>.numbers</code></span>
 <span class="format-chip">OpenDocument <code>.ods</code></span>
 <span class="format-chip">CSV <code>.csv</code></span>
@@ -56,11 +57,11 @@ A map of what Xberg can do. Each section links to the guide or reference page wi
 <span class="format-chip">BMP <code>.bmp</code></span>
 <span class="format-chip">TIFF <code>.tiff .tif</code></span>
 <span class="format-chip">WebP <code>.webp</code></span>
-<span class="format-chip">JPEG 2000 <code>.jp2 .jpx .jpm .mj2</code></span>
+<span class="format-chip">JPEG 2000 <code>.jp2 .jpg2 .j2c .j2k .jpc</code></span>
 <span class="format-chip">JBIG2 <code>.jbig2</code></span>
 <span class="format-chip">PNM <code>.pnm .pbm .pgm .ppm</code></span>
 <span class="format-chip">HEIC <code>.heic .heics</code></span>
-<span class="format-chip">HEIF <code>.heif</code></span>
+<span class="format-chip">HEIF <code>.heif .heifs .hif</code></span>
 <span class="format-chip">AVIF <code>.avif</code></span>
 <span class="format-chip">AVCS <code>.avcs</code></span>
 </div>
@@ -94,7 +95,8 @@ for the full notice and source pointer.
 <span class="format-chip">M4A <code>.m4a</code></span>
 <span class="format-chip">WAV <code>.wav</code></span>
 <span class="format-chip">WebM audio <code>.webm</code></span>
-<span class="format-chip">MP4 audio track <code>.mp4 .mpeg</code></span>
+<span class="format-chip">MP4 audio track <code>.mp4 .mpg4 .mp4v .m4v</code></span>
+<span class="format-chip">MPEG audio track <code>.mpeg .mpg .mpe .m1v .m2v</code></span>
 <span class="format-chip">WebM audio track <code>.webm</code></span>
 </div>
 
@@ -113,7 +115,7 @@ Enable the `transcription` feature and set a `transcription` config block to ext
 
 <div class="format-chips">
 <span class="format-chip">HTML <code>.html .htm</code></span>
-<span class="format-chip">XHTML <code>.xhtml</code></span>
+<span class="format-chip">XHTML <code>.xhtml .xht</code></span>
 <span class="format-chip">XML <code>.xml</code></span>
 <span class="format-chip">SVG <code>.svg</code></span>
 </div>
@@ -123,8 +125,12 @@ Enable the `transcription` feature and set a `transcription` config block to ext
 
 <div class="format-chips">
 <span class="format-chip">JSON <code>.json</code></span>
+<span class="format-chip">GeoJSON <code>.geojson</code></span>
+<span class="format-chip">KML <code>.kml</code></span>
 <span class="format-chip">YAML <code>.yaml</code></span>
 <span class="format-chip">TOML <code>.toml</code></span>
+<span class="format-chip">SQLite <code>.sqlite .sqlite3 .db</code></span>
+<span class="format-chip">GeoPackage <code>.gpkg .gpkx</code></span>
 </div>
 
 </TabItem>
@@ -146,9 +152,9 @@ Archives are traversed recursively — Xberg extracts every document inside, inc
 <span class="format-chip">EPUB <code>.epub</code></span>
 <span class="format-chip">BibTeX <code>.bib</code></span>
 <span class="format-chip">RIS <code>.ris</code></span>
-<span class="format-chip">CSL <code>.csl</code></span>
+<span class="format-chip">CSL JSON <code>MIME only</code></span>
 <span class="format-chip">LaTeX <code>.tex</code></span>
-<span class="format-chip">Typst <code>.typ</code></span>
+<span class="format-chip">Typst <code>.typ .typst</code></span>
 <span class="format-chip">JATS <code>.jats</code></span>
 <span class="format-chip">DocBook <code>.docbook</code></span>
 <span class="format-chip">OPML <code>.opml</code></span>
@@ -176,7 +182,9 @@ flowchart LR
     F --> G[ExtractedDocument]
 ```
 
-1. **MIME detection** -- Xberg identifies the file type from magic bytes and extension, then selects the matching native extractor from the registry.
+1. **MIME detection** -- Xberg prefers bounded content inspection, then falls back to a supported filename extension.
+   Unknown or missing extensions are sniffed rather than rejected. Configure `mime_detection_policy` to trust a
+   supported extension or ignore extensions when your input boundary requires different behavior.
 2. **Format extraction** -- The extractor pulls text, tables, metadata, and optionally images from the file. PDF extraction uses xberg-native-pdf (pure Rust); Office formats use native XML or OLE/CFB parsers; images pass directly to OCR.
 3. **OCR** -- When the extractor finds no text layer (or `force_ocr` is set), the file is routed to the configured OCR backend. The OCR result replaces or supplements the extracted text.
 4. **Post-processing** -- Validators, quality processing, chunking, embeddings, keyword extraction, and any registered post-processor plugins run in sequence.
@@ -501,7 +509,7 @@ Rust builds are modular through Cargo features. The default feature set is `toki
 
 | Category              | Features                                                                                                |
 | --------------------- | ------------------------------------------------------------------------------------------------------- |
-| **Format extractors** | `pdf`, `excel`, `office`, `hwp`, `hwpx`, `iwork`, `email`, `html`, `xml`, `archives`, `mdx`, `svg`, `heic` |
+| **Format extractors** | `pdf`, `excel`, `office`, `hwp`, `hwpx`, `iwork`, `email`, `html`, `xml`, `archives`, `mdx`, `sqlite`, `svg`, `heic` |
 | **OCR and ML**        | `ocr`, `ocr-wasm`, `paddle-ocr`, `sceptre-ocr`, `sceptre-ocr-tract`, `layout-detection`, `embeddings`, `reranker`, `transcription`, `liter-llm` |
 | **Text analysis**     | `language-detection`, `chunking`, `quality`, `keywords`, `stopwords`, `diff`, `ner`, `redaction`, `summarization`, `translation`, `classification`, `captioning`, `qr-codes` |
 | **Servers**           | `api`, `mcp`, `mcp-http`, `otel`                                                                        |

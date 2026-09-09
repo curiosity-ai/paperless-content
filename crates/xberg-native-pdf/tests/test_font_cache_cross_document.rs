@@ -1,15 +1,9 @@
-//! Cross-document font-cache collision regression.
+//! Cross-document font-cache collision regressions.
 //!
-//! The process-global font cache (`fonts::global_cache`) is keyed by a font
-//! *identity hash*. An earlier hardening pass folds the `/ToUnicode` *reference*
-//! (object id/gen) into that hash and keeps *canonical* subset fonts
-//! (`AAAAAA+`) out of the cache. A non-canonical subset tag such as
-//! `/CIDFont+F1` falls outside that exclusion, and template-emitted PDFs reuse
-//! the same `/ToUnicode` object number, so the reference-keyed hash can still
-//! match for two genuinely different fonts — the later document is then served
-//! the earlier font's parsed `FontInfo`, and its glyphs decode through the
-//! wrong `/ToUnicode` and come out garbled. Folding the stream's bytes (not
-//! just its reference) distinguishes them and closes this case.
+//! PDF object numbers are local to one document. The process-global font cache
+//! must therefore key every indirect font field by resolved semantic content;
+//! otherwise the document that first populates a same-key cache entry controls
+//! the later document's text decoding or character geometry.
 //!
 //! Both PDFs here are built in memory (per the repo's no-binary-fixtures
 //! convention) and are byte-for-byte identical except for the CID→Unicode
@@ -25,8 +19,7 @@ use std::sync::Mutex;
 use xberg_native_pdf::document::PdfDocument;
 use xberg_native_pdf::fonts::global_cache::{clear_global_font_cache, global_font_cache_stats};
 
-/// Serializes the two tests in this binary: both assert against the
-/// process-global cache, so they must not run concurrently.
+/// Serializes tests that assert against the process-global cache.
 static CACHE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Lines rendered on the single page. The content is fabricated and trivial;
@@ -141,6 +134,57 @@ fn extract_first_page(bytes: Vec<u8>) -> String {
     doc.extract_text(0).expect("extract page 0")
 }
 
+fn build_simple_font_pdf(width_a: u16, width_b: u16) -> Vec<u8> {
+    let content = b"BT /F1 12 Tf 40 700 Td (AB) Tj ET";
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+            .to_vec(),
+        format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            content.len(),
+            String::from_utf8_lossy(content)
+        )
+        .into_bytes(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /F32SharedFont \
+          /Encoding /WinAnsiEncoding /FirstChar 65 /LastChar 66 /Widths 6 0 R >>"
+            .to_vec(),
+        format!("[{width_a} {width_b}]").into_bytes(),
+    ];
+
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for (index, body) in objects.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_offset = out.len();
+    let size = objects.len() + 1;
+    out.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
+    for offset in offsets {
+        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF").as_bytes(),
+    );
+    out
+}
+
+fn first_character_width(bytes: Vec<u8>) -> f32 {
+    let doc = PdfDocument::from_bytes(bytes).expect("parse simple-font PDF");
+    doc.extract_chars(0)
+        .expect("extract simple-font characters")
+        .into_iter()
+        .find(|character| character.char == 'A')
+        .expect("fixture must contain A")
+        .bbox
+        .width
+}
+
 /// Several documents that share a `/BaseFont` name but map glyphs differently
 /// must each decode through their own `/ToUnicode`, even when processed
 /// back-to-back in one process without clearing the cache between them.
@@ -236,5 +280,23 @@ fn stream_cid_to_gid_map_distinguishes_otherwise_identical_fonts() {
         global_font_cache_stats().0,
         after_a + 1,
         "fonts differing only in a stream /CIDToGIDMap must not alias in the cache"
+    );
+}
+
+#[test]
+fn referenced_widths_do_not_pollute_character_geometry_across_documents() {
+    let _guard = CACHE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+
+    clear_global_font_cache();
+    let expected_wide = first_character_width(build_simple_font_pdf(900, 900));
+
+    clear_global_font_cache();
+    let narrow = first_character_width(build_simple_font_pdf(400, 400));
+    let actual_wide = first_character_width(build_simple_font_pdf(900, 900));
+
+    assert!(narrow < expected_wide, "fixture widths must produce distinct geometry");
+    assert!(
+        (actual_wide - expected_wide).abs() < f32::EPSILON,
+        "a prior document's referenced /Widths must not alter this document: expected {expected_wide}, got {actual_wide}"
     );
 }

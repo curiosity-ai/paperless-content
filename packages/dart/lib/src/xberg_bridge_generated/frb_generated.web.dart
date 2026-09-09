@@ -641,6 +641,14 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   BoundingBox dco_decode_box_autoadd_bounding_box(dynamic raw);
 
   @protected
+  CandleDevicePreference dco_decode_box_autoadd_candle_device_preference(
+    dynamic raw,
+  );
+
+  @protected
+  CandleTrocrVariant dco_decode_box_autoadd_candle_trocr_variant(dynamic raw);
+
+  @protected
   CaptioningConfig dco_decode_box_autoadd_captioning_config(dynamic raw);
 
   @protected
@@ -762,6 +770,17 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   FormulaModel dco_decode_box_autoadd_formula_model(dynamic raw);
 
   @protected
+  GeoJsonExtractionConfig dco_decode_box_autoadd_geo_json_extraction_config(
+    dynamic raw,
+  );
+
+  @protected
+  GlmOcrLayoutMode dco_decode_box_autoadd_glm_ocr_layout_mode(dynamic raw);
+
+  @protected
+  GlmOcrTaskKind dco_decode_box_autoadd_glm_ocr_task_kind(dynamic raw);
+
+  @protected
   HeadingContext dco_decode_box_autoadd_heading_context(dynamic raw);
 
   @protected
@@ -838,6 +857,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   LlmRateLimitConfig dco_decode_box_autoadd_llm_rate_limit_config(dynamic raw);
 
   @protected
+  MimeDetectionPolicy dco_decode_box_autoadd_mime_detection_policy(dynamic raw);
+
+  @protected
   MultiVectorEmbedding dco_decode_box_autoadd_multi_vector_embedding(
     dynamic raw,
   );
@@ -882,6 +904,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  PaddleOcrVlTaskKind dco_decode_box_autoadd_paddle_ocr_vl_task_kind(
+    dynamic raw,
+  );
+
+  @protected
   PageClassificationConfig dco_decode_box_autoadd_page_classification_config(
     dynamic raw,
   );
@@ -894,6 +921,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   PageHierarchy dco_decode_box_autoadd_page_hierarchy(dynamic raw);
+
+  @protected
+  PageOcrConfidence dco_decode_box_autoadd_page_ocr_confidence(dynamic raw);
 
   @protected
   PageStructure dco_decode_box_autoadd_page_structure(dynamic raw);
@@ -1146,6 +1176,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   DbfMetadata dco_decode_dbf_metadata(dynamic raw);
 
   @protected
+  DeepseekOcrBackendOptions dco_decode_deepseek_ocr_backend_options(
+    dynamic raw,
+  );
+
+  @protected
   DetectResponse dco_decode_detect_response(dynamic raw);
 
   @protected
@@ -1347,6 +1382,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   FormulaModel dco_decode_formula_model(dynamic raw);
+
+  @protected
+  GeoJsonExtractionConfig dco_decode_geo_json_extraction_config(dynamic raw);
+
+  @protected
+  GlmOcrBackendOptions dco_decode_glm_ocr_backend_options(dynamic raw);
 
   @protected
   GlmOcrLayoutMode dco_decode_glm_ocr_layout_mode(dynamic raw);
@@ -1802,6 +1843,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<Table> dco_decode_list_table(dynamic raw);
 
   @protected
+  List<TableCellStyle> dco_decode_list_table_cell_style(dynamic raw);
+
+  @protected
   List<TableDiff> dco_decode_list_table_diff(dynamic raw);
 
   @protected
@@ -1845,6 +1889,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   Metadata dco_decode_metadata(dynamic raw);
+
+  @protected
+  MimeDetectionPolicy dco_decode_mime_detection_policy(dynamic raw);
 
   @protected
   ModelPaths dco_decode_model_paths(dynamic raw);
@@ -1970,6 +2017,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   BoundingBox? dco_decode_opt_box_autoadd_bounding_box(dynamic raw);
 
   @protected
+  CandleDevicePreference? dco_decode_opt_box_autoadd_candle_device_preference(
+    dynamic raw,
+  );
+
+  @protected
+  CandleTrocrVariant? dco_decode_opt_box_autoadd_candle_trocr_variant(
+    dynamic raw,
+  );
+
+  @protected
   CaptioningConfig? dco_decode_opt_box_autoadd_captioning_config(dynamic raw);
 
   @protected
@@ -2062,6 +2119,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   FormulaModel? dco_decode_opt_box_autoadd_formula_model(dynamic raw);
 
   @protected
+  GeoJsonExtractionConfig?
+  dco_decode_opt_box_autoadd_geo_json_extraction_config(dynamic raw);
+
+  @protected
+  GlmOcrLayoutMode? dco_decode_opt_box_autoadd_glm_ocr_layout_mode(dynamic raw);
+
+  @protected
+  GlmOcrTaskKind? dco_decode_opt_box_autoadd_glm_ocr_task_kind(dynamic raw);
+
+  @protected
   HeadingContext? dco_decode_opt_box_autoadd_heading_context(dynamic raw);
 
   @protected
@@ -2130,6 +2197,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  MimeDetectionPolicy? dco_decode_opt_box_autoadd_mime_detection_policy(
+    dynamic raw,
+  );
+
+  @protected
   MultiVectorEmbedding? dco_decode_opt_box_autoadd_multi_vector_embedding(
     dynamic raw,
   );
@@ -2173,6 +2245,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  PaddleOcrVlTaskKind? dco_decode_opt_box_autoadd_paddle_ocr_vl_task_kind(
+    dynamic raw,
+  );
+
+  @protected
   PageClassificationConfig?
   dco_decode_opt_box_autoadd_page_classification_config(dynamic raw);
 
@@ -2184,6 +2261,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   PageHierarchy? dco_decode_opt_box_autoadd_page_hierarchy(dynamic raw);
+
+  @protected
+  PageOcrConfidence? dco_decode_opt_box_autoadd_page_ocr_confidence(
+    dynamic raw,
+  );
 
   @protected
   PageStructure? dco_decode_opt_box_autoadd_page_structure(dynamic raw);
@@ -2389,6 +2471,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   PaddleOcrConfig dco_decode_paddle_ocr_config(dynamic raw);
 
   @protected
+  PaddleOcrVlBackendOptions dco_decode_paddle_ocr_vl_backend_options(
+    dynamic raw,
+  );
+
+  @protected
   PaddleOcrVlTaskKind dco_decode_paddle_ocr_vl_task_kind(dynamic raw);
 
   @protected
@@ -2414,6 +2501,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   PageInfo dco_decode_page_info(dynamic raw);
+
+  @protected
+  PageOcrConfidence dco_decode_page_ocr_confidence(dynamic raw);
 
   @protected
   PageOrientationHandling dco_decode_page_orientation_handling(dynamic raw);
@@ -2660,6 +2750,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   TableCell dco_decode_table_cell(dynamic raw);
 
   @protected
+  TableCellStyle dco_decode_table_cell_style(dynamic raw);
+
+  @protected
   TableChunkingMode dco_decode_table_chunking_mode(dynamic raw);
 
   @protected
@@ -2712,6 +2805,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   TreeSitterProcessConfig dco_decode_tree_sitter_process_config(dynamic raw);
+
+  @protected
+  TrocrBackendOptions dco_decode_trocr_backend_options(dynamic raw);
 
   @protected
   int dco_decode_u_8(dynamic raw);
@@ -3225,6 +3321,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   BoundingBox sse_decode_box_autoadd_bounding_box(SseDeserializer deserializer);
 
   @protected
+  CandleDevicePreference sse_decode_box_autoadd_candle_device_preference(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  CandleTrocrVariant sse_decode_box_autoadd_candle_trocr_variant(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   CaptioningConfig sse_decode_box_autoadd_captioning_config(
     SseDeserializer deserializer,
   );
@@ -3398,6 +3504,21 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  GeoJsonExtractionConfig sse_decode_box_autoadd_geo_json_extraction_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  GlmOcrLayoutMode sse_decode_box_autoadd_glm_ocr_layout_mode(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  GlmOcrTaskKind sse_decode_box_autoadd_glm_ocr_task_kind(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   HeadingContext sse_decode_box_autoadd_heading_context(
     SseDeserializer deserializer,
   );
@@ -3498,6 +3619,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  MimeDetectionPolicy sse_decode_box_autoadd_mime_detection_policy(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   MultiVectorEmbedding sse_decode_box_autoadd_multi_vector_embedding(
     SseDeserializer deserializer,
   );
@@ -3548,6 +3674,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  PaddleOcrVlTaskKind sse_decode_box_autoadd_paddle_ocr_vl_task_kind(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   PageClassificationConfig sse_decode_box_autoadd_page_classification_config(
     SseDeserializer deserializer,
   );
@@ -3562,6 +3693,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   PageHierarchy sse_decode_box_autoadd_page_hierarchy(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  PageOcrConfidence sse_decode_box_autoadd_page_ocr_confidence(
     SseDeserializer deserializer,
   );
 
@@ -3880,6 +4016,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   DbfMetadata sse_decode_dbf_metadata(SseDeserializer deserializer);
 
   @protected
+  DeepseekOcrBackendOptions sse_decode_deepseek_ocr_backend_options(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   DetectResponse sse_decode_detect_response(SseDeserializer deserializer);
 
   @protected
@@ -4105,6 +4246,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   FormulaModel sse_decode_formula_model(SseDeserializer deserializer);
+
+  @protected
+  GeoJsonExtractionConfig sse_decode_geo_json_extraction_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  GlmOcrBackendOptions sse_decode_glm_ocr_backend_options(
+    SseDeserializer deserializer,
+  );
 
   @protected
   GlmOcrLayoutMode sse_decode_glm_ocr_layout_mode(SseDeserializer deserializer);
@@ -4690,6 +4841,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<Table> sse_decode_list_table(SseDeserializer deserializer);
 
   @protected
+  List<TableCellStyle> sse_decode_list_table_cell_style(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   List<TableDiff> sse_decode_list_table_diff(SseDeserializer deserializer);
 
   @protected
@@ -4741,6 +4897,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   Metadata sse_decode_metadata(SseDeserializer deserializer);
+
+  @protected
+  MimeDetectionPolicy sse_decode_mime_detection_policy(
+    SseDeserializer deserializer,
+  );
 
   @protected
   ModelPaths sse_decode_model_paths(SseDeserializer deserializer);
@@ -4894,6 +5055,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  CandleDevicePreference? sse_decode_opt_box_autoadd_candle_device_preference(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  CandleTrocrVariant? sse_decode_opt_box_autoadd_candle_trocr_variant(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   CaptioningConfig? sse_decode_opt_box_autoadd_captioning_config(
     SseDeserializer deserializer,
   );
@@ -5024,6 +5195,22 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  GeoJsonExtractionConfig?
+  sse_decode_opt_box_autoadd_geo_json_extraction_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  GlmOcrLayoutMode? sse_decode_opt_box_autoadd_glm_ocr_layout_mode(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  GlmOcrTaskKind? sse_decode_opt_box_autoadd_glm_ocr_task_kind(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   HeadingContext? sse_decode_opt_box_autoadd_heading_context(
     SseDeserializer deserializer,
   );
@@ -5114,6 +5301,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  MimeDetectionPolicy? sse_decode_opt_box_autoadd_mime_detection_policy(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   MultiVectorEmbedding? sse_decode_opt_box_autoadd_multi_vector_embedding(
     SseDeserializer deserializer,
   );
@@ -5169,6 +5361,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  PaddleOcrVlTaskKind? sse_decode_opt_box_autoadd_paddle_ocr_vl_task_kind(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   PageClassificationConfig?
   sse_decode_opt_box_autoadd_page_classification_config(
     SseDeserializer deserializer,
@@ -5186,6 +5383,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   PageHierarchy? sse_decode_opt_box_autoadd_page_hierarchy(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  PageOcrConfidence? sse_decode_opt_box_autoadd_page_ocr_confidence(
     SseDeserializer deserializer,
   );
 
@@ -5469,6 +5671,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   PaddleOcrConfig sse_decode_paddle_ocr_config(SseDeserializer deserializer);
 
   @protected
+  PaddleOcrVlBackendOptions sse_decode_paddle_ocr_vl_backend_options(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   PaddleOcrVlTaskKind sse_decode_paddle_ocr_vl_task_kind(
     SseDeserializer deserializer,
   );
@@ -5500,6 +5707,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   PageInfo sse_decode_page_info(SseDeserializer deserializer);
+
+  @protected
+  PageOcrConfidence sse_decode_page_ocr_confidence(
+    SseDeserializer deserializer,
+  );
 
   @protected
   PageOrientationHandling sse_decode_page_orientation_handling(
@@ -5782,6 +5994,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   TableCell sse_decode_table_cell(SseDeserializer deserializer);
 
   @protected
+  TableCellStyle sse_decode_table_cell_style(SseDeserializer deserializer);
+
+  @protected
   TableChunkingMode sse_decode_table_chunking_mode(
     SseDeserializer deserializer,
   );
@@ -5846,6 +6061,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   TreeSitterProcessConfig sse_decode_tree_sitter_process_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  TrocrBackendOptions sse_decode_trocr_backend_options(
     SseDeserializer deserializer,
   );
 
@@ -6586,6 +6806,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_box_autoadd_candle_device_preference(
+    CandleDevicePreference self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_candle_trocr_variant(
+    CandleTrocrVariant self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_box_autoadd_captioning_config(
     CaptioningConfig self,
     SseSerializer serializer,
@@ -6805,6 +7037,24 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_box_autoadd_geo_json_extraction_config(
+    GeoJsonExtractionConfig self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_glm_ocr_layout_mode(
+    GlmOcrLayoutMode self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_glm_ocr_task_kind(
+    GlmOcrTaskKind self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_box_autoadd_heading_context(
     HeadingContext self,
     SseSerializer serializer,
@@ -6931,6 +7181,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_box_autoadd_mime_detection_policy(
+    MimeDetectionPolicy self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_box_autoadd_multi_vector_embedding(
     MultiVectorEmbedding self,
     SseSerializer serializer,
@@ -7003,6 +7259,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_box_autoadd_paddle_ocr_vl_task_kind(
+    PaddleOcrVlTaskKind self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_box_autoadd_page_classification_config(
     PageClassificationConfig self,
     SseSerializer serializer,
@@ -7023,6 +7285,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_box_autoadd_page_hierarchy(
     PageHierarchy self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_page_ocr_confidence(
+    PageOcrConfidence self,
     SseSerializer serializer,
   );
 
@@ -7441,6 +7709,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_dbf_metadata(DbfMetadata self, SseSerializer serializer);
 
   @protected
+  void sse_encode_deepseek_ocr_backend_options(
+    DeepseekOcrBackendOptions self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_detect_response(
     DetectResponse self,
     SseSerializer serializer,
@@ -7754,6 +8028,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_formula_model(FormulaModel self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_geo_json_extraction_config(
+    GeoJsonExtractionConfig self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_glm_ocr_backend_options(
+    GlmOcrBackendOptions self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_glm_ocr_layout_mode(
@@ -8506,6 +8792,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_list_table(List<Table> self, SseSerializer serializer);
 
   @protected
+  void sse_encode_list_table_cell_style(
+    List<TableCellStyle> self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_list_table_diff(
     List<TableDiff> self,
     SseSerializer serializer,
@@ -8570,6 +8862,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_metadata(Metadata self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_mime_detection_policy(
+    MimeDetectionPolicy self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_model_paths(ModelPaths self, SseSerializer serializer);
@@ -8758,6 +9056,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_opt_box_autoadd_candle_device_preference(
+    CandleDevicePreference? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_candle_trocr_variant(
+    CandleTrocrVariant? self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_box_autoadd_captioning_config(
     CaptioningConfig? self,
     SseSerializer serializer,
@@ -8911,6 +9221,24 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_opt_box_autoadd_geo_json_extraction_config(
+    GeoJsonExtractionConfig? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_glm_ocr_layout_mode(
+    GlmOcrLayoutMode? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_glm_ocr_task_kind(
+    GlmOcrTaskKind? self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_box_autoadd_heading_context(
     HeadingContext? self,
     SseSerializer serializer,
@@ -9019,6 +9347,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_opt_box_autoadd_mime_detection_policy(
+    MimeDetectionPolicy? self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_box_autoadd_multi_vector_embedding(
     MultiVectorEmbedding? self,
     SseSerializer serializer,
@@ -9085,6 +9419,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_opt_box_autoadd_paddle_ocr_vl_task_kind(
+    PaddleOcrVlTaskKind? self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_box_autoadd_page_classification_config(
     PageClassificationConfig? self,
     SseSerializer serializer,
@@ -9105,6 +9445,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_opt_box_autoadd_page_hierarchy(
     PageHierarchy? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_page_ocr_confidence(
+    PageOcrConfidence? self,
     SseSerializer serializer,
   );
 
@@ -9469,6 +9815,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_paddle_ocr_vl_backend_options(
+    PaddleOcrVlBackendOptions self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_paddle_ocr_vl_task_kind(
     PaddleOcrVlTaskKind self,
     SseSerializer serializer,
@@ -9506,6 +9858,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_page_info(PageInfo self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_page_ocr_confidence(
+    PageOcrConfidence self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_page_orientation_handling(
@@ -9880,6 +10238,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_table_cell(TableCell self, SseSerializer serializer);
 
   @protected
+  void sse_encode_table_cell_style(
+    TableCellStyle self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_table_chunking_mode(
     TableChunkingMode self,
     SseSerializer serializer,
@@ -9963,6 +10327,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_tree_sitter_process_config(
     TreeSitterProcessConfig self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_trocr_backend_options(
+    TrocrBackendOptions self,
     SseSerializer serializer,
   );
 

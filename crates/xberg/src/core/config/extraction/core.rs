@@ -13,7 +13,9 @@ use super::super::ocr::{OcrConfig, OcrStrategy};
 use super::super::page::PageConfig;
 use super::super::processing::{ChunkingConfig, PostProcessorConfig};
 use super::file_config::FileExtractionConfig;
-use super::types::{ImageExtractionConfig, LanguageDetectionConfig, TokenReductionOptions, UrlExtractionConfig};
+use super::types::{
+    ImageExtractionConfig, LanguageDetectionConfig, MimeDetectionPolicy, TokenReductionOptions, UrlExtractionConfig,
+};
 
 /// Main extraction configuration.
 ///
@@ -34,6 +36,11 @@ use super::types::{ImageExtractionConfig, LanguageDetectionConfig, TokenReductio
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExtractionConfig {
+    /// ~keep: Controls whether MIME inference prefers content, a supported extension, or content alone.
+    #[serde(default)]
+    #[cfg_attr(feature = "alef-meta", alef(since = "1.1.0"))]
+    pub mime_detection_policy: MimeDetectionPolicy,
+
     /// Enable caching of extraction results
     #[serde(default = "default_true")]
     pub use_cache: bool,
@@ -179,9 +186,9 @@ pub struct ExtractionConfig {
     ///
     /// Controls maximum archive size, compression ratio, file count, and other
     /// security thresholds to prevent decompression bomb attacks. Also caps
-    /// nesting depth, iteration count, entity / token length, total
-    /// content size, and table cell count for every extraction path that
-    /// ingests user-controlled bytes.
+    /// nesting depth, iteration count, entity / token length, total content size,
+    /// decoded image allocation, and table cell count for every extraction path
+    /// that ingests user-controlled bytes.
     /// When `None`, default limits are used.
     #[serde(default)]
     pub security_limits: Option<crate::extractors::security::SecurityLimits>,
@@ -257,6 +264,19 @@ pub struct ExtractionConfig {
     /// stored in the notebook.
     #[serde(default)]
     pub jupyter_cell_rendering: JupyterCellRendering,
+
+    /// Apply Jupyter Book/MyST cell visibility tags while rendering notebooks.
+    ///
+    /// When enabled, `remove-cell`/`hide-cell`, `remove-input`/`hide-input`,
+    /// and `remove-output`/`hide-output` suppress the corresponding saved
+    /// source or output. Cells are never executed, and their metadata remains
+    /// available even when their rendered content is suppressed.
+    ///
+    /// Defaults to `true`. Set this to `false` to preserve all saved notebook
+    /// content regardless of cell tags. ~keep
+    #[serde(default = "default_true")]
+    #[cfg_attr(feature = "alef-meta", alef(since = "1.1.0"))]
+    pub apply_notebook_cell_tags: bool,
 
     /// Layout detection configuration (None = layout detection disabled).
     ///
@@ -346,6 +366,16 @@ pub struct ExtractionConfig {
     #[serde(default)]
     #[cfg_attr(feature = "alef-meta", alef(since = "1.1.0"))]
     pub csv: Option<super::super::csv::CsvConfig>,
+
+    /// GeoJSON extraction configuration (None = bounded summary).
+    ///
+    /// By default, GeoJSON coordinates are replaced by aggregate counts and bounds
+    /// so large geometry arrays do not become unbounded rendered output. Set
+    /// [`crate::core::config::GeoJsonExtractionConfig::include_full_coordinates`]
+    /// explicitly to retain the legacy full-coordinate output.
+    #[serde(default)]
+    #[cfg_attr(feature = "alef-meta", alef(since = "1.1.0"))]
+    pub geojson: Option<super::super::geojson::GeoJsonExtractionConfig>,
 
     /// Concurrency limits for constrained environments (None = use defaults).
     ///
@@ -503,6 +533,7 @@ impl ExtractionConfig {
 impl Default for ExtractionConfig {
     fn default() -> Self {
         Self {
+            mime_detection_policy: MimeDetectionPolicy::default(),
             use_cache: true,
             enable_quality_processing: true,
             ocr: None,
@@ -539,12 +570,14 @@ impl Default for ExtractionConfig {
             escape_markdown: true,
             table_anchors: false,
             jupyter_cell_rendering: JupyterCellRendering::Both,
+            apply_notebook_cell_tags: true,
             include_document_structure: false,
             acceleration: None,
             cache_namespace: None,
             cache_ttl_secs: None,
             email: None,
             csv: None,
+            geojson: None,
             concurrency: None,
             url: UrlExtractionConfig::default(),
             max_archive_depth: ExtractionConfig::default_archive_depth(),
@@ -642,6 +675,7 @@ impl ExtractionConfig {
     /// ```
     pub(crate) fn with_file_overrides(&self, overrides: &FileExtractionConfig) -> Self {
         let FileExtractionConfig {
+            ref mime_detection_policy,
             ref enable_quality_processing,
             ref ocr,
             ref force_ocr,
@@ -686,6 +720,10 @@ impl ExtractionConfig {
         } = *overrides;
 
         let mut config = self.clone();
+
+        if let Some(v) = mime_detection_policy {
+            config.mime_detection_policy = *v;
+        }
 
         if let Some(v) = enable_quality_processing {
             config.enable_quality_processing = *v;

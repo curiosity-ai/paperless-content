@@ -1,15 +1,16 @@
 ```csharp title="C#"
 using Xberg;
-using Microsoft.Extensions.Logging;
+using System;
 using System.Collections.Generic;
+using System.Text;
 
 public class MyExtractorPlugin : IDocumentExtractor
 {
-    private readonly ILogger _logger;
+    private readonly Action<string> _writeLog;
 
-    public MyExtractorPlugin(ILogger logger)
+    public MyExtractorPlugin(Action<string> writeLog)
     {
-        _logger = logger;
+        _writeLog = writeLog ?? throw new ArgumentNullException(nameof(writeLog));
     }
 
     public string Name => "my-plugin";
@@ -19,23 +20,23 @@ public class MyExtractorPlugin : IDocumentExtractor
 
     public void Initialize()
     {
-        _logger.LogInformation($"Initializing plugin: {Name}");
+        _writeLog($"INFO Initializing plugin: {Name}");
     }
 
     public void Shutdown()
     {
-        _logger.LogInformation($"Shutting down plugin: {Name}");
+        _writeLog($"INFO Shutting down plugin: {Name}");
     }
 
     public bool CanHandle(string path, string mimeType) => mimeType == "text/plain";
 
     public ExtractedDocument Extract(ExtractInput input, ExtractionConfig config)
     {
-        _logger.LogInformation($"Extracting {input.MimeType} ({input.Bytes?.Length ?? 0} bytes)");
-        var content = input.Bytes is null ? "" : System.Text.Encoding.UTF8.GetString(input.Bytes);
+        _writeLog($"INFO Extracting {input.MimeType} ({input.Bytes?.Length ?? 0} bytes)");
+        var content = input.Bytes is null ? "" : Encoding.UTF8.GetString(input.Bytes);
         if (string.IsNullOrEmpty(content))
         {
-            _logger.LogWarning("Extraction resulted in empty content");
+            _writeLog("WARN Extraction resulted in empty content");
         }
         return new ExtractedDocument
         {

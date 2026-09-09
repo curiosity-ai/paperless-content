@@ -8,16 +8,111 @@
 
 use crate::Result;
 use crate::XbergError;
-use crate::core::config::ExtractionConfig;
+use crate::core::config::{ExtractionConfig, MimeDetectionPolicy};
 use crate::core::mime::{LEGACY_POWERPOINT_MIME_TYPE, LEGACY_WORD_MIME_TYPE};
 use crate::plugins::InternalDocumentExtractor;
 use crate::plugins::registry::RegisteredDocumentExtractor;
 use crate::types::ExtractedDocument;
+use std::fs::{File, OpenOptions};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 #[cfg(feature = "otel")]
 use tracing::Instrument;
 
 use super::helpers::get_extractor;
+
+fn ensure_builtin_extraction_method(doc: &mut crate::types::internal::InternalDocument, is_builtin: bool) {
+    if !is_builtin {
+        return;
+    }
+
+    let method = doc
+        .metadata
+        .additional
+        .get("extraction_method")
+        .and_then(serde_json::Value::as_str)
+        .and_then(crate::types::ExtractionMethod::from_metadata_value);
+    if method.is_none() {
+        doc.metadata.additional.insert(
+            std::borrow::Cow::Borrowed("extraction_method"),
+            serde_json::Value::String(crate::types::ExtractionMethod::Native.as_str().to_string()),
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FileDetectionChecks {
+    force_ocr_conflict: bool,
+    scanned_pages_ocr_conflict: bool,
+}
+
+fn open_regular_file(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        // ~keep: NONBLOCK prevents a FIFO open from pinning the detection task before handle metadata rejects it.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+
+    let file = options.open(path).map_err(XbergError::from)?;
+    if !file.metadata().map_err(XbergError::from)?.is_file() {
+        return Err(XbergError::validation(
+            "Extraction input must be a regular file".to_string(),
+        ));
+    }
+    Ok(file)
+}
+
+fn detect_file_mime_blocking(
+    path: &Path,
+    mime_type: Option<&str>,
+    policy: MimeDetectionPolicy,
+    checks: FileDetectionChecks,
+) -> Result<String> {
+    let mut file = open_regular_file(path)?;
+    if checks.force_ocr_conflict {
+        return Err(XbergError::validation(
+            "force_ocr and disable_ocr cannot both be true".to_string(),
+        ));
+    }
+    if checks.scanned_pages_ocr_conflict {
+        return Err(XbergError::validation(
+            "ocr_strategy selects scanned pages for OCR, but disable_ocr is true".to_string(),
+        ));
+    }
+    crate::core::mime::detect_or_validate_file(path, &mut file, mime_type, policy)
+}
+
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+async fn detect_file_mime(
+    path: &Path,
+    mime_type: Option<&str>,
+    policy: MimeDetectionPolicy,
+    checks: FileDetectionChecks,
+) -> Result<String> {
+    let owned_path = path.to_path_buf();
+    let owned_mime_type = mime_type.map(str::to_owned);
+    tokio::task::spawn_blocking(move || {
+        detect_file_mime_blocking(&owned_path, owned_mime_type.as_deref(), policy, checks)
+    })
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, "file MIME detection task failed");
+        XbergError::Other("File MIME detection task failed".to_string())
+    })?
+}
+
+#[cfg(any(not(feature = "tokio-runtime"), target_arch = "wasm32"))]
+async fn detect_file_mime(
+    path: &Path,
+    mime_type: Option<&str>,
+    policy: MimeDetectionPolicy,
+    checks: FileDetectionChecks,
+) -> Result<String> {
+    detect_file_mime_blocking(path, mime_type, policy, checks)
+}
 
 /// Extract content from a file.
 ///
@@ -74,8 +169,6 @@ pub(crate) async fn extract_file(
     mime_type: Option<&str>,
     config: &ExtractionConfig,
 ) -> Result<ExtractedDocument> {
-    use crate::core::{io, mime};
-
     let path = path.as_ref();
 
     #[cfg(feature = "otel")]
@@ -108,27 +201,15 @@ pub(crate) async fn extract_file(
     };
 
     let extraction_future = Box::pin(async {
-        io::validate_file_exists(path)?;
-
-        if config.force_ocr && config.effective_disable_ocr() {
-            return Err(crate::XbergError::Validation {
-                message: "force_ocr and disable_ocr cannot both be true".to_string(),
-                source: None,
-            });
-        }
-
-        if matches!(
-            config.ocr_strategy,
-            crate::core::config::OcrStrategy::ScannedPages { .. }
-        ) && config.effective_disable_ocr()
-        {
-            return Err(crate::XbergError::Validation {
-                message: "ocr_strategy selects scanned pages for OCR, but disable_ocr is true".to_string(),
-                source: None,
-            });
-        }
-
-        let detected_mime = mime::detect_or_validate(path.to_str(), mime_type)?;
+        let ocr_disabled = config.effective_disable_ocr();
+        let checks = FileDetectionChecks {
+            force_ocr_conflict: config.force_ocr && ocr_disabled,
+            scanned_pages_ocr_conflict: matches!(
+                config.ocr_strategy,
+                crate::core::config::OcrStrategy::ScannedPages { .. }
+            ) && ocr_disabled,
+        };
+        let detected_mime = detect_file_mime(path, mime_type, config.mime_detection_policy, checks).await?;
 
         #[cfg(not(feature = "office"))]
         match detected_mime.as_str() {
@@ -325,6 +406,7 @@ pub(crate) async fn extract_with_candidates(
 
         match extraction {
             Ok(mut doc) => {
+                ensure_builtin_extraction_method(&mut doc, candidate.is_builtin());
                 if index > 0 {
                     let name = candidate.plugin().name();
                     crate::core::diagnostics::push_warning(
@@ -354,6 +436,47 @@ pub(crate) async fn extract_with_candidates(
     }
 
     Err(last_error.unwrap_or_else(|| XbergError::UnsupportedFormat(mime_type.to_string())))
+}
+
+#[cfg(all(test, feature = "tokio-runtime", not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn should_reject_non_regular_file_before_extraction() {
+        let directory = tempdir().unwrap();
+        let config = ExtractionConfig::default();
+
+        let error = extract_file(directory.path(), Some("text/plain"), &config)
+            .await
+            .expect_err("a directory is not a document file");
+
+        assert!(matches!(
+            error,
+            XbergError::Validation { message, .. } if message == "Extraction input must be a regular file"
+        ));
+    }
+
+    #[tokio::test]
+    async fn should_report_missing_file_before_invalid_ocr_configuration() {
+        let directory = tempdir().unwrap();
+        let missing_file = directory.path().join("missing.txt");
+        let config = ExtractionConfig {
+            force_ocr: true,
+            disable_ocr: true,
+            ..Default::default()
+        };
+
+        let error = extract_file(&missing_file, None, &config)
+            .await
+            .expect_err("a missing file must fail before OCR configuration validation");
+
+        assert!(matches!(
+            error,
+            XbergError::Io(source) if source.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
 }
 
 /// Clear the cache-control field on an `LlmConfig` before it is folded into the
@@ -481,17 +604,19 @@ pub(in crate::core::extractor) async fn extract_bytes_with_extractor(
 
     crate::extractors::ensure_initialized()?;
 
-    let extractor = get_extractor(mime_type)?;
+    let (extractor, is_builtin) = get_extractor(mime_type)?;
 
     #[cfg(feature = "otel")]
-    let doc = {
+    let mut doc = {
         let stage_span = crate::telemetry::spans::extraction_stage_span(extractor.name(), extractor.priority());
         Box::pin(extractor.extract_content(content, mime_type, config))
             .instrument(stage_span)
             .await?
     };
     #[cfg(not(feature = "otel"))]
-    let doc = Box::pin(extractor.extract_content(content, mime_type, config)).await?;
+    let mut doc = Box::pin(extractor.extract_content(content, mime_type, config)).await?;
+
+    ensure_builtin_extraction_method(&mut doc, is_builtin);
 
     let result = Box::pin(crate::core::pipeline::run_pipeline(doc, config)).await?;
     Ok(result)
@@ -499,8 +624,61 @@ pub(in crate::core::extractor) async fn extract_bytes_with_extractor(
 
 #[cfg(test)]
 mod cache_key_tests {
-    use super::hash_extraction_config;
+    use super::{ensure_builtin_extraction_method, hash_extraction_config};
     use crate::core::config::ExtractionConfig;
+
+    #[test]
+    fn should_default_builtin_extraction_method_to_native() {
+        let mut document = crate::types::internal::InternalDocument::new("text");
+
+        ensure_builtin_extraction_method(&mut document, true);
+
+        assert_eq!(
+            document.metadata.additional.get("extraction_method"),
+            Some(&serde_json::Value::String("native".to_string()))
+        );
+    }
+
+    #[test]
+    fn should_leave_custom_plugin_extraction_method_unspecified() {
+        let mut document = crate::types::internal::InternalDocument::new("custom");
+
+        ensure_builtin_extraction_method(&mut document, false);
+
+        assert!(!document.metadata.additional.contains_key("extraction_method"));
+    }
+
+    #[test]
+    fn should_preserve_recognized_builtin_extraction_method() {
+        let mut document = crate::types::internal::InternalDocument::new("pdf");
+        document.metadata.additional.insert(
+            std::borrow::Cow::Borrowed("extraction_method"),
+            serde_json::Value::String("mixed".to_string()),
+        );
+
+        ensure_builtin_extraction_method(&mut document, true);
+
+        assert_eq!(
+            document.metadata.additional.get("extraction_method"),
+            Some(&serde_json::Value::String("mixed".to_string()))
+        );
+    }
+
+    #[test]
+    fn should_replace_unrecognized_builtin_extraction_method_with_native() {
+        let mut document = crate::types::internal::InternalDocument::new("doc");
+        document.metadata.additional.insert(
+            std::borrow::Cow::Borrowed("extraction_method"),
+            serde_json::Value::String("native_ole".to_string()),
+        );
+
+        ensure_builtin_extraction_method(&mut document, true);
+
+        assert_eq!(
+            document.metadata.additional.get("extraction_method"),
+            Some(&serde_json::Value::String("native".to_string()))
+        );
+    }
 
     #[test]
     fn source_name_changes_the_cache_key() {
@@ -594,7 +772,7 @@ mod cache_key_tests {
         let psm_auto = ExtractionConfig {
             ocr: Some(OcrConfig {
                 tesseract_config: Some(TesseractConfig {
-                    psm: 3,
+                    psm: Some(3),
                     ..TesseractConfig::default()
                 }),
                 ..OcrConfig::default()
@@ -604,7 +782,7 @@ mod cache_key_tests {
         let psm_sparse = ExtractionConfig {
             ocr: Some(OcrConfig {
                 tesseract_config: Some(TesseractConfig {
-                    psm: 11,
+                    psm: Some(11),
                     ..TesseractConfig::default()
                 }),
                 ..OcrConfig::default()

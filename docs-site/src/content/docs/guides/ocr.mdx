@@ -61,7 +61,7 @@ The Candle backends (GLM-OCR, TrOCR, DeepSeek-OCR, PaddleOCR-VL) ship compiled i
 | ---------------- | -------------------- | ----------------------------------- | --------------------------- | ------------------ | ---------------- | ----------------------- | ----------------------- | ------------------------ |
 | **Speed**        | Fast                 | Model-dependent                     | Fast on CPU                 | Moderate           | Moderate         | Moderate                | Moderate                | Slow (API latency)       |
 | **Accuracy**     | Good                 | Excellent                           | Good                        | Excellent          | Good             | Excellent               | Excellent               | Highest                  |
-| **Languages**    | 100+                 | 80+ (11 script families)            | 6 EasyOCR gen2 groups       | All               | 100+             | 20+ (CJK + Latin)       | 20+ (CJK + Latin)       | All (provider-dependent) |
+| **Languages**    | 100+                 | 80+ (11 script families)            | 8 EasyOCR gen2 groups       | All               | 100+             | 20+ (CJK + Latin)       | 20+ (CJK + Latin)       | All (provider-dependent) |
 | **Installation** | System package       | Built-in (native) or Python package | Built-in or Cargo feature   | Built-in           | Built-in         | Built-in                | Built-in                | API key only             |
 | **Model size**   | ~10 MB               | Mobile ~8 MB, Server ~120 MB        | Downloaded on first use     | ~3 GB              | ~250 MB          | ~4 GB                   | ~2.5 GB                 | None (cloud-hosted)      |
 | **GPU support**  | No                   | Yes                                 | No (CPU-only in Xberg 1.1) | Yes (Metal/CUDA)   | Yes (Metal/CUDA) | Yes (Metal/CUDA)        | Yes (Metal/CUDA)        | N/A (server-side)        |
@@ -133,9 +133,12 @@ tesseract --list-langs
 
 ### Tesseract in Wasm
 
-The Wasm package ships Tesseract as a separate module. Call `enableOcr()` after `initWasm()` to load it, then pass the `tesseract-wasm` backend in the config:
-
-<Snip_wasm_ocr_enable_ocr />
+The Wasm package has no packaged helper that wires up a Tesseract backend for you (there is no
+`enableOcr()` export). The primitive it does export is `registerOcrBackend()` — you supply a
+JavaScript object implementing the `OcrBackend` trait bridge and register it under the name
+`"tesseract-wasm"` before calling `extract` with `{ ocr: { backend: "tesseract-wasm" } }`. See
+[Trait Bridges](/reference/api-wasm/#trait-bridges) in the WASM API Reference for the registration
+API.
 
 ### Verify Tesseract from your binding
 
@@ -347,10 +350,15 @@ Specify multiple language codes separated by `+` (Tesseract) or as a list (Paddl
 <TabItem label="Wasm">
 
 ```typescript
-import { ExtractInputKind, enableOcr, extract, initWasm } from '@xberg-io/xberg-wasm';
+// NOTE: The Wasm package does not ship a ready-made Tesseract adapter or an
+// enableOcr() helper. Before calling extract, register your own OcrBackend
+// trait bridge object (name/supportedLanguages/processImage) under the name
+// "tesseract-wasm" via registerOcrBackend() — see the WASM API Reference's
+// Trait Bridges section.
+import init, { ExtractInputKind, extract, registerOcrBackend } from '@xberg-io/xberg-wasm';
 
-await initWasm();
-await enableOcr();
+await init();
+registerOcrBackend(myTesseractWasmBackend);
 
 const file = fileInput.files?.[0];
 if (file) {
@@ -792,7 +800,7 @@ xberg extract document.pdf --force-ocr true --ocr-backend candle-deepseek-ocr --
 
 ### Candle PaddleOCR-VL
 
-PaddleOCR-VL 1.5 — SigLIP vision encoder + Ernie-4.5 text decoder for lightweight multilingual document understanding. Markdown output.
+PaddleOCR-VL 1.6 — SigLIP vision encoder + Ernie-4.5 text decoder for lightweight multilingual document understanding. Markdown output.
 
 <Tabs syncKey="lang">
 <TabItem label="Native bindings (Rust, Go, TypeScript, Node.js, Java, C#, Ruby, PHP, Elixir)">
@@ -1129,7 +1137,14 @@ The native-text-to-OCR fallback decision (should a PDF page with an embedded tex
 | `min_meaningful_words`           | `3`     | Minimum count of meaningful words before native text is accepted instead of OCR.              |
 | `min_alnum_ratio`                | `0.3`   | Minimum alphanumeric ratio of non-whitespace characters.                                      |
 | `critical_fragmented_word_ratio` | `0.80`  | Fraction of 1-2 character words that forces OCR regardless of other signals.                  |
+| `max_ocr_output_fragmented_word_ratio` | `0.35` | Fraction of short words that reports OCR output as suspected recognition noise. |
+| `min_ocr_mean_confidence`        | `75.0`  | Calibrated backend confidence below which OCR output is reported as suspected noise. |
+| `discard_suspected_ocr_noise`    | `false` | Discard non-empty OCR output when a recognition-noise signal fires. By default, Xberg retains the text and adds a processing warning. |
 | `min_undecodable_ratio`          | `0.5`   | Minimum fraction of non-whitespace characters that must be undecodable (PUA, replacement, or control garbage) before a page's text layer is treated as unreadable and routed to OCR. See [Automatic OCR for Undecodable Text Layers](#automatic-ocr-for-undecodable-text-layers). |
+
+Inspect `processing_warnings` for pages flagged by fragmented-word, calibrated-confidence, or configured
+dictionary-invalid-word signals. To preserve the pre-1.1 destructive behavior, set
+`discard_suspected_ocr_noise = true`; blank OCR pages remain blank without a recognition-noise warning.
 
 <Tabs syncKey="lang">
 <TabItem label="Python">
@@ -1168,6 +1183,8 @@ let config = ExtractionConfig {
 ```toml title="xberg.toml"
 [ocr.quality_thresholds]
 pipeline_min_quality = 0.6
+# Opt in only when discarding suspected OCR noise is preferable to retaining marginal text.
+discard_suspected_ocr_noise = true
 ```
 
 </TabItem>

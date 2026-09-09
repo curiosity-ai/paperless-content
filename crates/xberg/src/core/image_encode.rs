@@ -14,6 +14,16 @@ use tracing::warn;
 use crate::core::config::extraction::ImageOutputFormat;
 #[cfg(feature = "svg")]
 use crate::core::config::extraction::SvgOptions;
+use crate::error::XbergError;
+#[cfg(feature = "heic")]
+use crate::extraction::image_decode::{
+    ImageDecodeBudget, copy_decoded_rows, decoded_byte_count, image_dimension_error,
+};
+use crate::extraction::image_decode::{
+    decode_standard_image_with_format_and_security_limits, decode_standard_image_with_security_limits,
+    validate_dynamic_image_additional_live_bytes,
+};
+use crate::extractors::security::SecurityLimits;
 use crate::types::ExtractedImage;
 
 /// Describes why a re-encode attempt was skipped or failed.
@@ -104,6 +114,7 @@ impl std::fmt::Display for EncodeWarning {
 pub(crate) fn re_encode(
     image: &mut ExtractedImage,
     target: ImageOutputFormat,
+    limits: &SecurityLimits,
     #[cfg(feature = "svg")] svg_options: &SvgOptions,
 ) -> Result<bool, EncodeWarning> {
     if target == ImageOutputFormat::Native {
@@ -148,7 +159,8 @@ pub(crate) fn re_encode(
         });
     }
 
-    let dynamic = decode_source(image)?;
+    let dynamic = decode_source(image, limits)?;
+    validate_reencode_peak(&dynamic, target, image.data.len(), limits)?;
 
     let (new_bytes, new_format) = encode_to_target(&dynamic, target)?;
 
@@ -156,6 +168,35 @@ pub(crate) fn re_encode(
     image.format = Cow::Borrowed(new_format);
 
     Ok(true)
+}
+
+const ENCODE_FIXED_OVERHEAD_BYTES: u64 = 256 * 1024;
+const PNG_WEBP_ENCODE_BYTES_PER_PIXEL: u64 = 4;
+const JPEG_ENCODE_BYTES_PER_PIXEL: u64 = 3;
+const HEIF_ENCODE_LIVE_BYTES_PER_PIXEL: u64 = 12;
+
+fn validate_reencode_peak(
+    image: &DynamicImage,
+    target: ImageOutputFormat,
+    encoded_source_bytes: usize,
+    limits: &SecurityLimits,
+) -> Result<(), EncodeWarning> {
+    let additional_bytes_per_pixel = match target {
+        ImageOutputFormat::Native => 0,
+        ImageOutputFormat::Png | ImageOutputFormat::Webp { .. } => PNG_WEBP_ENCODE_BYTES_PER_PIXEL,
+        ImageOutputFormat::Jpeg { .. } => JPEG_ENCODE_BYTES_PER_PIXEL,
+        ImageOutputFormat::Heif { .. } => HEIF_ENCODE_LIVE_BYTES_PER_PIXEL,
+        #[cfg(feature = "svg")]
+        ImageOutputFormat::Svg => 0,
+    };
+    let encoded_source_bytes = u64::try_from(encoded_source_bytes).unwrap_or(u64::MAX);
+    let fixed_live_bytes = ENCODE_FIXED_OVERHEAD_BYTES.saturating_add(encoded_source_bytes);
+    validate_dynamic_image_additional_live_bytes(image, limits, additional_bytes_per_pixel, fixed_live_bytes).map_err(
+        |error| EncodeWarning::EncodeFailed {
+            target_format: "raster",
+            message: error.to_string(),
+        },
+    )
 }
 
 /// Returns `true` when `target` already matches the source `format` string,
@@ -332,15 +373,15 @@ fn rasterize_svg(
 /// Decode the source bytes inside `image` to a [`DynamicImage`].
 ///
 /// The dispatch order is:
-/// 1. Known format strings → `image::load_from_memory_with_format`
+/// 1. Known format strings → the format-specific `image` decoder
 /// 2. `"heic"` / `"heif"` / `"HEIC"` / `"HEIF"` → `xberg-libheif` (feature `heic`)
-/// 3. `"unknown"` or anything else → `image::load_from_memory` (magic-byte auto-detect)
-fn decode_source(image: &ExtractedImage) -> Result<DynamicImage, EncodeWarning> {
+/// 3. `"unknown"` or anything else → magic-byte auto-detect
+fn decode_source(image: &ExtractedImage, limits: &SecurityLimits) -> Result<DynamicImage, EncodeWarning> {
     let format_lc = image.format.to_ascii_lowercase();
 
     #[cfg(feature = "heic")]
     if matches!(format_lc.as_str(), "heic" | "heif") {
-        return decode_heic(&image.data, &format_lc);
+        return decode_heic(&image.data, &format_lc, limits);
     }
 
     #[cfg(not(feature = "heic"))]
@@ -362,14 +403,63 @@ fn decode_source(image: &ExtractedImage) -> Result<DynamicImage, EncodeWarning> 
     };
 
     match maybe_fmt {
-        Some(fmt) => image::load_from_memory_with_format(&image.data, fmt).map_err(|err| EncodeWarning::DecodeFailed {
-            source_format: image.format.to_string(),
-            message: err.to_string(),
-        }),
-        None => image::load_from_memory(&image.data).map_err(|_err| EncodeWarning::Undecodable {
-            source_format: image.format.to_string(),
+        Some(format) => {
+            decode_standard_image_with_format_and_security_limits(&image.data, format, limits).map_err(|error| {
+                EncodeWarning::DecodeFailed {
+                    source_format: image.format.to_string(),
+                    message: error.to_string(),
+                }
+            })
+        }
+        None => decode_standard_image_with_security_limits(&image.data, limits).map_err(|error| match error {
+            XbergError::Validation { .. } => EncodeWarning::DecodeFailed {
+                source_format: image.format.to_string(),
+                message: error.to_string(),
+            },
+            _ => EncodeWarning::Undecodable {
+                source_format: image.format.to_string(),
+            },
         }),
     }
+}
+
+#[cfg(feature = "heic")]
+const HEIF_DECODE_BUFFER_COUNT: u64 = 2;
+
+#[cfg(feature = "heic")]
+fn validate_heic_decode_budget(
+    width: u32,
+    height: u32,
+    source_format: &str,
+    encoded_source_bytes: usize,
+    limits: &SecurityLimits,
+) -> Result<(), EncodeWarning> {
+    let rgba_bytes = decoded_byte_count(width, height, u64::from(image::ColorType::Rgba8.bytes_per_pixel()))
+        .and_then(|bytes| {
+            bytes
+                .checked_mul(HEIF_DECODE_BUFFER_COUNT)
+                .and_then(|peak| peak.checked_add(u64::try_from(encoded_source_bytes).unwrap_or(u64::MAX)))
+                .ok_or_else(|| image_dimension_error(width, height, u64::MAX, u64::MAX))
+        })
+        .and_then(|peak| ImageDecodeBudget::from_security_limits(limits).validate(width, height, peak));
+    rgba_bytes.map_err(|error| EncodeWarning::DecodeFailed {
+        source_format: source_format.to_string(),
+        message: error.to_string(),
+    })
+}
+
+#[cfg(feature = "heic")]
+fn validate_heic_encoded_input_budget(
+    encoded_source_bytes: usize,
+    source_format: &str,
+    limits: &SecurityLimits,
+) -> Result<(), EncodeWarning> {
+    ImageDecodeBudget::from_security_limits(limits)
+        .validate(1, 1, u64::try_from(encoded_source_bytes).unwrap_or(u64::MAX))
+        .map_err(|error| EncodeWarning::DecodeFailed {
+            source_format: source_format.to_string(),
+            message: error.to_string(),
+        })
 }
 
 /// Decode a HEIC/HEIF image via `xberg-libheif` into a [`DynamicImage`].
@@ -377,9 +467,10 @@ fn decode_source(image: &ExtractedImage) -> Result<DynamicImage, EncodeWarning> 
 /// The decoded output is always RGBA8 so that the subsequent encode step has a
 /// uniform input regardless of the source chroma.
 #[cfg(feature = "heic")]
-fn decode_heic(data: &[u8], source_format: &str) -> Result<DynamicImage, EncodeWarning> {
+fn decode_heic(data: &[u8], source_format: &str, limits: &SecurityLimits) -> Result<DynamicImage, EncodeWarning> {
     use xberg_libheif::{ColorSpace, HeifContext, LibHeif, RgbChroma};
 
+    validate_heic_encoded_input_budget(data.len(), source_format, limits)?;
     let context = HeifContext::read_from_bytes(data).map_err(|err| EncodeWarning::DecodeFailed {
         source_format: source_format.to_string(),
         message: format!("{err:?}"),
@@ -391,6 +482,10 @@ fn decode_heic(data: &[u8], source_format: &str) -> Result<DynamicImage, EncodeW
             source_format: source_format.to_string(),
             message: format!("{err:?}"),
         })?;
+
+    let width = handle.width();
+    let height = handle.height();
+    validate_heic_decode_budget(width, height, source_format, data.len(), limits)?;
 
     let lib = LibHeif::new();
     let heif_img = lib
@@ -406,14 +501,28 @@ fn decode_heic(data: &[u8], source_format: &str) -> Result<DynamicImage, EncodeW
         message: "HEIF image has no interleaved plane".to_string(),
     })?;
 
-    let width = heif_img.width();
-    let height = heif_img.height();
-
-    let row_size = (width as usize) * 4;
-    let mut rgba_bytes: Vec<u8> = Vec::with_capacity((width as usize) * (height as usize) * 4);
-    for row in plane.data.chunks(plane.stride) {
-        rgba_bytes.extend_from_slice(&row[..row_size.min(row.len())]);
+    let decoded_width = heif_img.width();
+    let decoded_height = heif_img.height();
+    if decoded_width != width || decoded_height != height {
+        return Err(EncodeWarning::DecodeFailed {
+            source_format: source_format.to_string(),
+            message: format!(
+                "HEIF decoded dimensions {decoded_width}x{decoded_height} do not match declared dimensions {width}x{height}"
+            ),
+        });
     }
+
+    let rgba_bytes = copy_decoded_rows(
+        plane.data,
+        plane.stride,
+        width,
+        height,
+        u64::from(image::ColorType::Rgba8.bytes_per_pixel()),
+    )
+    .map_err(|error| EncodeWarning::DecodeFailed {
+        source_format: source_format.to_string(),
+        message: error.to_string(),
+    })?;
 
     let rgba_img =
         image::RgbaImage::from_raw(width, height, rgba_bytes).ok_or_else(|| EncodeWarning::DecodeFailed {
@@ -608,9 +717,31 @@ mod tests {
         re_encode(
             image,
             target,
+            &SecurityLimits::default(),
             #[cfg(feature = "svg")]
             &SvgOptions::default(),
         )
+    }
+
+    #[test]
+    fn reencode_honors_request_security_limit() {
+        let original = make_png_bytes();
+        let mut image = make_image(original.clone(), "png");
+        let limits = SecurityLimits {
+            max_content_size: 1_024,
+            ..Default::default()
+        };
+
+        let result = re_encode(
+            &mut image,
+            ImageOutputFormat::Jpeg { quality: 85 },
+            &limits,
+            #[cfg(feature = "svg")]
+            &SvgOptions::default(),
+        );
+
+        assert!(matches!(result, Err(EncodeWarning::EncodeFailed { .. })));
+        assert_eq!(image.data, original, "a rejected re-encode must preserve source bytes");
     }
 
     /// Create a minimal valid 4×4 PNG image as `Bytes` for use in tests.
@@ -745,6 +876,19 @@ mod tests {
     }
 
     #[test]
+    fn should_reject_oversized_declared_dimensions_before_reencoding() {
+        let oversized = crate::extraction::image_decode::bmp_with_declared_dimensions(6_000, 6_000);
+        let mut image = make_image(Bytes::from(oversized), "bmp");
+
+        let result = re_encode_default(&mut image, ImageOutputFormat::Png);
+
+        assert!(
+            matches!(result, Err(EncodeWarning::DecodeFailed { ref message, .. }) if message.contains("security_limits.max_content_size")),
+            "oversized image must fail at the decoded-image budget; got {result:?}"
+        );
+    }
+
+    #[test]
     fn unknown_format_auto_detects() {
         let png_bytes = make_png_bytes();
         let mut image = make_image(png_bytes, "unknown");
@@ -776,7 +920,7 @@ mod tests {
             sanitize: true,
             render_dpi: 96.0,
         };
-        let result = re_encode(&mut image, ImageOutputFormat::Native, &opts);
+        let result = re_encode(&mut image, ImageOutputFormat::Native, &SecurityLimits::default(), &opts);
         assert!(
             matches!(result, Ok(true)),
             "SVG sanitize on Native must return Ok(true); got {result:?}"
@@ -795,7 +939,7 @@ mod tests {
             sanitize: false,
             render_dpi: 96.0,
         };
-        let result = re_encode(&mut image, ImageOutputFormat::Native, &opts);
+        let result = re_encode(&mut image, ImageOutputFormat::Native, &SecurityLimits::default(), &opts);
         assert!(
             matches!(result, Ok(false)),
             "SVG no-sanitize on Native must return Ok(false); got {result:?}"
@@ -808,7 +952,12 @@ mod tests {
     fn svg_to_svg_sanitize_roundtrip() {
         let svg_bytes = Bytes::from_static(b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"4\" height=\"4\"/>");
         let mut image = make_image(svg_bytes, "svg");
-        let result = re_encode(&mut image, ImageOutputFormat::Svg, &SvgOptions::default());
+        let result = re_encode(
+            &mut image,
+            ImageOutputFormat::Svg,
+            &SecurityLimits::default(),
+            &SvgOptions::default(),
+        );
         assert!(
             matches!(result, Ok(true)),
             "svg→svg must return Ok(true); got {result:?}"
@@ -821,7 +970,12 @@ mod tests {
     #[test]
     fn raster_to_svg_returns_unsupported_direction() {
         let mut image = make_image(make_png_bytes(), "png");
-        let result = re_encode(&mut image, ImageOutputFormat::Svg, &SvgOptions::default());
+        let result = re_encode(
+            &mut image,
+            ImageOutputFormat::Svg,
+            &SecurityLimits::default(),
+            &SvgOptions::default(),
+        );
         assert!(
             matches!(result, Err(EncodeWarning::UnsupportedDirection { ref from_format, to_format: "svg" }) if from_format == "png"),
             "png→svg must return Err(UnsupportedDirection); got {result:?}",
@@ -838,6 +992,7 @@ mod tests {
         let result = re_encode(
             &mut image,
             ImageOutputFormat::Jpeg { quality: 85 },
+            &SecurityLimits::default(),
             &SvgOptions::default(),
         );
         assert!(
@@ -879,5 +1034,17 @@ mod tests {
         let mut image = make_image(Bytes::from_static(b"placeholder"), "heic");
         let result = re_encode_default(&mut image, ImageOutputFormat::Heif { quality: 80 });
         assert!(matches!(result, Ok(false)), "heic→Heif must return Ok(false)");
+    }
+
+    #[cfg(feature = "heic")]
+    #[test]
+    fn should_reject_oversized_heic_dimensions_before_reencoding_decode() {
+        let error = validate_heic_decode_budget(6_000, 6_000, "heic", 0, &SecurityLimits::default())
+            .expect_err("oversized HEIC must fail at the decoded-image budget");
+
+        assert!(
+            matches!(error, EncodeWarning::DecodeFailed { ref message, .. } if message.contains("security_limits.max_content_size")),
+            "unexpected error: {error}"
+        );
     }
 }

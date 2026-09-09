@@ -260,9 +260,9 @@ tasks:
       - task: version:sync
 
   alef:generate:
-    desc: "Regenerate all Alef-managed outputs (formatting via poly, no build)"
+    desc: "Regenerate all Alef-managed outputs (formatting via poly, no build or snippet validation)"
     cmds:
-      - alef all --clean
+      - alef all --clean --skip-snippet-validation
 
   alef:verify:
     desc: "Check Alef-generated files are up to date"
@@ -293,6 +293,19 @@ tasks:
     desc: "Check the native FFI build still selects every document format (GH#1387)"
     cmds:
       - python3 scripts/ci/check-ffi-format-features.py alef.toml
+
+  supported-counts:sync:
+    desc: "Synchronize published format counts with the MIME registry"
+    cmds:
+      - python3 scripts/sync_supported_counts.py sync
+      - alef readme
+      - task: plugin:generate
+
+  supported-counts:verify:
+    desc: "Test and verify published format counts against the MIME registry"
+    cmds:
+      - uv run --frozen --only-dev python -m pytest -q scripts/test_sync_supported_counts.py
+      - python3 scripts/sync_supported_counts.py verify
 
   verify:feature-parity:
     desc: "Check per-target feature aggregates still match `full` (GH#1443)"
@@ -387,7 +400,17 @@ tasks:
   wasm:e2e:
     desc: "Run WASM e2e tests (builds wasm-pack bundle first)"
     cmds:
-      - alef test --e2e --lang wasm
+      # A RUSTFLAGS set anywhere in the environment REPLACES .cargo/config.toml's
+      # [target.wasm32-unknown-unknown] rustflags outright -- cargo does not merge the two.
+      # CI's setup-onnx-runtime action exports a job-wide RUSTFLAGS carrying
+      # `-C link-arg=-Wl,-rpath,$ORIGIN`, which rust-lld rejects outright, and the override
+      # simultaneously drops the bulk-memory / getrandom_backend / --allow-multiple-definition
+      # flags the wasm build needs. Emptying is not enough -- an empty-but-set RUSTFLAGS still
+      # wins over the config file -- and CARGO_ENCODED_RUSTFLAGS must go too, since it takes
+      # precedence over RUSTFLAGS when present. Unset here rather than in the workflow so every
+      # caller inherits it; scripts/ci/wasm/run-crate-tests.sh already had to learn this
+      # separately for the other wasm entry point. ~keep
+      - unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS && alef test --e2e --lang wasm
 
   elixir:e2e:
     desc: "Run Elixir e2e tests (compiles NIF first)"

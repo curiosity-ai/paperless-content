@@ -19,21 +19,25 @@ use std::sync::Arc;
 ///
 /// RwLock read + HashMap lookup is ~100ns, fast enough without caching.
 /// Removed thread-local cache to avoid Tokio work-stealing scheduler issues.
-pub(in crate::core::extractor) fn get_extractor(mime_type: &str) -> Result<Arc<dyn InternalDocumentExtractor>> {
+pub(in crate::core::extractor) fn get_extractor(mime_type: &str) -> Result<(Arc<dyn InternalDocumentExtractor>, bool)> {
     let registry = crate::plugins::registry::get_document_extractor_registry();
     let registry_read = registry.read();
     let extractor = registry_read.get_registered(mime_type)?;
+    let is_builtin = extractor.is_builtin();
     let extractor: Arc<dyn InternalDocumentExtractor> = Arc::new(extractor);
 
     #[cfg(feature = "otel")]
     {
-        Ok(Arc::new(
-            crate::plugins::extractor::instrumented::InstrumentedExtractor::new(extractor),
+        Ok((
+            Arc::new(crate::plugins::extractor::instrumented::InstrumentedExtractor::new(
+                extractor,
+            )),
+            is_builtin,
         ))
     }
 
     #[cfg(not(feature = "otel"))]
     {
-        Ok(extractor)
+        Ok((extractor, is_builtin))
     }
 }

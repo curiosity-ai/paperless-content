@@ -18,6 +18,26 @@ static RE_OBJ_PATTERN: LazyLock<regex::bytes::Regex> =
     LazyLock::new(|| regex::bytes::Regex::new(r"(\d+)\s+(\d+)\s+obj").unwrap());
 static RE_TRAILER: LazyLock<regex::bytes::Regex> = LazyLock::new(|| regex::bytes::Regex::new(r"trailer\s*<<").unwrap());
 
+fn trace_trailer_parse_failure(error: &nom::Err<nom::error::Error<&[u8]>>, input_len: usize, input_offset: usize) {
+    match error {
+        nom::Err::Error(parse_error) | nom::Err::Failure(parse_error) => {
+            let error_offset = input_offset + input_len.saturating_sub(parse_error.input.len());
+            tracing::warn!(
+                error_offset,
+                parser_error_kind = ?parse_error.code,
+                "failed to parse trailer dictionary"
+            );
+        }
+        nom::Err::Incomplete(_) => {
+            tracing::warn!(
+                error_offset = input_offset + input_len,
+                parser_error_kind = "incomplete",
+                "failed to parse trailer dictionary"
+            );
+        }
+    }
+}
+
 /// Reconstruct the cross-reference table by scanning the entire PDF file.
 ///
 /// This function scans for "N G obj" patterns throughout the file and builds
@@ -240,11 +260,7 @@ fn find_trailer<R: Read + Seek>(
                 }
             }
             Err(e) => {
-                tracing::warn!(
-                    offset = trailer_start,
-                    error = %e,
-                    "failed to parse trailer dictionary"
-                );
+                trace_trailer_parse_failure(&e, input.len(), trailer_keyword_end);
             }
         }
     }
@@ -326,11 +342,12 @@ fn reconstruct_minimal_trailer<R: Read + Seek>(
                         break;
                     }
                 }
-                Err(e) => {
+                Err(error) => {
                     tracing::trace!(
                         object_id = obj_num,
                         offset = entry.offset,
-                        error = %e,
+                        error_code = error.telemetry_code(),
+                        error_offset = ?error.telemetry_offset(),
                         "failed to load object"
                     );
                     continue;

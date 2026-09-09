@@ -32,7 +32,7 @@
 //! (two hand-maintained lists silently diverging) into its regression test is not acceptable.
 //!
 //! Shape 1 has no such copy: under `full` every format extractor is compiled in by definition,
-//! so any advertised format that does not resolve to a registered extractor is unambiguously a
+//! so any declared canonical MIME or alias that does not resolve to a registered extractor is a
 //! catalogue lie — either a `FORMATS` entry added without an extractor, or an aggregate feature
 //! that stopped implying one. The cost is that narrow builds are not covered here; those are
 //! covered from the other side by `list_supported_formats()`'s registry intersection (issue
@@ -59,6 +59,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
+use xberg::core::mime::detect_mime_type;
 use xberg::extractors::ensure_initialized;
 use xberg::plugins::registry::get_document_extractor_registry;
 
@@ -75,6 +76,19 @@ const FORMATS_TABLE_FOOTER: &str = "\n];";
 /// trips it.
 const MIN_ENTRIES_WITH_EXTENSIONS: usize = 80;
 
+const EXPECTED_FORMAT_COUNT: usize = 107;
+const EXPECTED_EXTENSION_COUNT: usize = 141;
+const EXPECTED_ALIAS_COUNT: usize = 56;
+
+const MIME_ONLY_FORMATS: &[&str] = &[
+    "text/x-gfm",
+    "text/x-markdown-extra",
+    "text/x-multimarkdown",
+    "text/x-pandoc",
+    "application/csl+json",
+    "text/x-source-code",
+];
+
 /// The formats whose extractors were compiled out of the shipped 1.0.13/1.0.14 native libraries.
 /// Pinned by extension so the parser is proven to reach the specific rows this defect was about,
 /// spread across the whole table rather than clustered at its start.
@@ -86,6 +100,7 @@ const REGRESSION_EXTENSIONS: &[&str] = &[
 struct CatalogueEntry {
     extensions: Vec<String>,
     mime_type: String,
+    aliases: Vec<String>,
 }
 
 /// Reads the `core/mime.rs` source that owns the format catalogue.
@@ -151,6 +166,7 @@ fn parse_catalogue(source: &str) -> Vec<CatalogueEntry> {
     let mut entries = Vec::new();
     let mut extensions: Vec<String> = Vec::new();
     let mut mime_type: Option<String> = None;
+    let mut aliases: Vec<String> = Vec::new();
     let mut inside_entry = false;
 
     for line in formats_table(source).lines() {
@@ -159,6 +175,7 @@ fn parse_catalogue(source: &str) -> Vec<CatalogueEntry> {
             inside_entry = true;
             extensions.clear();
             mime_type = None;
+            aliases.clear();
         } else if !inside_entry {
             continue;
         } else if let Some(tail) = line.strip_prefix("extensions:") {
@@ -177,6 +194,8 @@ fn parse_catalogue(source: &str) -> Vec<CatalogueEntry> {
                     .map(|(_, resolved)| resolved.clone())
                     .unwrap_or_else(|| panic!("mime_type constant `{value}` is not declared in core/mime.rs"))
             });
+        } else if let Some(tail) = line.strip_prefix("aliases:") {
+            aliases = string_literals(tail);
         } else if line == "}," {
             let resolved = mime_type
                 .take()
@@ -184,6 +203,7 @@ fn parse_catalogue(source: &str) -> Vec<CatalogueEntry> {
             entries.push(CatalogueEntry {
                 extensions: std::mem::take(&mut extensions),
                 mime_type: resolved,
+                aliases: std::mem::take(&mut aliases),
             });
             inside_entry = false;
         }
@@ -192,8 +212,7 @@ fn parse_catalogue(source: &str) -> Vec<CatalogueEntry> {
     entries
 }
 
-/// Every format the catalogue advertises by file extension must resolve to an extractor that is
-/// actually registered in this build.
+/// Every canonical MIME and alias in the catalogue must resolve to the same extractor.
 ///
 /// A failure names every offending format, not just the first, so a feature-list regression that
 /// drops several extractors at once is diagnosable in one run.
@@ -206,12 +225,27 @@ fn every_catalogued_format_resolves_to_a_registered_extractor() {
     let registry = get_document_extractor_registry();
     let registry_guard = registry.read();
 
-    let mut unextractable: Vec<String> = catalogue
-        .iter()
-        .filter(|entry| !entry.extensions.is_empty())
-        .filter(|entry| registry_guard.get(&entry.mime_type).is_err())
-        .map(|entry| format!("{} (.{})", entry.mime_type, entry.extensions.join(", .")))
-        .collect();
+    let mut unextractable = Vec::new();
+    for entry in &catalogue {
+        let canonical = match registry_guard.get(&entry.mime_type) {
+            Ok(extractor) => extractor,
+            Err(_) => {
+                unextractable.push(format!("{} (.{})", entry.mime_type, entry.extensions.join(", .")));
+                continue;
+            }
+        };
+        for alias in &entry.aliases {
+            match registry_guard.get(alias) {
+                Ok(extractor) if extractor.name() == canonical.name() => {}
+                Ok(extractor) => unextractable.push(format!(
+                    "{alias} routes to {}, not canonical extractor {}",
+                    extractor.name(),
+                    canonical.name()
+                )),
+                Err(_) => unextractable.push(format!("{alias} (alias of {})", entry.mime_type)),
+            }
+        }
+    }
     unextractable.sort();
 
     assert!(
@@ -242,6 +276,12 @@ fn the_parser_reads_every_row_of_the_format_table() {
          every guard in this file would be weakened by the difference"
     );
 
+    assert_eq!(
+        catalogue.len(),
+        EXPECTED_FORMAT_COUNT,
+        "the audited registry should contain exactly {EXPECTED_FORMAT_COUNT} formats"
+    );
+
     let with_extensions = catalogue.iter().filter(|entry| !entry.extensions.is_empty()).count();
     assert!(
         with_extensions >= MIN_ENTRIES_WITH_EXTENSIONS,
@@ -253,6 +293,23 @@ fn the_parser_reads_every_row_of_the_format_table() {
         .iter()
         .flat_map(|entry| entry.extensions.iter().map(String::as_str))
         .collect();
+    assert_eq!(
+        extensions.len(),
+        EXPECTED_EXTENSION_COUNT,
+        "the audited registry should contain exactly {EXPECTED_EXTENSION_COUNT} unique extensions"
+    );
+    assert_eq!(
+        catalogue.iter().map(|entry| entry.aliases.len()).sum::<usize>(),
+        EXPECTED_ALIAS_COUNT,
+        "the audited registry should contain exactly {EXPECTED_ALIAS_COUNT} MIME aliases"
+    );
+
+    let mime_only: Vec<&str> = catalogue
+        .iter()
+        .filter(|entry| entry.extensions.is_empty())
+        .map(|entry| entry.mime_type.as_str())
+        .collect();
+    assert_eq!(mime_only, MIME_ONLY_FORMATS);
     let unseen: Vec<&str> = REGRESSION_EXTENSIONS
         .iter()
         .copied()
@@ -262,5 +319,62 @@ fn the_parser_reads_every_row_of_the_format_table() {
     assert!(
         unseen.is_empty(),
         "the parser did not reach the catalogue rows this regression is about: {unseen:?}"
+    );
+}
+
+#[test]
+fn every_catalogued_extension_is_unique_and_detected_case_insensitively() {
+    let source = mime_source();
+    let catalogue = parse_catalogue(&source);
+    let mut owners = std::collections::HashMap::new();
+    let mut checked = 0;
+
+    for entry in &catalogue {
+        for extension in &entry.extensions {
+            assert_eq!(
+                owners.insert(extension.as_str(), entry.mime_type.as_str()),
+                None,
+                "extension .{extension} has more than one canonical MIME owner"
+            );
+            for candidate in [extension.clone(), extension.to_ascii_uppercase()] {
+                assert_eq!(
+                    detect_mime_type(format!("audit.{candidate}"), false).unwrap(),
+                    entry.mime_type,
+                    "extension .{candidate} should resolve to {}",
+                    entry.mime_type
+                );
+            }
+            checked += 1;
+        }
+    }
+
+    assert_eq!(
+        checked, EXPECTED_EXTENSION_COUNT,
+        "the detection matrix must not pass vacuously"
+    );
+}
+
+#[test]
+fn every_catalogued_mime_name_has_one_owner() {
+    let source = mime_source();
+    let catalogue = parse_catalogue(&source);
+    let mut owners = std::collections::HashMap::new();
+    let mut checked = 0;
+
+    for entry in &catalogue {
+        for mime_type in std::iter::once(&entry.mime_type).chain(&entry.aliases) {
+            assert_eq!(
+                owners.insert(mime_type.as_str(), entry.mime_type.as_str()),
+                None,
+                "MIME name {mime_type} has more than one canonical owner"
+            );
+            checked += 1;
+        }
+    }
+
+    assert_eq!(
+        checked,
+        EXPECTED_FORMAT_COUNT + EXPECTED_ALIAS_COUNT,
+        "the MIME ownership matrix must not pass vacuously"
     );
 }

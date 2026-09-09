@@ -238,10 +238,10 @@ pub(crate) struct FaceInfo {
 #[derive(Clone)]
 pub(crate) enum Source {
     /// A font's path on disk. `load_system_fonts` is the only producer, and
-    /// it does no filesystem walking on wasm32 (no target directory list
-    /// matches — see its doc comment), so this variant is structurally
+    /// it does no filesystem walking on wasm32 or Android (no target directory
+    /// list matches — see its doc comment), so this variant is structurally
     /// unconstructed there. ~keep
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg_attr(any(target_arch = "wasm32", target_os = "android"), allow(dead_code))]
     File(PathBuf),
     /// A font's raw data. Only constructed via `Database::load_font_data`,
     /// which is itself gated on `cjk-render-fallback` — see its doc comment. ~keep

@@ -39,6 +39,7 @@ pub enum CodeContentMode {
 /// docstrings = true
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TreeSitterConfig {
     /// Enable code intelligence processing (default: true).
     ///
@@ -85,6 +86,7 @@ pub struct TreeSitterConfig {
 ///
 /// Controls which analysis features are enabled when extracting code files.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TreeSitterProcessConfig {
     /// Extract structural items (functions, classes, structs, etc.). Default: true.
     #[serde(default = "default_true")]

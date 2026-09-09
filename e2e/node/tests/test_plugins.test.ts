@@ -1,5 +1,6 @@
 /**
  * Bridge registry error-path tests for document extractor and renderer plugins.
+ * ~keep
  *
  * These tests cover the observable behaviour of register/unregister/clear at
  * the TypeScript/Node layer.  register_document_extractor and register_renderer
@@ -9,7 +10,7 @@
  *
  * A DocumentExtractor bridge object must expose:
  *   name(): string
- *   extract(input, config): ExtractionResult
+ *   extract(input, config): ExtractedDocument
  *   supportedMimeTypes(): string[]
  *
  * A Renderer bridge object must expose:
@@ -18,8 +19,8 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { extract, listDocumentExtractors, listRenderers } from "@xberg-io/xberg";
-import type { ExtractInput, ExtractionConfig, ExtractionResult } from "@xberg-io/xberg";
+import { ExtractInputKind, extract, listDocumentExtractors, listRenderers } from "@xberg-io/xberg";
+import type { ExtractedDocument, ExtractInput, ExtractionConfig } from "@xberg-io/xberg";
 
 // The register/unregister/clear functions are exported by the native module but
 // not re-typed in the public TypeScript wrapper.  Import the native binding
@@ -50,7 +51,7 @@ function clearRenderers(): void {
 // Minimal stub factory helpers
 // ---------------------------------------------------------------------------
 
-function makeExtractor(name: string, mimeType = "application/x-test"): object {
+function makeExtractor(name: string, mimeType = "application/x-test") {
   return {
     name: (): string => name,
     version: (): string => "0.0.1",
@@ -64,14 +65,14 @@ function makeExtractor(name: string, mimeType = "application/x-test"): object {
       /* no-op */
     },
     supportedMimeTypes: (): string[] => [mimeType],
-    extract: async (input: ExtractInput, _config: ExtractionConfig): Promise<ExtractionResult> => ({
+    extract: async (input: ExtractInput, _config: ExtractionConfig): Promise<ExtractedDocument> => ({
       content: input.bytes ? new TextDecoder().decode(input.bytes) : "",
       mimeType: input.mimeType ?? "text/plain",
     }),
   };
 }
 
-function makeRenderer(name: string): object {
+function makeRenderer(name: string) {
   return {
     name: (): string => name,
     version: (): string => "0.0.1",
@@ -93,6 +94,18 @@ function makeRenderer(name: string): object {
 // ---------------------------------------------------------------------------
 
 describe("plugins: document extractor registry", () => {
+  it("extractor callback returns one extracted document", async () => {
+    const input: ExtractInput = {
+      bytes: new TextEncoder().encode("plugin content"),
+      kind: ExtractInputKind.Bytes,
+      mimeType: "text/plain",
+    };
+
+    const result = await makeExtractor("_test_ts_result_shape").extract(input, {});
+
+    expect(result).toEqual({ content: "plugin content", mimeType: "text/plain" });
+  });
+
   it("register_duplicate_extractor_replaces: second registration silently replaces first", () => {
     const name = "_test_ts_dup_extractor";
     try {
@@ -114,8 +127,8 @@ describe("plugins: document extractor registry", () => {
   });
 
   it("clear_then_list_extractor_empty: list is empty after clear", async () => {
-    const extA = makeExtractor("_test_ts_clear_a", "application/x-ts-clear-a") as any;
-    const extB = makeExtractor("_test_ts_clear_b", "application/x-ts-clear-b") as any;
+    const extA = makeExtractor("_test_ts_clear_a", "application/x-ts-clear-a");
+    const extB = makeExtractor("_test_ts_clear_b", "application/x-ts-clear-b");
     registerDocumentExtractor(extA);
     registerDocumentExtractor(extB);
     await extA.dispose();
@@ -162,8 +175,8 @@ describe("plugins: renderer registry", () => {
   });
 
   it("clear_then_list_renderer_empty: list is empty after clear", async () => {
-    const rendA = makeRenderer("_test_ts_renderer_clear_a") as any;
-    const rendB = makeRenderer("_test_ts_renderer_clear_b") as any;
+    const rendA = makeRenderer("_test_ts_renderer_clear_a");
+    const rendB = makeRenderer("_test_ts_renderer_clear_b");
     registerRenderer(rendA);
     registerRenderer(rendB);
     await rendA.dispose();

@@ -15,6 +15,22 @@ mod tests;
 
 pub use cache::clear_processor_cache;
 pub use format::apply_output_format;
+#[cfg(any(
+    feature = "classification",
+    feature = "summarization",
+    feature = "translation",
+    feature = "captioning",
+    feature = "qr-codes",
+    feature = "ner",
+    feature = "redaction",
+    feature = "quality",
+    feature = "keywords-yake",
+    feature = "keywords-rake"
+))]
+pub(crate) use initialization::automatic_registration_allowed;
+pub(crate) use initialization::{
+    with_builtin_registration_recovery, with_post_processor_enabled, with_post_processor_suppressed,
+};
 
 use crate::Result;
 use crate::core::config::ExtractionConfig;
@@ -23,9 +39,7 @@ use crate::types::internal::InternalDocument;
 
 use execution::{execute_processor_stages, execute_validators};
 use features::{execute_chunking, execute_language_detection, execute_token_reduction};
-use initialization::{
-    builtin_registration_error, get_processors_from_cache, initialize_features, initialize_processor_cache,
-};
+use initialization::{builtin_registration_error, initialize_processor_cache_for_async_pipeline};
 
 const CAPTIONING_PROCESSOR_NAME: &str = "captioning";
 const BUILTIN_REGISTRATION_SOURCE: &str = "builtin_registration";
@@ -147,7 +161,7 @@ fn image_descriptions_changed(
             .any(|(retained, captioned)| retained.description != captioned.description)
 }
 
-/// Push a `ProcessingWarning` onto `doc` when the one-time built-in post-processor
+/// Push a `ProcessingWarning` onto `doc` when the latest built-in post-processor
 /// registration pass (#271) reported a failure. `registration_error` is
 /// `initialization::builtin_registration_error()`; `None` means every enabled
 /// built-in processor registered successfully (or registration has not run yet).
@@ -362,21 +376,18 @@ pub async fn run_pipeline(mut doc: InternalDocument, config: &ExtractionConfig) 
     let pp_config = config.postprocessor.as_ref();
     let postprocessing_enabled = pp_config.is_none_or(|processor_config| processor_config.enabled);
     let processor_stages = if postprocessing_enabled {
-        initialize_features();
+        let processor_stages = initialize_processor_cache_for_async_pipeline().await?;
         push_builtin_registration_warning(&mut doc, builtin_registration_error());
-        initialize_processor_cache()?;
-
-        let (early_processors, middle_processors, late_processors) = get_processors_from_cache()?;
-        Some((early_processors, middle_processors, late_processors))
+        Some(processor_stages)
     } else {
         None
     };
 
     let include_structure = config.include_document_structure;
     let mut captioning_carry_over = CaptioningCarryOver::default();
-    if let Some((_, middle_processors, _)) = &processor_stages {
+    if let Some(snapshot) = &processor_stages {
         captioning_carry_over =
-            run_captioning_prepass(&mut doc, config, include_structure, &pp_config, middle_processors).await?;
+            run_captioning_prepass(&mut doc, config, include_structure, &pp_config, &snapshot.middle).await?;
     }
 
     // Computed once, up front, from `doc` (independent of the later derivation and
@@ -451,21 +462,21 @@ pub async fn run_pipeline(mut doc: InternalDocument, config: &ExtractionConfig) 
 
     #[cfg(feature = "image-encode")]
     if let Some(ref image_cfg) = config.images {
-        apply_output_format_pass(&mut result, image_cfg);
+        apply_output_format_pass_with_security_limits(&mut result, image_cfg, config.security_limits.as_ref());
     }
 
     if let Some(ref image_cfg) = config.images {
         apply_data_base64_pass(&mut result, image_cfg);
     }
 
-    if let Some((early_processors, _, _)) = &processor_stages {
+    if let Some(snapshot) = &processor_stages {
         execute_processor_stages(
             &mut result,
             config,
             &pp_config,
             &[(
                 crate::plugins::ProcessingStage::Early,
-                std::sync::Arc::clone(early_processors),
+                std::sync::Arc::clone(&snapshot.early),
             )],
         )
         .await?;
@@ -485,11 +496,11 @@ pub async fn run_pipeline(mut doc: InternalDocument, config: &ExtractionConfig) 
     // offsets as final.
     execute_chunking(&mut result, config, chunker_heading_source.as_deref())?;
 
-    if let Some((_, middle_processors, late_processors)) = &processor_stages {
+    if let Some(snapshot) = &processor_stages {
         let middle_processors = if config.captioning.is_some() {
-            processors_without_captioning(middle_processors)
+            processors_without_captioning(&snapshot.middle)
         } else {
-            std::sync::Arc::clone(middle_processors)
+            std::sync::Arc::clone(&snapshot.middle)
         };
         execute_processor_stages(
             &mut result,
@@ -499,12 +510,13 @@ pub async fn run_pipeline(mut doc: InternalDocument, config: &ExtractionConfig) 
                 (crate::plugins::ProcessingStage::Middle, middle_processors),
                 (
                     crate::plugins::ProcessingStage::Late,
-                    std::sync::Arc::clone(late_processors),
+                    std::sync::Arc::clone(&snapshot.late),
                 ),
             ],
         )
         .await?;
     }
+    drop(processor_stages);
 
     execute_token_reduction(&mut result, config)?;
     execute_validators(&result, config).await?;
@@ -699,7 +711,7 @@ pub fn run_pipeline_sync(mut doc: InternalDocument, config: &ExtractionConfig) -
 
     #[cfg(feature = "image-encode")]
     if let Some(ref image_cfg) = config.images {
-        apply_output_format_pass(&mut result, image_cfg);
+        apply_output_format_pass_with_security_limits(&mut result, image_cfg, config.security_limits.as_ref());
     }
 
     if let Some(ref image_cfg) = config.images {
@@ -793,10 +805,19 @@ fn measure_text_coverage(result: &ExtractedDocument) -> f32 {
 ///
 /// When the `svg` feature is active and `config.output_format` is `Native`, a
 /// sanitization pass is still applied to SVG images if `config.svg.sanitize` is set.
-#[cfg(feature = "image-encode")]
+#[cfg(all(feature = "image-encode", test))]
 fn apply_output_format_pass(
     result: &mut ExtractedDocument,
     config: &crate::core::config::extraction::ImageExtractionConfig,
+) {
+    apply_output_format_pass_with_security_limits(result, config, None);
+}
+
+#[cfg(feature = "image-encode")]
+fn apply_output_format_pass_with_security_limits(
+    result: &mut ExtractedDocument,
+    config: &crate::core::config::extraction::ImageExtractionConfig,
+    security_limits: Option<&crate::extractors::security::SecurityLimits>,
 ) {
     use crate::core::config::extraction::ImageOutputFormat;
     use crate::core::image_encode::re_encode;
@@ -811,10 +832,13 @@ fn apply_output_format_pass(
     }
 
     let target = config.output_format;
+    let default_security_limits = crate::extractors::security::SecurityLimits::default();
+    let security_limits = security_limits.unwrap_or(&default_security_limits);
     for image in result.images.iter_mut().flatten() {
         match re_encode(
             image,
             target,
+            security_limits,
             #[cfg(feature = "svg")]
             &config.svg,
         ) {
@@ -1082,6 +1106,7 @@ mod issue_214_text_coverage_tests {
             speaker_notes: None,
             section_name: None,
             sheet_name: None,
+            ocr_confidence: None,
         }
     }
 
@@ -1320,9 +1345,7 @@ mod issue_213_chunk_offset_ordering_tests {
 /// Regression tests for #271: `builtin_registration_error()` used to be dead code —
 /// nothing surfaced it, so a user whose e.g. `summarization` processor failed to
 /// register got a clean `Ok` with no output and no explanation. These test the pure
-/// warning-construction helper directly (no global registry involved) rather than
-/// the real one-time `OnceLock` registration pass, which cannot be re-triggered or
-/// forced to fail from a test without mutating process-global state (#310).
+/// warning-construction helper directly so the test does not mutate process-global registry state.
 #[cfg(test)]
 mod issue_271_builtin_registration_warning_tests {
     use super::*;

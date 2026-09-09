@@ -10,13 +10,8 @@ import { Content as Snip_go_advanced_embedding_with_chunking } from "../../../sn
 import { Content as Snip_java_advanced_embedding_with_chunking } from "../../../snippets/java/advanced/embedding_with_chunking.md";
 import { Content as Snip_csharp_advanced_embedding_with_chunking } from "../../../snippets/csharp/advanced/embedding_with_chunking.md";
 import { Content as Snip_ruby_advanced_embedding_with_chunking } from "../../../snippets/ruby/advanced/embedding_with_chunking.md";
-import { Content as Snip_python_utils_standalone_embed } from "../../../snippets/python/utils/standalone_embed.md";
-import { Content as Snip_typescript_utils_standalone_embed } from "../../../snippets/typescript/utils/standalone_embed.md";
 import { Content as Snip_rust_utils_standalone_embed } from "../../../snippets/rust/utils/standalone_embed.md";
-import { Content as Snip_go_utils_standalone_embed } from "../../../snippets/go/utils/standalone_embed.md";
-import { Content as Snip_java_utils_standalone_embed } from "../../../snippets/java/utils/standalone_embed.md";
 import { Content as Snip_csharp_utils_standalone_embed } from "../../../snippets/csharp/utils/standalone_embed.md";
-import { Content as Snip_ruby_utils_standalone_embed } from "../../../snippets/ruby/utils/standalone_embed.md";
 import { Content as Snip_python_utils_vector_database_integration } from "../../../snippets/python/utils/vector_database_integration.md";
 import { Content as Snip_typescript_utils_vector_database_integration } from "../../../snippets/typescript/utils/vector_database_integration.md";
 import { Content as Snip_rust_advanced_vector_database_integration } from "../../../snippets/rust/advanced/vector_database_integration.md";
@@ -101,40 +96,17 @@ Rust extraction configuration and `XBERG_EMBEDDING_PLUGIN_NAME` accept the Plugi
 
 Call `embed_texts` (or `embed_texts_async`) to embed a list of strings directly with an `EmbeddingConfig`, bypassing extraction and chunking. Each input string maps to one output vector.
 
+This entry point is Rust-only. The language bindings expose no standalone "embed arbitrary text" call — in Python, TypeScript, Go, Java, C#, and Ruby, embeddings are produced during extraction and attached per chunk via `ExtractionConfig.chunking.embedding` (see [Configuration](#configuration) above).
+
 <Tabs syncKey="lang">
-<TabItem label="Python">
-
-<Snip_python_utils_standalone_embed />
-
-</TabItem>
-<TabItem label="TypeScript">
-
-<Snip_typescript_utils_standalone_embed />
-
-</TabItem>
 <TabItem label="Rust">
 
 <Snip_rust_utils_standalone_embed />
 
 </TabItem>
-<TabItem label="Go">
-
-<Snip_go_utils_standalone_embed />
-
-</TabItem>
-<TabItem label="Java">
-
-<Snip_java_utils_standalone_embed />
-
-</TabItem>
 <TabItem label="C#">
 
 <Snip_csharp_utils_standalone_embed />
-
-</TabItem>
-<TabItem label="Ruby">
-
-<Snip_ruby_utils_standalone_embed />
 
 </TabItem>
 </Tabs>

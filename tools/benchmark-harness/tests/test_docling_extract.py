@@ -48,11 +48,13 @@ class _Document:
         self.path = path
         self.events = events
 
-    def export_to_markdown(self) -> str:
+    def export_to_markdown(self, *, traverse_pictures: bool) -> str:
+        assert traverse_pictures is True
         self.events.append(f"render:{self.path}")
         return f"markdown:{self.path}"
 
-    def export_to_text(self) -> str:
+    def export_to_text(self, *, traverse_pictures: bool) -> str:
+        assert traverse_pictures is True
         self.events.append(f"render_text:{self.path}")
         return f"text:{self.path}"
 
@@ -126,6 +128,19 @@ def _jobkit_modules(events: list[str]) -> dict[str, types.ModuleType]:
 
 class DoclingBatchConformanceTest(unittest.TestCase):
     """Validate the wrapper contract without importing the real packages."""
+
+    def test_render_includes_text_nested_under_pictures(self) -> None:
+        """Both serializers must retain text that Docling nests under picture items."""
+        wrapper = _load_wrapper()
+        document = mock.Mock()
+        document.export_to_text.return_value = "plain"
+        document.export_to_markdown.return_value = "markdown"
+
+        assert wrapper._render(document, "plaintext") == "plain"
+        assert wrapper._render(document, "markdown") == "markdown"
+
+        document.export_to_text.assert_called_once_with(traverse_pictures=True)
+        document.export_to_markdown.assert_called_once_with(traverse_pictures=True)
 
     def test_converter_configuration_fails_closed(self) -> None:
         """Reject a sync run when the requested OCR mode cannot be configured."""

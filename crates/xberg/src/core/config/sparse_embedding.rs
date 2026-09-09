@@ -15,6 +15,7 @@ use std::path::PathBuf;
 /// local ONNX SPLADE model.
 ///
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SparseEmbeddingConfig {
     /// The sparse-embedding model to use (defaults to the "opensearch-v3-distill" preset).
     #[serde(default = "default_sparse_model", deserialize_with = "deserialize_null_model")]
@@ -74,7 +75,7 @@ impl Default for SparseEmbeddingConfig {
 /// Sparse-embedding model types supported by Xberg.
 ///
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SparseEmbeddingModelType {
     /// Use a preset SPLADE model (recommended).
     Preset {
@@ -172,5 +173,11 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let back: SparseEmbeddingConfig = serde_json::from_str(&json).unwrap();
         assert!(matches!(back.model, SparseEmbeddingModelType::Custom { model_id, .. } if model_id == "org/splade"));
+    }
+
+    #[test]
+    fn model_type_rejects_unknown_fields() {
+        let json = r#"{"type":"preset","name":"opensearch-v3-distill","extra_name":"other"}"#;
+        assert!(serde_json::from_str::<SparseEmbeddingModelType>(json).is_err());
     }
 }

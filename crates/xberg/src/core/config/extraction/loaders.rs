@@ -162,4 +162,62 @@ mod tests {
         let found = ExtractionConfig::find_config_in_dir(dir.path()).unwrap();
         assert!(found.is_some(), "xberg.toml must win over xberg.json");
     }
+
+    #[test]
+    fn from_toml_file_rejects_unknown_nested_fields() {
+        let cases = [
+            (
+                "max_archive_bytes",
+                "[security_limits]\nmax_archive_bytes = 1024\n",
+                true,
+            ),
+            ("backnd", "[ocr]\nbacknd = \"tesseract\"\n", true),
+            (
+                "psmm",
+                "[ocr]\nbackend = \"tesseract\"\n[ocr.tesseract_config]\npsmm = 6\n",
+                true,
+            ),
+            (
+                "deskww",
+                "[ocr]\nbackend = \"tesseract\"\n[ocr.tesseract_config.preprocessing]\ndeskww = true\n",
+                true,
+            ),
+            (
+                "min_confidence",
+                "[ocr_strategy]\nmode = \"auto\"\nmin_confidence = 0.95\n",
+                true,
+            ),
+            (
+                "quality_threshold",
+                "[ocr]\n[ocr.vlm_fallback]\nmode = \"disabled\"\nquality_threshold = 0.8\n",
+                true,
+            ),
+            (
+                "pdf_backend",
+                "[pdf_options]\npdf_backend = \"native\"\n",
+                cfg!(feature = "pdf"),
+            ),
+        ];
+
+        for (unknown_field, source, enabled) in cases {
+            if !enabled {
+                continue;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("xberg.toml");
+            std::fs::write(&path, source).unwrap();
+
+            let error = ExtractionConfig::from_toml_file(&path)
+                .expect_err("an unknown nested field must make config loading fail");
+            let message = error.to_string();
+            assert!(
+                message.contains("Invalid TOML"),
+                "wrong error for {unknown_field}: {message}"
+            );
+            assert!(
+                message.contains(unknown_field),
+                "error must name {unknown_field}: {message}"
+            );
+        }
+    }
 }

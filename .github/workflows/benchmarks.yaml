@@ -17,6 +17,7 @@ on:
 env:
   ITERATIONS: "3"
   TIKA_VERSION: "3.3.1"
+  TIKA_SHA256: "0e8ee9795ac4244feab466f4a5a9c3b94675af392848243842cb6e1e69d27103"
   ORT_VERSION: "1.24.2"
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
@@ -182,6 +183,29 @@ jobs:
 
       - name: Log disk space after artifact upload
         run: scripts/ci/validate/show-disk-space.sh "Disk space after artifact upload"
+
+  prefetch-tika:
+    name: Prefetch Apache Tika
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Download Apache Tika once
+        run: |
+          mkdir -p tools/benchmark-harness/libs
+          jar_path="tools/benchmark-harness/libs/tika-app-${TIKA_VERSION}.jar"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 --retry-max-time 120 \
+            -o "${jar_path}" \
+            "https://repo.maven.apache.org/maven2/org/apache/tika/tika-app/${TIKA_VERSION}/tika-app-${TIKA_VERSION}.jar"
+          echo "${TIKA_SHA256}  ${jar_path}" | sha256sum --check
+
+      - name: Upload Apache Tika artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: apache-tika-jar
+          path: tools/benchmark-harness/libs/tika-app-${{ env.TIKA_VERSION }}.jar
+          retention-days: 7
 
   bench-rust:
     name: bench-rust (${{ matrix.pipeline }}, ${{ matrix.output_format }}, ${{ matrix.mode }}, ${{ matrix.cohort }})
@@ -863,8 +887,8 @@ jobs:
 
   bench-tika:
     name: tika (${{ matrix.output_format }}, ${{ matrix.mode }}, ${{ matrix.cohort }})
-    needs: [setup, bench-rust]
-    if: ${{ needs.setup.result == 'success' && !cancelled() }}
+    needs: [setup, bench-rust, prefetch-tika]
+    if: ${{ needs.setup.result == 'success' && needs.prefetch-tika.result == 'success' && !cancelled() }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 360
     permissions:
@@ -927,17 +951,17 @@ jobs:
           ort-version: ${{ env.ORT_VERSION }}
 
       - name: Setup Java
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v6
         id: setup-java
         with:
           distribution: "temurin"
           java-version: "25"
 
-      - name: Download Apache Tika
-        run: |
-          mkdir -p tools/benchmark-harness/libs
-          curl -fsSL --retry 5 --retry-delay 5 -o "tools/benchmark-harness/libs/tika-app-${{ env.TIKA_VERSION }}.jar" \
-            "https://repo1.maven.org/maven2/org/apache/tika/tika-app/${{ env.TIKA_VERSION }}/tika-app-${{ env.TIKA_VERSION }}.jar"
+      - name: Download Apache Tika artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: apache-tika-jar
+          path: tools/benchmark-harness/libs
 
       - name: Run benchmark
         env:
@@ -970,8 +994,8 @@ jobs:
       matrix:
         mode: [single-file]
         output_format: [markdown, plaintext]
-        # PyMuPDF4LLM emits markdown and has no OCR path, so it runs the PDF and ebook families
-        # (which have text layers) but NOT the scanned-image cohort, where it would always be empty.
+        # This comparison measures PyMuPDF4LLM's text-layer path, so it runs the PDF and ebook
+        # families and explicitly keeps its optional OCR path disabled.
         cohort: [native-pdf-fast-b8, native-ebook-fast]
         exclude:
           - output_format: plaintext
@@ -1026,6 +1050,9 @@ jobs:
           python-version: "3.11"
           cache-prefix: benchmark-pymupdf4llm
           install-command: "uv sync --frozen --no-install-project --no-install-workspace --group dev --group bench-pymupdf4llm"
+
+      - name: Test PyMuPDF4LLM adapter
+        run: .venv/bin/pytest -q scripts/ci/benchmarks/test_pymupdf4llm_extract.py
 
       - name: Run benchmark
         env:

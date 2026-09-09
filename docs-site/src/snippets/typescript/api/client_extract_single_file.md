@@ -1,5 +1,6 @@
 ```typescript title="TypeScript"
-import { readFileSync } from "fs";
+/// <reference types="node" />
+import { readFileSync } from "node:fs";
 
 async function extractViaClient() {
   const formData = new FormData();

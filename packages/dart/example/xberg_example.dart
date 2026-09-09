@@ -1,6 +1,8 @@
-import 'package:xberg' as xberg;
+import 'dart:io';
+
+import 'package:xberg/xberg.dart' as xberg;
 
 void main() {
-  print('Example: xberg loaded successfully');
-  // Add your API calls here after code generation
+  final listSupportedFormats = xberg.XbergBridge.listSupportedFormats;
+  stdout.writeln('Xberg loaded: ${listSupportedFormats.runtimeType}.');
 }

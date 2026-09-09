@@ -15,6 +15,17 @@ use super::{
     types::{ApiState, DoclingCompatDocument, DoclingCompatResponse, OpenWebDocumentMetadata, OpenWebDocumentResponse},
 };
 
+async fn resolve_openweb_bytes(
+    data: Vec<u8>,
+    mime_type: String,
+    filename: Option<String>,
+    config: &crate::core::config::ExtractionConfig,
+) -> Result<(Vec<u8>, String), ApiError> {
+    crate::core::mime::resolve_owned_bytes_mime(data, filename, Some(mime_type), config.mime_detection_policy)
+        .await
+        .map_err(ApiError::from)
+}
+
 /// OpenWebUI "External" engine handler.
 ///
 /// PUT /process
@@ -56,17 +67,11 @@ pub(crate) async fn openweb_external_handler(
         .unwrap_or(crate::core::mime::OCTET_STREAM_MIME_TYPE)
         .to_string();
 
-    let filename = headers
+    let filename_hint = headers
         .get("X-Filename")
         .and_then(|v| v.to_str().ok())
-        .map(|v| urlencoding::decode(v).unwrap_or_else(|_| v.into()).into_owned())
-        .unwrap_or_else(|| "unknown".to_string());
-
-    let mime_type = if mime_type == crate::core::mime::OCTET_STREAM_MIME_TYPE {
-        crate::core::mime::detect_mime_type(&filename, false).unwrap_or(mime_type)
-    } else {
-        mime_type
-    };
+        .map(|v| urlencoding::decode(v).unwrap_or_else(|_| v.into()).into_owned());
+    let filename = filename_hint.clone().unwrap_or_else(|| "unknown".to_string());
 
     // Honor the server's user config as the base, then merge the per-request config
     // supplied via the `X-Config` header (JSON) — same capability as `/extract`.
@@ -80,7 +85,8 @@ pub(crate) async fn openweb_external_handler(
         config.output_format = crate::core::config::OutputFormat::Markdown;
     }
 
-    let request = ExtractionRequest::bytes(body.to_vec(), mime_type, config);
+    let (data, mime_type) = resolve_openweb_bytes(body.to_vec(), mime_type, filename_hint, &config).await?;
+    let request = ExtractionRequest::bytes(data, mime_type, config);
     let mut svc = state
         .extraction_service
         .lock()
@@ -121,7 +127,7 @@ pub(crate) async fn openweb_docling_handler(
     State(state): State<ApiState>,
     MultipartApi(mut multipart): MultipartApi,
 ) -> Result<Json<DoclingCompatResponse>, ApiError> {
-    let mut file_data: Option<(Vec<u8>, String)> = None;
+    let mut file_data: Option<(Vec<u8>, String, Option<String>)> = None;
     let mut config_json: Option<String> = None;
     let mut flat_config = serde_json::Map::new();
 
@@ -151,17 +157,8 @@ pub(crate) async fn openweb_docling_handler(
                     .await
                     .map_err(|e| ApiError::validation(crate::error::XbergError::validation(e.to_string())))?;
 
-                let mut mime_type =
-                    content_type.unwrap_or_else(|| crate::core::mime::OCTET_STREAM_MIME_TYPE.to_string());
-
-                if mime_type == crate::core::mime::OCTET_STREAM_MIME_TYPE
-                    && let Some(ref name) = file_name
-                    && let Ok(detected) = crate::core::mime::detect_mime_type(name, false)
-                {
-                    mime_type = detected;
-                }
-
-                file_data = Some((data.to_vec(), mime_type));
+                let mime_type = content_type.unwrap_or_else(|| crate::core::mime::OCTET_STREAM_MIME_TYPE.to_string());
+                file_data = Some((data.to_vec(), mime_type, file_name));
             }
             // A client that sends the whole config as one JSON blob: the /extract field name
             // "config", or the "parameters" label.
@@ -189,7 +186,7 @@ pub(crate) async fn openweb_docling_handler(
         config_json = Some(serde_json::Value::Object(flat_config).to_string());
     }
 
-    let (data, mime_type) = file_data.ok_or_else(|| {
+    let (data, mime_type, filename) = file_data.ok_or_else(|| {
         ApiError::validation(crate::error::XbergError::validation(
             "No file provided. Upload a file with field name 'files'.",
         ))
@@ -203,6 +200,7 @@ pub(crate) async fn openweb_docling_handler(
         config.output_format = crate::core::config::OutputFormat::Markdown;
     }
 
+    let (data, mime_type) = resolve_openweb_bytes(data, mime_type, filename, &config).await?;
     let request = ExtractionRequest::bytes(data, mime_type, config);
     let mut svc = state
         .extraction_service
@@ -286,6 +284,26 @@ mod tests {
         if let Some(cfg) = config {
             body.extend_from_slice(
                 format!("--{boundary}\r\nContent-Disposition: form-data; name=\"config\"\r\n\r\n{cfg}\r\n").as_bytes(),
+            );
+        }
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        body
+    }
+
+    fn docling_json_body(boundary: &str, content_type: &str, config: Option<&str>) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"report.txt\"\r\nContent-Type: {content_type}\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(br#"{"kind":"report"}"#);
+        body.extend_from_slice(b"\r\n");
+        if let Some(config) = config {
+            body.extend_from_slice(
+                format!("--{boundary}\r\nContent-Disposition: form-data; name=\"config\"\r\n\r\n{config}\r\n")
+                    .as_bytes(),
             );
         }
         body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
@@ -391,6 +409,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openweb_process_detects_json_content_despite_txt_filename_by_default() {
+        let response = test_router()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/process")
+                    .header("content-type", crate::core::mime::OCTET_STREAM_MIME_TYPE)
+                    .header("X-Filename", "report.txt")
+                    .body(Body::from(r#"{"kind":"report"}"#))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("handler responded");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes readable");
+        let parsed: OpenWebDocumentResponse = serde_json::from_slice(&bytes).expect("response parses");
+        assert_eq!(parsed.page_content, "kind: report\n");
+    }
+
+    #[tokio::test]
+    async fn openweb_process_detects_json_content_despite_txt_filename_in_content_only_mode() {
+        let response = test_router()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/process")
+                    .header("content-type", crate::core::mime::OCTET_STREAM_MIME_TYPE)
+                    .header("X-Filename", "report.txt")
+                    .header("X-Config", r#"{"mime_detection_policy":"content_only"}"#)
+                    .body(Body::from(r#"{"kind":"report"}"#))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("handler responded");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes readable");
+        let parsed: OpenWebDocumentResponse = serde_json::from_slice(&bytes).expect("response parses");
+        assert_eq!(parsed.page_content, "kind: report\n");
+    }
+
+    #[tokio::test]
+    async fn openweb_process_keeps_specific_content_type_authoritative() {
+        let response = test_router()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/process")
+                    .header("content-type", "text/plain")
+                    .header("X-Filename", "report.json")
+                    .header("X-Config", r#"{"mime_detection_policy":"content_only"}"#)
+                    .body(Body::from(r#"{"kind":"report"}"#))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("handler responded");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes readable");
+        let parsed: OpenWebDocumentResponse = serde_json::from_slice(&bytes).expect("response parses");
+        assert_eq!(parsed.page_content, "{\"kind\":\"report\"}\n");
+    }
+
+    #[tokio::test]
     async fn openweb_process_rejects_empty_body() {
         let app = test_router();
 
@@ -473,6 +562,60 @@ mod tests {
             serde_json::from_slice(&bytes).expect("response parses as DoclingCompatResponse");
         assert!(!parsed.document.md_content.is_empty(), "md_content must be non-empty");
         assert_eq!(parsed.status, "success");
+    }
+
+    #[tokio::test]
+    async fn openweb_docling_detects_json_content_despite_txt_filename_by_default() {
+        let boundary = "doclingprefercontentboundary";
+        let response = test_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/convert/file")
+                    .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+                    .body(Body::from(docling_json_body(
+                        boundary,
+                        crate::core::mime::OCTET_STREAM_MIME_TYPE,
+                        None,
+                    )))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("handler responded");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes readable");
+        let parsed: DoclingCompatResponse = serde_json::from_slice(&bytes).expect("response parses");
+        assert_eq!(parsed.document.md_content, "kind: report\n");
+    }
+
+    #[tokio::test]
+    async fn openweb_docling_detects_json_content_despite_txt_filename_in_content_only_mode() {
+        let boundary = "doclingcontentonlyboundary";
+        let response = test_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/convert/file")
+                    .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+                    .body(Body::from(docling_json_body(
+                        boundary,
+                        crate::core::mime::OCTET_STREAM_MIME_TYPE,
+                        Some(r#"{"mime_detection_policy":"content_only"}"#),
+                    )))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("handler responded");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes readable");
+        let parsed: DoclingCompatResponse = serde_json::from_slice(&bytes).expect("response parses");
+        assert_eq!(parsed.document.md_content, "kind: report\n");
     }
 
     #[tokio::test]

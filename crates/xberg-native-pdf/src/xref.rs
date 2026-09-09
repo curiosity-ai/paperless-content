@@ -367,7 +367,6 @@ fn find_actual_xref_offset<R: Read + Seek>(reader: &mut R, offset: u64) -> Resul
                 tracing::warn!(
                     offset,
                     corrected_offset = found_offset,
-                    object_header = before_obj.trim(),
                     "corrected misaligned xref offset (found object header)"
                 );
                 return Ok(found_offset);
@@ -411,7 +410,6 @@ fn parse_xref_iterative<R: Read + Seek>(reader: &mut R, start_offset: u64) -> Re
         tracing::debug!(
             offset = actual_offset,
             original_offset = offset,
-            peek = ?crate::utils::safe_prefix(&peek_str, 15),
             chain_depth = visited.len(),
             "parsing xref"
         );
@@ -422,16 +420,16 @@ fn parse_xref_iterative<R: Read + Seek>(reader: &mut R, start_offset: u64) -> Re
         } else if trimmed.chars().next().is_some_and(|c| c.is_ascii_digit()) {
             match parse_xref_stream(reader, actual_offset) {
                 Ok(xref) => xref,
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to parse as xref stream, trying traditional xref");
+                Err(error) => {
+                    crate::error::trace_recovery("parse_xref_stream", &error);
                     reader.seek(SeekFrom::Start(actual_offset))?;
                     match parse_traditional_xref(reader, actual_offset) {
                         Ok(xref) => xref,
-                        Err(trad_err) => {
-                            tracing::warn!(error = %trad_err, "failed to parse as traditional xref");
+                        Err(traditional_error) => {
+                            crate::error::trace_recovery("parse_traditional_xref", &traditional_error);
                             return Err(Error::InvalidPdf(format!(
                                 "failed to parse xref (stream attempt: {}, traditional attempt: {})",
-                                e, trad_err
+                                error, traditional_error
                             )));
                         }
                     }
@@ -440,7 +438,7 @@ fn parse_xref_iterative<R: Read + Seek>(reader: &mut R, start_offset: u64) -> Re
         } else {
             tracing::warn!(
                 offset = actual_offset,
-                data = ?crate::utils::safe_prefix(trimmed, 20),
+                error_code = "unexpected_xref_data",
                 "xref starts with unexpected data"
             );
             return Err(Error::InvalidXref);
@@ -485,8 +483,13 @@ fn parse_xref_iterative<R: Read + Seek>(reader: &mut R, start_offset: u64) -> Re
                         None => result_xref = Some(stm_xref),
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(offset = stm_off, error = %e, "skipping unparseable /XRefStm");
+                Err(error) => {
+                    tracing::warn!(
+                        offset = stm_off,
+                        error_code = error.telemetry_code(),
+                        error_offset = ?error.telemetry_offset(),
+                        "skipping unparseable /XRefStm"
+                    );
                 }
             }
         }
@@ -523,8 +526,12 @@ fn parse_traditional_xref<R: Read + Seek>(reader: &mut R, offset: u64) -> Result
     // Read only until "trailer" or "startxref" instead of the entire remaining file.
     // For linearized PDFs, the first xref may be near byte 0, and read_to_end would
     // load the entire file (e.g., 375MB) just to parse an 8-entry xref table. ~keep
-    let lines = read_until_trailer(reader).map_err(|e| {
-        tracing::error!(error = %e, "failed to read xref lines");
+    let lines = read_until_trailer(reader).map_err(|_| {
+        tracing::error!(
+            operation = "read_xref_lines",
+            error_code = "io_error",
+            "failed to read xref lines"
+        );
         Error::InvalidXref
     })?;
 
@@ -532,6 +539,7 @@ fn parse_traditional_xref<R: Read + Seek>(reader: &mut R, offset: u64) -> Result
 
     let mut xref = CrossRefTable::new();
     let mut line_idx = 0;
+    let mut malformed_entry_count = 0usize;
 
     // Find "xref" keyword, skipping leading whitespace and stray data lines
     // Some PDFs have garbage bytes or comments before the xref keyword ~keep
@@ -551,7 +559,7 @@ fn parse_traditional_xref<R: Read + Seek>(reader: &mut R, offset: u64) -> Result
         if skipped_lines > MAX_SKIP_LINES {
             return Err(Error::InvalidXref);
         }
-        tracing::warn!(line = ?trimmed, "skipping unexpected line before xref");
+        malformed_entry_count += 1;
         line_idx += 1;
     }
 
@@ -591,7 +599,7 @@ fn parse_traditional_xref<R: Read + Seek>(reader: &mut R, offset: u64) -> Result
             }
 
             if trimmed.starts_with("trailer") {
-                tracing::warn!(expected = count, found = i, "expected more entries before trailer");
+                malformed_entry_count += (count - i) as usize;
                 line_idx -= 1; // Back up so outer loop can process trailer ~keep
                 break;
             }
@@ -601,7 +609,7 @@ fn parse_traditional_xref<R: Read + Seek>(reader: &mut R, offset: u64) -> Result
             let parts: Vec<&str> = trimmed.split_whitespace().collect();
 
             if parts.len() < 3 {
-                tracing::warn!(index = i, entry = ?trimmed, "malformed xref entry (too few parts)");
+                malformed_entry_count += 1;
 
                 // Still increment counter to maintain object numbering
                 // Add a placeholder free entry to maintain object number sequence ~keep
@@ -613,17 +621,13 @@ fn parse_traditional_xref<R: Read + Seek>(reader: &mut R, offset: u64) -> Result
 
             // Allow extra parts (some PDFs have trailing data) ~keep
             if parts.len() > 3 {
-                tracing::debug!(
-                    parts = parts.len(),
-                    entry = ?trimmed,
-                    "xref entry has more parts than expected (3)"
-                );
+                tracing::debug!(parts = parts.len(), "xref entry has more parts than expected (3)");
             }
 
             let offset: u64 = match parts[0].parse() {
                 Ok(v) => v,
                 Err(_) => {
-                    tracing::warn!(index = i, value = ?parts[0], "failed to parse offset");
+                    malformed_entry_count += 1;
                     let entry = XRefEntry::free(0, 65535);
                     xref.add_entry(start_obj + i, entry);
                     i += 1;
@@ -634,7 +638,7 @@ fn parse_traditional_xref<R: Read + Seek>(reader: &mut R, offset: u64) -> Result
             let generation: u16 = match parts[1].parse() {
                 Ok(v) => v,
                 Err(_) => {
-                    tracing::warn!(index = i, value = ?parts[1], "failed to parse generation");
+                    malformed_entry_count += 1;
                     let entry = XRefEntry::free(0, 65535);
                     xref.add_entry(start_obj + i, entry);
                     i += 1;
@@ -652,7 +656,7 @@ fn parse_traditional_xref<R: Read + Seek>(reader: &mut R, offset: u64) -> Result
                 'n' => true,
                 'f' => false,
                 _ => {
-                    tracing::warn!(index = i, type_flag = ?type_flag, "invalid type flag, treating as free");
+                    malformed_entry_count += 1;
                     false
                 }
             };
@@ -679,6 +683,10 @@ fn parse_traditional_xref<R: Read + Seek>(reader: &mut R, offset: u64) -> Result
         {
             xref.set_trailer(dict.clone());
         }
+    }
+
+    if malformed_entry_count > 0 {
+        crate::error::trace_recovery_count("parse_traditional_xref", "malformed_xref_entry", malformed_entry_count);
     }
 
     Ok(xref)

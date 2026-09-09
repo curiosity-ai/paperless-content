@@ -15,6 +15,7 @@
 
 mod tests {
     use xberg_native_pdf::document::PdfDocument;
+    use xberg_native_pdf::extractors::images::PdfFilter;
     use xberg_native_pdf::rendering::{RenderOptions, render_page};
 
     /// Point this at a PDF whose pages carry JBIG2 `/ImageMask`s to run the assertion.
@@ -40,6 +41,28 @@ mod tests {
         );
 
         let doc = PdfDocument::open(&path).expect("open the JBIG2 fixture");
+
+        let handles = doc.page_image_handles(0).expect("enumerate page images");
+        assert_eq!(
+            handles.len(),
+            3,
+            "the two JPEG backgrounds and referenced JBIG2 /Mask must all be enumerated"
+        );
+        let text_mask = handles
+            .iter()
+            .find(|handle| handle.filter_chain.contains(&PdfFilter::JBIG2Decode))
+            .expect("enumeration must expose the JBIG2 text mask");
+        let decoded_mask = text_mask
+            .decode()
+            .expect("decode the referenced JBIG2 text mask")
+            .to_dynamic_image()
+            .expect("materialize decoded JBIG2 pixels")
+            .to_luma8();
+        let mask_dark = decoded_mask.pixels().filter(|pixel| pixel[0] < 100).count();
+        assert!(
+            mask_dark > 10_000,
+            "decoded JBIG2 text mask contains only {mask_dark} dark pixels"
+        );
 
         // as_raw() returns premultiplied RGBA8888 — PNG bytes cannot be scanned for ink. ~keep
         let opts = RenderOptions::with_dpi(72).as_raw();

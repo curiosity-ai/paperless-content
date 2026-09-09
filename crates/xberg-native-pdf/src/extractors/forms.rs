@@ -268,8 +268,16 @@ impl FormExtractor {
     /// }
     /// # Ok::<(), xberg_native_pdf::error::Error>(())
     /// ```
-    #[tracing::instrument(name = "pdf.extract_fields", skip_all, err)]
+    #[tracing::instrument(name = "pdf.extract_fields", skip_all)]
     pub fn extract_fields(doc: &PdfDocument) -> Result<Vec<FormField>> {
+        let result = Self::extract_fields_impl(doc);
+        if let Err(error) = &result {
+            crate::error::trace_failure("extract_form_fields", error);
+        }
+        result
+    }
+
+    fn extract_fields_impl(doc: &PdfDocument) -> Result<Vec<FormField>> {
         let catalog = doc.catalog()?;
         let catalog_dict = catalog
             .as_dict()

@@ -14,6 +14,7 @@ pub(crate) mod download_progress;
 pub mod email;
 pub mod extraction;
 pub mod formats;
+pub mod geojson;
 #[cfg(feature = "html")]
 pub mod html_output;
 pub mod late_interaction;
@@ -45,10 +46,11 @@ pub(crate) use download_progress::DownloadProgress;
 pub use email::EmailConfig;
 pub use extraction::{
     ExtractInput, ExtractInputKind, ExtractionConfig, ExtractionErrorItem, ExtractionResult, ExtractionSummary,
-    FileExtractionConfig, ImageExtractionConfig, LanguageDetectionConfig, TokenReductionOptions, UrlExtractionConfig,
-    UrlExtractionMode,
+    FileExtractionConfig, ImageExtractionConfig, LanguageDetectionConfig, MimeDetectionPolicy, TokenReductionOptions,
+    UrlExtractionConfig, UrlExtractionMode,
 };
 pub use formats::{JupyterCellRendering, OutputFormat};
+pub use geojson::GeoJsonExtractionConfig;
 #[cfg(feature = "html")]
 pub use html_output::{HtmlOutputConfig, HtmlTheme};
 pub use late_interaction::{LateInteractionConfig, LateInteractionModelType};

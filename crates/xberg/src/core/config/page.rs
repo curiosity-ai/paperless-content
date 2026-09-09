@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// Page range tracking in chunk metadata (first_page/last_page) is automatically enabled
 /// when page boundaries are available and chunking is configured.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PageConfig {
     /// Extract pages as separate array (ExtractedDocument.pages)
     #[serde(default)]

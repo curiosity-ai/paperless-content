@@ -6,7 +6,7 @@ import { Tabs, TabItem } from "@astrojs/starlight/components";
 import ApiSnippetGroup from "../../../components/ApiSnippetGroup.astro";
 import { Content as Snip_wasm_getting_started_browser_file_input } from "../../../snippets/wasm/getting-started/browser-file-input.md";
 
-Extract text, metadata, and structure from 100 file formats — PDFs, Office documents, images, email, HTML, archives, and more. Single files or batches, from local paths or in-memory bytes, with per-document configuration overrides and built-in content filtering.
+Extract text, metadata, and structure from 107 file formats — PDFs, Office documents, images, email, HTML, archives, and more. Single files or batches, from local paths or in-memory bytes, with per-document configuration overrides and built-in content filtering.
 
 See the [Configuration Reference](/reference/configuration/) for all extraction settings and the [Supported Formats](/reference/formats/) reference for format-specific options.
 
@@ -272,7 +272,7 @@ should never come close to the defaults below.
 | `max_entity_length`      | Billion-laughs-class attacks — a single XML entity/attribute/token expanding to hundreds of MB | 1 MiB |
 | `max_content_size`       | Aggregate text growth across a whole document (catches long-tail expansion that `max_entity_length` alone would miss) | 100 MB |
 | `max_iterations`         | Infinite or near-infinite parser loops (XML token loop, HTML tokenizer, JSON parser) | 10,000,000 |
-| `max_table_cells`        | Documents claiming an unreasonable number of table cells (CSV, XLSX, HTML tables) | 100,000 |
+| `max_table_cells`        | Documents claiming an unreasonable aggregate number of table cells (CSV, XLSX, HTML tables) | 100,000 |
 | `max_pages`              | Excessive per-page OCR, layout, and rendering work                                | Unlimited      |
 
 When both `max_nesting_depth` and `max_xml_depth` apply to the same parse, the
@@ -380,6 +380,12 @@ xberg_security_limits_free(limits);
 
 Any field left unset falls back to the `SecurityLimits::default()` value shown
 in the table above.
+
+The `max_table_cells` default is intentionally conservative. For a trusted
+large CSV, XLSX, or HTML input, raise `security_limits.max_table_cells` to a
+known workload bound; doing so permits proportionally more parsing work and
+output allocation. Limit errors report both the observed cell count and the
+configured value.
 
 `max_pages` is enforced before per-page work for PDF, PPTX, Keynote, ODP, and
 multi-frame TIFF when OCR is enabled. It is not a universal document-page cap:
@@ -614,18 +620,18 @@ Use `source`, `outputs`, or `both` (the default).
 
 ## Supported Formats
 
-Xberg supports 100 file formats across 120 file extensions in 8 categories:
+Xberg supports 107 file formats across 140 unique file extensions and accepts 53 compatibility MIME aliases:
 
-| Category          | Extensions                                               | Notes                               |
+| Category          | Example extensions                                       | Notes                               |
 | ----------------- | -------------------------------------------------------- | ----------------------------------- |
 | **PDF**           | `.pdf`                                                   | Native text + OCR for scanned pages |
-| **Images**        | `.png`, `.jpg`, `.jpeg`, `.tiff`, `.bmp`, `.webp`, `.heic`, `.heif`, `.avif` | OCR backend; HEIC/HEIF/AVIF need `heic` feature + libheif |
+| **Images**        | `.png`, `.jpg`, `.jpeg`, `.tiff`, `.bmp`, `.webp`, `.heic`, `.heics`, `.heif`, `.heifs`, `.hif`, `.avif` | OCR backend; HEIC/HEIF/AVIF need `heic` feature + libheif |
 | **Office**        | `.docx`, `.pptx`, `.xlsx`, `.odt`, `.ods`, `.odp`        | Modern + OpenDocument via native parsers |
-| **Legacy Office** | `.doc`, `.ppt`, `.wpd`, `.wp`, `.wp5`, `.wp6`            | Native OLE/CFB parsing; WordPerfect via libwpd |
-| **Email**         | `.eml`, `.msg`                                           | Full support including attachments  |
-| **Web**           | `.html`, `.htm`                                          | Converted to Markdown with metadata |
-| **Text**          | `.md`, `.txt`, `.xml`, `.json`, `.yaml`, `.toml`, `.csv` | Direct extraction                   |
-| **Archives**      | `.zip`, `.tar`, `.tar.gz`, `.tar.bz2`, `.7z`             | Recursive extraction                |
+| **Legacy Office** | `.doc`, `.ppt`, `.pps`, `.wpd`, `.wp`, `.wp5`, `.wp6`    | Native OLE/CFB parsing; WordPerfect via libwpd |
+| **Email**         | `.eml`, `.msg`, `.pst`                                   | Full support including attachments  |
+| **Web**           | `.html`, `.htm`, `.xhtml`, `.xht`                        | Converted to Markdown with metadata |
+| **Text and data** | `.md`, `.txt`, `.xml`, `.json`, `.geojson`, `.kml`, `.yaml`, `.toml`, `.csv`, `.sqlite`, `.sqlite3`, `.db`, `.gpkg`, `.gpkx` | Direct, geospatial, and bounded database extraction |
+| **Archives**      | `.zip`, `.tar`, `.tgz`, `.gz`, `.7z`                     | Recursive extraction                |
 
 ### Image metadata and EXIF
 
@@ -732,7 +738,14 @@ for page_index in 0..count {
 
 ## MIME Type Detection
 
-When extracting from bytes, `ExtractInput` requires an explicit MIME type since there's no file extension to infer it from. For file paths, auto-detection from the extension is automatic.
+Xberg prefers bounded content inspection and falls back to a supported filename extension. Files with unknown or
+missing extensions are sniffed instead of being rejected. A specific explicit MIME type remains authoritative;
+`application/octet-stream` is a generic placeholder that triggers configured detection.
+
+Set `ExtractionConfig.mime_detection_policy` to `prefer_content` (the default), `trust_extension`, or `content_only`.
+`trust_extension` skips content sniffing when the filename has a supported extension, so use it only when filenames
+come from a trusted source. `content_only` ignores the filename extension. A `FileExtractionConfig` override can select
+a different policy for one batch item.
 
 ### Example: Override MIME Type
 

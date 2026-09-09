@@ -323,11 +323,6 @@ pub struct LazyCMap {
     /// succeeded. Both terminal states are memoized so the parser
     /// never re-runs after the first call. ~keep
     parsed: Arc<Mutex<Option<Option<Arc<CMap>>>>>,
-
-    /// Owning font's BaseFont, when known. Carried purely so the parse-failure
-    /// WARN can name the font: a document with thirty fonts otherwise gives a
-    /// reader no way to tell which one lost its ToUnicode mapping. ~keep
-    font_name: Option<String>,
 }
 
 impl LazyCMap {
@@ -348,17 +343,13 @@ impl LazyCMap {
             raw_stream,
             cache_key,
             parsed: Arc::new(Mutex::new(None)),
-            font_name: None,
         }
     }
 
-    /// Same as [`LazyCMap::new`], but records the owning font's BaseFont so a
-    /// failed parse can say which font it belonged to.
-    pub fn new_for_font(raw_stream: Vec<u8>, font_name: String) -> Self {
-        LazyCMap {
-            font_name: Some(font_name),
-            ..LazyCMap::new(raw_stream)
-        }
+    /// Same as [`LazyCMap::new`]. The font name is accepted for API compatibility
+    /// but is intentionally excluded from telemetry because PDF names are untrusted.
+    pub fn new_for_font(raw_stream: Vec<u8>, _font_name: String) -> Self {
+        LazyCMap::new(raw_stream)
     }
 
     /// Get a reference to the parsed CMap.
@@ -433,25 +424,14 @@ impl LazyCMap {
                 tracing::debug!("CMap parsed and cached (stream hash {:?})", self.cache_key);
                 Some(cmap_arc)
             }
-            Err(e) => {
+            Err(error) => {
                 // Memoized as `Some(None)` above so this fires at most once
                 // per LazyCMap even though `get()` sits on the per-character
                 // decode path (`FontInfo::char_to_unicode`) — a broken
                 // ToUnicode CMap is a genuine "fallback taken" a consumer
                 // wants to see, and it can no longer spam once per glyph. ~keep
                 *parsed_guard = Some(None);
-                match &self.font_name {
-                    Some(name) => tracing::warn!(
-                        "Failed to parse the ToUnicode CMap for font '{}'; no Unicode mapping is \
-                         available for it: {}",
-                        name,
-                        e
-                    ),
-                    None => tracing::warn!(
-                        "Failed to parse a ToUnicode CMap; no Unicode mapping is available: {}",
-                        e
-                    ),
-                }
+                crate::error::trace_recovery("parse_tounicode_cmap", &error);
                 None
             }
         }
@@ -1654,13 +1634,11 @@ endcmap
     }
 
     #[derive(Default)]
-    struct MessageVisitor(String);
+    struct MessageVisitor(Vec<String>);
 
     impl tracing::field::Visit for MessageVisitor {
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                self.0 = format!("{:?}", value);
-            }
+            self.0.push(format!("{}={value:?}", field.name()));
         }
     }
 
@@ -1680,7 +1658,7 @@ endcmap
         fn event(&self, event: &tracing::Event<'_>) {
             let mut visitor = MessageVisitor::default();
             event.record(&mut visitor);
-            self.messages.lock_or_recover().push(visitor.0);
+            self.messages.lock_or_recover().push(visitor.0.join(" "));
         }
 
         fn enter(&self, _span: &tracing::span::Id) {}
@@ -1798,7 +1776,8 @@ endcmap
     /// path (`FontInfo::char_to_unicode`).
     #[test]
     fn lazy_cmap_memoizes_a_parse_failure_and_warns_once() {
-        let data = b"RANDOM BINARY GARBAGE, NOT A CMAP STREAM AT ALL 0xDEADBEEF".to_vec();
+        const CONFIDENTIAL_MARKER: &str = "CONFIDENTIAL_CMAP_NAME_9c12";
+        let data = format!("RANDOM BINARY GARBAGE {CONFIDENTIAL_MARKER}").into_bytes();
         let lazy = LazyCMap::new(data);
         let logs = capture_warnings(|| {
             assert!(lazy.get().is_none(), "a garbage stream must fail to parse");
@@ -1807,11 +1786,17 @@ endcmap
         });
         let failure_warnings = logs
             .iter()
-            .filter(|m| m.contains("Failed to parse a ToUnicode CMap"))
-            .count();
+            .filter(|message| {
+                message.contains("operation=\"parse_tounicode_cmap\"")
+                    && message.contains("error_code=\"font_error\"")
+                    && message.contains("message=PDF operation degraded")
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
-            failure_warnings, 1,
+            failure_warnings.len(),
+            1,
             "LazyCMap::get() must warn on a parse failure exactly once, not per call: {logs:?}"
         );
+        assert!(!format!("{logs:?}").contains(CONFIDENTIAL_MARKER));
     }
 }

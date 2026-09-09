@@ -13,7 +13,9 @@ use super::super::formats::OutputFormat;
 use super::super::ocr::{OcrConfig, OcrStrategy};
 use super::super::page::PageConfig;
 use super::super::processing::{ChunkingConfig, PostProcessorConfig};
-use super::types::{ImageExtractionConfig, LanguageDetectionConfig, TokenReductionOptions, UrlExtractionConfig};
+use super::types::{
+    ImageExtractionConfig, LanguageDetectionConfig, MimeDetectionPolicy, TokenReductionOptions, UrlExtractionConfig,
+};
 
 /// Per-file extraction configuration overrides for batch processing.
 ///
@@ -42,8 +44,13 @@ use super::types::{ImageExtractionConfig, LanguageDetectionConfig, TokenReductio
 /// };
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct FileExtractionConfig {
+    /// ~keep: Override MIME inference policy for this file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "alef-meta", alef(since = "1.1.0"))]
+    pub mime_detection_policy: Option<MimeDetectionPolicy>,
+
     /// Override quality post-processing for this file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_quality_processing: Option<bool>,

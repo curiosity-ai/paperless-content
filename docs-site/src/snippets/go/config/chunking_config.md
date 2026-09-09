@@ -64,7 +64,7 @@ func main() {
 }
 ```
 
-```go title="Go - Prepend Heading Context"
+```go title="Go - Use Heading Context"
 package main
 
 import (
@@ -81,10 +81,9 @@ func main() {
 
 	config := xberg.ExtractionConfig{
 		Chunking: &xberg.ChunkingConfig{
-			MaxCharacters:         &maxChars,
-			Overlap:               &overlap,
-			ChunkerType:           &chunkerType,
-			PrependHeadingContext: true,
+			MaxCharacters: &maxChars,
+			Overlap:       &overlap,
+			ChunkerType:   &chunkerType,
 		},
 	}
 
@@ -95,7 +94,9 @@ func main() {
 	}
 
 	for _, chunk := range result.Results[0].Chunks {
-		// Each chunk's content is prefixed with its heading breadcrumb
+		if chunk.Metadata.HeadingContext != nil {
+			fmt.Printf("Heading depth: %d\n", len(chunk.Metadata.HeadingContext.Headings))
+		}
 		fmt.Printf("Content: %.100s...\n", chunk.Content)
 	}
 }

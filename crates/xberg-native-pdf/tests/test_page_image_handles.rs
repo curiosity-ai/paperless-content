@@ -8,6 +8,7 @@ mod common;
 
 use xberg_native_pdf::PdfDocument;
 use xberg_native_pdf::extractors::images::PdfFilter;
+use xberg_native_pdf::rendering::{RenderOptions, render_page};
 
 const MINIMAL_JPEG: &[u8] = &[
     0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
@@ -89,6 +90,57 @@ fn build_pdf_with_jpeg(width: u32, height: u32) -> Vec<u8> {
     build_pdf_with_jpegs(&[(0.0, 0.0, width as f32, height as f32)])
 }
 
+fn build_pdf_with_referenced_mask() -> Vec<u8> {
+    build_pdf_with_referenced_mask_options(false, true)
+}
+
+fn build_pdf_with_referenced_mask_decode(inverted: bool) -> Vec<u8> {
+    build_pdf_with_referenced_mask_options(inverted, true)
+}
+
+fn build_pdf_with_referenced_mask_options(inverted: bool, include_bits_per_component: bool) -> Vec<u8> {
+    let content = b"q 100 0 0 100 0 0 cm /Im0 Do Q";
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R \
+          /Resources << /XObject << /Im0 5 0 R >> >> >>\nendobj\n",
+    );
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes());
+    pdf.extend_from_slice(content);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(
+        b"5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray \
+          /BitsPerComponent 8 /Mask 6 0 R /Length 1 >>\nstream\n\x80\nendstream\nendobj\n",
+    );
+    offsets.push(pdf.len());
+    let (decode, sample) = if inverted { (" /Decode [1 0]", 0x80) } else { ("", 0x00) };
+    let bits_per_component = if include_bits_per_component {
+        " /BitsPerComponent 1"
+    } else {
+        ""
+    };
+    pdf.extend_from_slice(
+        format!(
+            "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ImageMask true \
+             {bits_per_component}{decode} /Length 1 >>\nstream\n"
+        )
+        .as_bytes(),
+    );
+    pdf.push(sample);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    common::finalize_pdf(pdf, &offsets)
+}
+
 #[test]
 fn page_image_handles_returns_one_handle_for_single_jpeg() {
     let pdf_bytes = build_pdf_with_jpeg(100, 80);
@@ -102,6 +154,64 @@ fn page_image_handles_returns_one_handle_for_single_jpeg() {
     assert_eq!(h.height, 1);
     assert!(!h.is_inline);
     assert_eq!(h.paint_order, 0);
+}
+
+#[test]
+fn page_image_handles_includes_referenced_mask() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_referenced_mask()).expect("open PDF");
+
+    let handles = doc.page_image_handles(0).expect("enumerate page image handles");
+
+    assert_eq!(
+        handles.len(),
+        2,
+        "the image and its referenced /Mask must both be OCR candidates"
+    );
+    assert_eq!((handles[0].width, handles[0].height), (1, 1));
+    assert_eq!((handles[1].width, handles[1].height), (1, 1));
+}
+
+#[test]
+fn referenced_image_mask_defaults_missing_bits_per_component_to_one() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_referenced_mask_options(false, false)).expect("open PDF");
+
+    let handles = doc.page_image_handles(0).expect("enumerate page image handles");
+
+    assert_eq!(
+        handles[1].bits_per_component, 1,
+        "ImageMask defaults to one bit per component"
+    );
+    handles[1]
+        .decode()
+        .expect("decode ImageMask with omitted BitsPerComponent");
+}
+
+#[test]
+fn referenced_image_mask_zero_sample_keeps_base_pixel_opaque() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_referenced_mask()).expect("open PDF");
+
+    let rendered = render_page(&doc, 0, &RenderOptions::with_dpi(72).as_raw()).expect("render masked image");
+    let center = ((50 * rendered.width + 50) * 4) as usize;
+    let pixel = &rendered.data[center..center + 4];
+
+    assert!(
+        pixel[0] < 200 && pixel[1] < 200 && pixel[2] < 200,
+        "the mask's zero sample is ink and must preserve the gray base pixel, got {pixel:?}"
+    );
+}
+
+#[test]
+fn referenced_image_mask_inverted_decode_one_sample_keeps_base_pixel_opaque() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_referenced_mask_decode(true)).expect("open PDF");
+
+    let rendered = render_page(&doc, 0, &RenderOptions::with_dpi(72).as_raw()).expect("render masked image");
+    let center = ((50 * rendered.width + 50) * 4) as usize;
+    let pixel = &rendered.data[center..center + 4];
+
+    assert!(
+        pixel[0] < 200 && pixel[1] < 200 && pixel[2] < 200,
+        "the inverted mask's one sample must preserve the gray base pixel, got {pixel:?}"
+    );
 }
 
 #[test]

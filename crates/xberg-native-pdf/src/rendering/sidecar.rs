@@ -444,7 +444,7 @@ impl CmykSidecar {
 ///
 /// On a parse error, malformed colorant array, or recursion-bound
 /// trip from [`PdfDocument::get_page_inks_deep`], this function emits
-/// a `tracing::warn!` naming the page and the underlying error, then
+/// a `tracing::warn!` naming the page and a stable error code, then
 /// returns an empty vector. The render continues with degraded spot
 /// fidelity (the sidecar allocates a zero-length spot stack and any
 /// downstream paint-op writes that target spot lanes will find no
@@ -461,12 +461,12 @@ pub(crate) fn discover_page_spot_inks(doc: &PdfDocument, page_index: usize) -> V
     // lanes drop out of the composite without any signal. ~keep
     match doc.get_page_inks_deep(page_index) {
         Ok(inks) => inks,
-        Err(e) => {
+        Err(error) => {
             tracing::warn!(
-                "sidecar: failed to discover spot inks for page {}: {}; the \
-                 transparency composite will proceed with no spot lanes",
                 page_index,
-                e
+                error_code = error.telemetry_code(),
+                error_offset = ?error.telemetry_offset(),
+                "sidecar failed to discover spot inks; transparency composite will proceed with no spot lanes"
             );
             Vec::new()
         }
@@ -1823,9 +1823,7 @@ mod tests {
     }
 
     /// A test-only `tracing_subscriber::Layer` that captures every
-    /// WARN-or-above event's formatted message into a shared buffer.
-    /// Lets the discover-error probe assert "warn! emitted the expected
-    /// diagnostic" without pulling in a test crate.
+    /// WARN-or-above event's stable identity and fields.
     ///
     /// Installed per-call via `tracing::subscriber::with_default`, which
     /// scopes the subscriber to the current thread for the duration of a
@@ -1833,7 +1831,14 @@ mod tests {
     /// this needs no shared `OnceLock` gate and no snapshot-the-prior-length
     /// dance: each test gets its own fresh buffer. ~keep
     struct CapturingLayer {
-        buf: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        buf: std::sync::Arc<std::sync::Mutex<Vec<CapturedEvent>>>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct CapturedEvent {
+        level: tracing::Level,
+        target: String,
+        fields: std::collections::BTreeMap<String, String>,
     }
 
     impl<S> tracing_subscriber::Layer<S> for CapturingLayer
@@ -1844,24 +1849,32 @@ mod tests {
             if *event.metadata().level() > tracing::Level::WARN {
                 return;
             }
-            let mut visitor = MessageVisitor::default();
+            let mut visitor = FieldVisitor::default();
             event.record(&mut visitor);
-            if let Some(message) = visitor.message {
-                self.buf.lock().unwrap().push(message);
-            }
+            self.buf.lock().unwrap().push(CapturedEvent {
+                level: *event.metadata().level(),
+                target: event.metadata().target().to_string(),
+                fields: visitor.fields,
+            });
         }
     }
 
     #[derive(Default)]
-    struct MessageVisitor {
-        message: Option<String>,
+    struct FieldVisitor {
+        fields: std::collections::BTreeMap<String, String>,
     }
 
-    impl tracing::field::Visit for MessageVisitor {
+    impl tracing::field::Visit for FieldVisitor {
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                self.message = Some(format!("{value:?}"));
-            }
+            self.fields.insert(field.name().to_string(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.fields.insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.fields.insert(field.name().to_string(), value.to_string());
         }
     }
 
@@ -1883,7 +1896,8 @@ mod tests {
     fn discover_page_spot_inks_warns_on_deep_walk_error() {
         use tracing_subscriber::layer::SubscriberExt as _;
 
-        let buf: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let buf: std::sync::Arc<std::sync::Mutex<Vec<CapturedEvent>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::registry().with(CapturingLayer { buf: buf.clone() });
 
         // Single-page synthetic PDF. We will then ask for page 42 — out
@@ -1910,16 +1924,27 @@ mod tests {
             spots
         );
 
-        // The warning message names the page index and includes the
-        // word "spot inks" so a log scrape can find it. ~keep
-        let records: Vec<String> = buf.lock().unwrap().clone();
-        let saw_warning = records.iter().any(|m| m.contains("page 42") && m.contains("spot inks"));
-        assert!(
-            saw_warning,
-            "expected tracing::warn! naming page 42 and 'spot inks' on the \
-             deep-walk error path; captured records: {:?}",
-            records
+        let all_records = buf.lock().unwrap().clone();
+        let records: Vec<_> = all_records
+            .iter()
+            .filter(|event| event.target == format!("{}::rendering::sidecar", crate::LOG_TARGET_ROOT))
+            .collect();
+        assert_eq!(
+            records.len(),
+            1,
+            "expected exactly one sidecar warning: {all_records:?}"
         );
+        assert_eq!(records[0].level, tracing::Level::WARN);
+        assert_eq!(
+            records[0].target,
+            format!("{}::rendering::sidecar", crate::LOG_TARGET_ROOT)
+        );
+        assert_eq!(records[0].fields.get("page_index").map(String::as_str), Some("42"));
+        assert_eq!(
+            records[0].fields.get("error_code").map(String::as_str),
+            Some("invalid_pdf")
+        );
+        assert!(!records[0].fields.contains_key("error"));
     }
 
     /// Round 5 / B2: `extract_paint_spot_inks` for a Pattern colour

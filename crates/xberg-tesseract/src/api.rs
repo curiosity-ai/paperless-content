@@ -1042,14 +1042,17 @@ impl TesseractAPI {
     pub fn clear(&self) -> Result<()> {
         let handle = self.handle.lock().map_err(|_| TesseractError::MutexLockError)?;
         #[cfg(all(feature = "build-tesseract", not(target_arch = "wasm32")))]
-        unsafe {
-            shim::xberg_tess_clear(*handle)
-        };
+        let result = unsafe { shim::xberg_tess_clear(*handle) };
         #[cfg(not(all(feature = "build-tesseract", not(target_arch = "wasm32"))))]
-        unsafe {
-            TessBaseAPIClear(*handle)
+        let result = {
+            unsafe { TessBaseAPIClear(*handle) };
+            0
         };
-        Ok(())
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(TesseractError::OcrError)
+        }
     }
 
     /// Ends the OCR engine.
@@ -2013,7 +2016,7 @@ mod shim {
         pub(super) fn xberg_tess_recognize(handle: *mut c_void) -> c_int;
         pub(super) fn xberg_tess_get_hocr_text(handle: *mut c_void, page: c_int) -> *mut c_char;
         pub(super) fn xberg_tess_get_utf8_text(handle: *mut c_void) -> *mut c_char;
-        pub(super) fn xberg_tess_clear(handle: *mut c_void);
+        pub(super) fn xberg_tess_clear(handle: *mut c_void) -> c_int;
         pub(super) fn xberg_tess_detect_orientation_script(
             handle: *mut c_void,
             orient_deg: *mut c_int,
@@ -2039,6 +2042,25 @@ mod live_engine_tests {
         assert!(is_registered(addr), "a new engine should be tracked as live");
         drop(api);
         assert!(!is_registered(addr), "a dropped engine should be unregistered");
+    }
+
+    #[test]
+    fn clear_reaches_the_linked_native_implementation_without_initialization() {
+        let api = TesseractAPI::new().expect("create engine");
+        api.clear().expect("clear engine");
+    }
+
+    #[test]
+    fn clear_rejects_a_null_native_handle() {
+        let api = TesseractAPI::new().expect("create engine");
+        let original = {
+            let mut handle = api.handle.lock().expect("lock engine handle");
+            std::mem::replace(&mut *handle, std::ptr::null_mut())
+        };
+
+        assert!(matches!(api.clear(), Err(TesseractError::OcrError)));
+
+        *api.handle.lock().expect("restore engine handle") = original;
     }
 
     #[test]

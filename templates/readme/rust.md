@@ -19,7 +19,7 @@
 [![Hugging Face](https://img.shields.io/badge/Hugging%20Face-Xberg-007ec6)](https://huggingface.co/xberg-io)
 [![Discord](https://img.shields.io/badge/Discord-Chat-007ec6)](https://discord.gg/xt9WY3GnKR)
 
-High-performance document intelligence library for Rust. Extract text, metadata, transcripts, and structured information from PDFs, Office documents, images, audio/video, and 100 formats.
+High-performance document intelligence library for Rust. Extract text, metadata, transcripts, and structured information from PDFs, Office documents, images, audio/video, and 107 formats.
 
 This is the core Rust library that powers the Python, TypeScript, and Ruby bindings.
 
@@ -108,6 +108,16 @@ async fn main() -> xberg::Result<()> {
     Ok(())
 }
 ```
+
+### MIME Detection Policy
+
+`ExtractionConfig::mime_detection_policy` defaults to `MimeDetectionPolicy::PreferContent`. Use
+`TrustExtension` to skip content sniffing when the filename has a supported extension, or `ContentOnly` to ignore
+filename extensions. A specific explicit `ExtractInput::mime_type` remains authoritative; `application/octet-stream`
+is treated as a generic placeholder and falls back to policy-based detection. A `FileExtractionConfig` override can
+select a different policy for one batch item. Because uploaded and downloaded filenames are
+attacker-controlled, use `TrustExtension` only for trusted sources; a misleading extension can otherwise route content
+to the wrong extractor.
 
 ## OCR with Table Extraction
 

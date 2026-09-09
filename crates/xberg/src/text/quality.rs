@@ -116,11 +116,14 @@ fn count_tag_bytes(text: &str, open_needle: &[u8], close_needle: &[u8]) -> usize
     total
 }
 
-/// Score an extracted text on the closed interval `[0.0, 1.0]`, where higher is better.
+/// Score the cleanliness and readability of extracted text on `[0.0, 1.0]`.
 ///
 /// `1.0` is the neutral score for clean prose; penalties (OCR artifacts, embedded
 /// script/style noise, navigation chrome) subtract, structural cues (headings,
-/// punctuation) add. The result is clamped to `[0.0, 1.0]`.
+/// punctuation) add. The result is clamped to `[0.0, 1.0]`. It measures only the
+/// text supplied to this function and therefore cannot measure extraction
+/// completeness or recall. Callers must inspect extraction warnings separately
+/// for known omissions or degraded processing.
 ///
 /// Pass `metadata` as `None` when the caller has no extraction metadata available;
 /// the metadata bonus simply isn't applied in that case. Texts shorter than

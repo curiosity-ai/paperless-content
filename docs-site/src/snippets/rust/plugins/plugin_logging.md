@@ -2,7 +2,7 @@
 use xberg::plugins::{Plugin, DocumentExtractor};
 use xberg::{ExtractInput, ExtractedDocument, ExtractionConfig, Result};
 use async_trait::async_trait;
-use log::{info, warn, error};
+use tracing::{debug, info, warn};
 
 struct MyPlugin;
 
@@ -16,18 +16,28 @@ impl Plugin for MyPlugin {
     }
 
     fn initialize(&self) -> Result<()> {
-        info!("Initializing plugin: {}", self.name());
+        info!(plugin = self.name(), "initializing plugin");
         Ok(())
     }
 
     fn shutdown(&self) -> Result<()> {
-        info!("Shutting down plugin: {}", self.name());
+        info!(plugin = self.name(), "shutting down plugin");
         Ok(())
     }
 }
 
 #[async_trait]
 impl DocumentExtractor for MyPlugin {
+    #[tracing::instrument(
+        name = "xberg::plugin_extract",
+        level = "debug",
+        skip_all,
+        fields(
+            plugin = self.name(),
+            mime_type = tracing::field::Empty,
+            input_len = tracing::field::Empty,
+        )
+    )]
     async fn extract(
         &self,
         input: ExtractInput,
@@ -35,12 +45,15 @@ impl DocumentExtractor for MyPlugin {
     ) -> Result<ExtractedDocument> {
         let mime_type = input.mime_type.clone().unwrap_or_default();
         let bytes = input.bytes.unwrap_or_default();
-        info!("Extracting {} ({} bytes)", mime_type, bytes.len());
+        let span = tracing::Span::current();
+        span.record("mime_type", mime_type.as_str());
+        span.record("input_len", bytes.len());
+        debug!("extracting document");
 
         let result = ExtractedDocument::default();
 
         if result.content.is_empty() {
-            warn!("Extraction resulted in empty content");
+            warn!("extraction produced empty content");
         }
 
         Ok(result)

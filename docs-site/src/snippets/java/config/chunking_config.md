@@ -49,28 +49,3 @@ result.chunks().forEach(chunk -> {
     }
 });
 ```
-
-```java title="Java - Prepend Heading Context"
-import io.xberg.Xberg;
-import io.xberg.ExtractInput;
-import io.xberg.ExtractInputKind;
-import io.xberg.ExtractionConfig;
-import io.xberg.ExtractionResult;
-import io.xberg.ExtractedDocument;
-import io.xberg.ChunkingConfig;
-
-ExtractionConfig config = ExtractionConfig.builder()
-    .withChunking(ChunkingConfig.builder()
-        .withPrependHeadingContext(true)
-        .build())
-    .build();
-ExtractionResult output = Xberg.extract(
-    ExtractInput.builder().withKind(ExtractInputKind.Uri).withUri("document.md").build(),
-    config
-);
-ExtractedDocument result = output.results().get(0);
-// Each chunk's content is prefixed with its heading breadcrumb
-result.chunks().forEach(chunk ->
-    System.out.println(chunk.content().substring(0, Math.min(100, chunk.content().length())))
-);
-```

@@ -18,6 +18,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(sceptre_ocr)");
     if std::env::var_os("CARGO_FEATURE_SCEPTRE_OCR_ORT").is_some()
         || std::env::var_os("CARGO_FEATURE_SCEPTRE_OCR_TRACT").is_some()
+        || std::env::var_os("CARGO_FEATURE_SCEPTRE_OCR_CANDLE").is_some()
     {
         println!("cargo::rustc-cfg=sceptre_ocr");
     }

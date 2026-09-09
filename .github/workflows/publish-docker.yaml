@@ -47,6 +47,9 @@ permissions:
 jobs:
   prepare:
     name: Prepare metadata
+    if: >-
+      ${{ github.event_name != 'release'
+      || startsWith(github.event.release.tag_name, 'v') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -204,6 +207,17 @@ jobs:
             docx/**
             images/**
             doc/**
+
+      # fetch-test-documents stages every object through `mktemp` (mode 0600) and
+      # copies it into place with plain `cp`, so the corpus lands readable only by
+      # the runner user. The core and full images run as the unprivileged `xberg`
+      # user (`USER xberg`), which then cannot read the /data:ro mount at all --
+      # both failed with `Cache error: Failed to open file for hashing: Permission
+      # denied (os error 13)` while the cli image, which has no USER directive and
+      # so runs as root, passed. The durable fix belongs upstream in
+      # xberg-io/actions/fetch-test-documents; this keeps the mount readable meanwhile.
+      - name: Make fetched fixtures readable inside the container
+        run: chmod -R a+rX test_documents
 
       - name: Decide whether to build
         id: gate
@@ -408,9 +422,16 @@ jobs:
         if: ${{ steps.check.outputs.push == 'true' }}
         working-directory: /tmp/digests
         run: |
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ matrix.image }}@sha256:%s ' *)
+          mapfile -t tags < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          tag_args=()
+          for tag in "${tags[@]}"; do
+            tag_args+=("-t" "$tag")
+          done
+          digest_args=()
+          for digest in *; do
+            digest_args+=("${{ matrix.image }}@sha256:$digest")
+          done
+          docker buildx imagetools create "${tag_args[@]}" "${digest_args[@]}"
 
       - name: Inspect published manifest
         if: ${{ steps.check.outputs.push == 'true' }}

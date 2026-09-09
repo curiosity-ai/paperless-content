@@ -115,8 +115,13 @@ pub(crate) fn render_mesh_shading(
         4..=7 => {
             let data = match shading_obj.decode_stream_data() {
                 Ok(d) => d,
-                Err(e) => {
-                    tracing::warn!("Mesh shading type {shading_type}: stream decode failed: {e}");
+                Err(error) => {
+                    tracing::warn!(
+                        shading_type,
+                        error_code = error.telemetry_code(),
+                        error_offset = ?error.telemetry_offset(),
+                        "mesh shading stream decode failed"
+                    );
                     return Ok(());
                 }
             };

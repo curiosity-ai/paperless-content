@@ -10,12 +10,13 @@
 /// 2. Download on a cache miss unless Hugging Face offline mode is enabled.
 /// 3. Verify SHA-256 on every warm or cold resolution and repair corrupt entries.
 /// 4. Return the snapshot artifact path directly, without an Xberg-owned copy.
-use std::path::PathBuf;
-
-#[cfg(test)]
+#[cfg(paddle_ocr)]
 use std::fs;
-#[cfg(test)]
+#[cfg(paddle_ocr)]
+use std::io::Read;
+#[cfg(all(test, paddle_ocr))]
 use std::path::Path;
+use std::path::PathBuf;
 
 #[cfg(paddle_ocr)]
 use crate::error::XbergError;
@@ -425,6 +426,52 @@ impl ModelManager {
     #[cfg(test)]
     pub(crate) fn cache_dir(&self) -> &PathBuf {
         &self.cache_dir
+    }
+
+    #[cfg(paddle_ocr)]
+    fn manifest_cache_path(&self, relative_path: &str) -> PathBuf {
+        self.cache_dir
+            .join("models--xberg-io--paddleocr-onnx-models")
+            .join("snapshots")
+            .join(HF_REPO_REVISION)
+            .join(relative_path)
+    }
+
+    #[cfg(paddle_ocr)]
+    pub(crate) fn probe_manifest_presence(&self) -> (usize, usize, usize) {
+        let mut present = 0;
+        let mut missing = 0;
+        let mut invalid = 0;
+        for entry in Self::manifest() {
+            let path = self.manifest_cache_path(&entry.relative_path);
+            let metadata = match fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    missing += 1;
+                    continue;
+                }
+                Err(_) => {
+                    invalid += 1;
+                    continue;
+                }
+            };
+            if metadata.len() != entry.size_bytes {
+                invalid += 1;
+                continue;
+            }
+            let readable = fs::File::open(path)
+                .and_then(|mut file| {
+                    let mut byte = [0_u8; 1];
+                    file.read_exact(&mut byte)
+                })
+                .is_ok();
+            if readable {
+                present += 1;
+            } else {
+                invalid += 1;
+            }
+        }
+        (present, missing, invalid)
     }
 
     /// Ensures a recognition model for the given script family exists locally.
@@ -1169,6 +1216,37 @@ mod check_cached_tests {
             .unwrap();
         assert!(artifacts.len() >= 4, "det + cls + rec + dict, got {artifacts:?}");
         assert!(artifacts.iter().all(|(_, cached)| !cached));
+    }
+
+    #[test]
+    fn bounded_manifest_probe_does_not_hash_exact_size_artifact() {
+        let temp = TempDir::new().unwrap();
+        let manager = ModelManager::new(temp.path().to_path_buf());
+        let entry = ModelManager::manifest().into_iter().next().unwrap();
+        let path = manager.manifest_cache_path(&entry.relative_path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = fs::File::create(path).unwrap();
+        file.set_len(entry.size_bytes).unwrap();
+
+        let (present, missing, invalid) = manager.probe_manifest_presence();
+        assert_eq!(present, 1);
+        assert_eq!(missing, ModelManager::manifest().len() - 1);
+        assert_eq!(invalid, 0);
+    }
+
+    #[test]
+    fn bounded_manifest_probe_reports_wrong_size_artifact_invalid() {
+        let temp = TempDir::new().unwrap();
+        let manager = ModelManager::new(temp.path().to_path_buf());
+        let entry = ModelManager::manifest().into_iter().next().unwrap();
+        let path = manager.manifest_cache_path(&entry.relative_path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"truncated").unwrap();
+
+        let (present, missing, invalid) = manager.probe_manifest_presence();
+        assert_eq!(present, 0);
+        assert_eq!(missing, ModelManager::manifest().len() - 1);
+        assert_eq!(invalid, 1);
     }
 
     #[test]

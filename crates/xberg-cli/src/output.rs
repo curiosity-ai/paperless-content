@@ -9,7 +9,7 @@
 
 use serde::Serialize;
 use std::io::Write;
-use xberg::{ExtractedDocument, ProcessingWarning};
+use xberg::{ExtractedDocument, ExtractionErrorItem, ProcessingWarning};
 
 /// Prefix for every processing-warning line.
 ///
@@ -160,7 +160,10 @@ pub struct BatchEnvelope {
     ///
     /// This has one entry per requested input even when an input yields multiple
     /// entries in `results`.
-    pub per_file_ms: Vec<f64>,
+    pub per_file_ms: Vec<Option<f64>>,
+    /// Per-input failures, omitted when every input succeeded.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<ExtractionErrorItem>,
 }
 
 #[cfg(test)]

@@ -1184,7 +1184,7 @@ impl InternalDocumentExtractor for OrgModeExtractor {
     }
 
     fn supported_mime_types(&self) -> &[&str] {
-        &["text/x-org", "text/org", "application/x-org"]
+        &["text/org", "text/x-org", "application/x-org"]
     }
 
     fn priority(&self) -> i32 {

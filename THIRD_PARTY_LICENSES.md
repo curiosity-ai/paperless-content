@@ -85,3 +85,22 @@ platform's `libheif` build links it.
   `reranker`, `auto-rotate`, transcription). License: MIT. Linked dynamically
   (system `libonnxruntime.so`) in the musl/container builds; bundled per the
   `ort-bundled` feature (official Microsoft binaries) otherwise.
+
+## Tesseract OCR + Leptonica
+
+- **Feature:** `xberg-tesseract` builds Tesseract 5.5.3 at commit
+  `db0ec62f81b0737fbbe184d8fea40af5738f8eef` and Leptonica 1.87.0 at commit
+  `13275a278eb55b5746e33f95fbf5a2c8f604b3ab` when `build-tesseract` or
+  `build-tesseract-wasm` is enabled.
+- **Licenses:** Tesseract is Apache-2.0; the exact upstream text is preserved in
+  [`crates/xberg-tesseract/licenses/tesseract-LICENSE`](crates/xberg-tesseract/licenses/tesseract-LICENSE).
+  Leptonica is BSD-2-Clause; the exact upstream notice is preserved in
+  [`crates/xberg-tesseract/licenses/leptonica-LICENSE`](crates/xberg-tesseract/licenses/leptonica-LICENSE).
+- **Linking:** both native libraries are built from their checksum-verified
+  source archives and statically linked into the consuming artifact. Their
+  permissive licenses permit static linking when the license texts and notices
+  accompany redistribution.
+- **Model redistribution:** `eng.traineddata` is redistributed from
+  `tessdata_fast` commit `87416418657359cb625c412a48b6e1d6d41c29bd` after
+  checksum verification. `tessdata_fast` uses the same Apache-2.0 license text
+  as Tesseract, so the preserved Tesseract license covers the model artifact.

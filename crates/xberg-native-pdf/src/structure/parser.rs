@@ -388,11 +388,12 @@ fn parse_struct_elem(
                             visited,
                         );
                     }
-                    Err(e) => {
+                    Err(error) => {
                         tracing::warn!(
                             object_id = obj_ref.id,
                             generation = obj_ref.generation,
-                            error = %e,
+                            error_code = error.telemetry_code(),
+                            error_offset = ?error.telemetry_offset(),
                             "OBJR: failed to load /Obj"
                         );
                         return Ok(None);
@@ -454,8 +455,13 @@ fn parse_struct_elem(
         if let Object::Reference(r) = k_obj_raw {
             let k_resolved = match document.load_object(*r) {
                 Ok(obj) => obj,
-                Err(e) => {
-                    tracing::warn!(object_id = r.id, error = %e, "failed to load /K reference");
+                Err(error) => {
+                    tracing::warn!(
+                        object_id = r.id,
+                        error_code = error.telemetry_code(),
+                        error_offset = ?error.telemetry_offset(),
+                        "failed to load /K reference"
+                    );
                     return Ok(Some(struct_elem));
                 }
             };
@@ -605,11 +611,12 @@ fn parse_k_children(
                                     }
                                 }
                             }
-                            Err(e) => {
+                            Err(error) => {
                                 tracing::warn!(
                                     object_id = obj_ref.id,
                                     generation = obj_ref.generation,
-                                    error = %e,
+                                    error_code = error.telemetry_code(),
+                                    error_offset = ?error.telemetry_offset(),
                                     "failed to resolve ObjectRef"
                                 );
                             }
@@ -663,11 +670,12 @@ fn parse_k_children(
                         }
                     }
                 }
-                Err(e) => {
+                Err(error) => {
                     tracing::warn!(
                         object_id = obj_ref.id,
                         generation = obj_ref.generation,
-                        error = %e,
+                        error_code = error.telemetry_code(),
+                        error_offset = ?error.telemetry_offset(),
                         "failed to resolve ObjectRef"
                     );
                 }
@@ -788,11 +796,12 @@ fn resolve_mcr_scope(
 
     let stm_obj = match document.load_object(stm_ref) {
         Ok(o) => o,
-        Err(e) => {
+        Err(error) => {
             tracing::warn!(
                 object_id = stm_ref.id,
                 generation = stm_ref.generation,
-                error = %e,
+                error_code = error.telemetry_code(),
+                error_offset = ?error.telemetry_offset(),
                 "MCR /Stm could not be resolved; defaulting to page scope"
             );
             return McidScope::Page(page);

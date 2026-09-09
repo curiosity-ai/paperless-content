@@ -296,6 +296,46 @@ fn subset_missing_glyph_pdf() -> Vec<u8> {
     build_pdf(&[font_dict.to_string(), descriptor.to_string()], &content, &font, 7)
 }
 
+fn simple_truetype_with_zero_widths(content: &str, mappings: &[(u8, u16)], widths: &str) -> Vec<u8> {
+    let font = test_font(CmapKind::ByteIndexed, 3);
+    let mut bfchars = String::new();
+    for &(code, unicode) in mappings {
+        bfchars.push_str(&format!("<{code:02X}> <{unicode:04X}>\n"));
+    }
+    let tounicode = format!(
+        "/CIDInit /ProcSet findresource begin\n\
+         12 dict begin begincmap\n\
+         /CMapName /ZeroWidthChars def /CMapType 2 def\n\
+         1 begincodespacerange <00> <FF> endcodespacerange\n\
+         {} beginbfchar\n{}endbfchar\n\
+         endcmap CMapName currentdict /CMap defineresource pop end end",
+        mappings.len(),
+        bfchars
+    );
+    let descriptor = "<< /Type /FontDescriptor /FontName /CharBox /Flags 4 \
+                      /FontBBox [0 0 450 700] /ItalicAngle 0 /Ascent 800 /Descent -200 \
+                      /CapHeight 700 /StemV 80 /FontFile2 8 0 R >>";
+    let font_dict = format!(
+        "<< /Type /Font /Subtype /TrueType /BaseFont /CharBox /FirstChar 65 \
+         /LastChar 67 /Widths [{widths}] /FontDescriptor 6 0 R /ToUnicode 7 0 R >>"
+    );
+    let tounicode_obj = format!("<< /Length {} >>\nstream\n{tounicode}\nendstream", tounicode.len() + 1);
+    build_pdf(&[font_dict, descriptor.to_string(), tounicode_obj], content, &font, 8)
+}
+
+fn type3_zero_width_pdf() -> Vec<u8> {
+    let font = test_font(CmapKind::ByteIndexed, 1);
+    let content = "BT /F1 10 Tf 20 100 Td (AA) Tj ET";
+    let char_proc = "0 0 d0\n0 0 450 700 re f";
+    let font_dict = "<< /Type /Font /Subtype /Type3 /BaseFont /Overlay \
+                     /FontBBox [0 0 450 700] /FontMatrix [0.001 0 0 0.001 0 0] \
+                     /CharProcs << /A 6 0 R >> \
+                     /Encoding << /Type /Encoding /Differences [65 /A] >> \
+                     /FirstChar 65 /LastChar 65 /Widths [0] /Resources << >> >>";
+    let char_proc_obj = format!("<< /Length {} >>\nstream\n{char_proc}\nendstream", char_proc.len() + 1);
+    build_pdf(&[font_dict.to_string(), char_proc_obj], content, &font, 7)
+}
+
 /// The decoded string, the per-char sequence, and each char's advance.
 fn chars_and_advances(pdf: Vec<u8>) -> (String, Vec<char>, Vec<f32>) {
     let doc = PdfDocument::from_bytes(pdf).expect("fixture parses");
@@ -357,6 +397,61 @@ fn subset_missing_glyph_keeps_the_character_in_extraction() {
     assert_eq!(seq, vec!['A', 'B']);
 }
 
+#[test]
+fn malformed_zero_width_spacing_glyph_uses_embedded_advance_for_extraction() {
+    let pdf = simple_truetype_with_zero_widths("BT /F1 10 Tf 20 100 Td (AAA) Tj ET", &[(65, 0x003F)], "0 600 700");
+    let (text, seq, advances) = chars_and_advances(pdf);
+    assert_eq!(text, "???");
+    assert_eq!(seq, vec!['?', '?', '?']);
+    assert_advances(&advances, &[5.0, 5.0]);
+}
+
+#[test]
+fn zero_width_combining_mark_remains_an_overlay() {
+    let pdf = simple_truetype_with_zero_widths(
+        "BT /F1 10 Tf 20 100 Td (ABC) Tj ET",
+        &[(65, 0x0041), (66, 0x0301), (67, 0x0042)],
+        "500 0 600",
+    );
+    let (_, seq, advances) = chars_and_advances(pdf);
+    assert_eq!(seq, vec!['A', '\u{301}', 'B']);
+    assert_advances(&advances, &[5.0, 0.0]);
+}
+
+#[test]
+fn type3_zero_width_glyph_remains_an_overlay() {
+    let (text, seq, advances) = chars_and_advances(type3_zero_width_pdf());
+    assert_eq!(text, "AA");
+    assert_eq!(seq, vec!['A']);
+    assert!(
+        advances.is_empty(),
+        "overlay glyphs must share one origin: {advances:?}"
+    );
+}
+
+#[test]
+fn explicit_tj_displacement_remains_authoritative_for_zero_width_glyph() {
+    let pdf = simple_truetype_with_zero_widths(
+        "BT /F1 10 Tf 20 100 Td [(A) 500 (A)] TJ ET",
+        &[(65, 0x003F)],
+        "0 600 700",
+    );
+    let (text, seq, advances) = chars_and_advances(pdf);
+    assert_eq!(text, "??");
+    assert_eq!(seq, vec!['?', '?']);
+    assert_advances(&advances, &[5.0]);
+}
+
+#[test]
+fn zero_tj_number_does_not_disable_malformed_width_repair() {
+    let pdf =
+        simple_truetype_with_zero_widths("BT /F1 10 Tf 20 100 Td [(A) 0 (A)] TJ ET", &[(65, 0x003F)], "0 600 700");
+    let (text, seq, advances) = chars_and_advances(pdf);
+    assert_eq!(text, "??");
+    assert_eq!(seq, vec!['?', '?']);
+    assert_advances(&advances, &[5.0]);
+}
+
 mod render_parity {
     use super::*;
     use xberg_native_pdf::extractors::warnings::{WarningCategory, drain_global_warnings};
@@ -370,7 +465,11 @@ mod render_parity {
     /// hide the race.
     static SINK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn glyph_drop_warnings_for(pdf: Vec<u8>, needle: &str) -> Vec<String> {
+    /// No font-name filter: `report_drops` renders the name as the literal
+    /// `redacted`, so matching a drop warning against the fixture's font name
+    /// never fires. The `SINK` lock plus the drain-before-render below is what
+    /// makes the drained warnings attributable to this render. ~keep
+    fn glyph_drop_warnings_for(pdf: Vec<u8>) -> Vec<String> {
         let _sink = SINK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let doc = PdfDocument::from_bytes(pdf).expect("fixture parses");
         let _ = drain_global_warnings();
@@ -379,7 +478,6 @@ mod render_parity {
             .into_iter()
             .filter(|w| w.category == WarningCategory::GlyphDropped)
             .map(|w| w.message)
-            .filter(|m| m.contains(needle))
             .collect()
     }
 
@@ -392,7 +490,7 @@ mod render_parity {
             ("unicode-cmap", simple_truetype_pdf(CmapKind::WindowsUnicode, "ABC")),
             ("type0-identity", type0_identity_pdf()),
         ] {
-            let warnings = glyph_drop_warnings_for(pdf, "CharBox");
+            let warnings = glyph_drop_warnings_for(pdf);
             assert!(warnings.is_empty(), "{label}: unexpected drop warnings: {warnings:?}");
         }
     }
@@ -401,7 +499,7 @@ mod render_parity {
     /// layer (test above) and surfaces as exactly one drop warning here.
     #[test]
     fn subset_missing_glyph_raises_one_drop_warning() {
-        let warnings = glyph_drop_warnings_for(subset_missing_glyph_pdf(), "AAAAAA+CharBox");
+        let warnings = glyph_drop_warnings_for(subset_missing_glyph_pdf());
         assert_eq!(warnings.len(), 1, "expected one drop warning: {warnings:?}");
         assert!(
             warnings[0].contains("0x42"),

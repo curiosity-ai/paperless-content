@@ -900,7 +900,7 @@ impl InternalDocumentExtractor for TypstExtractor {
     }
 
     fn supported_mime_types(&self) -> &[&str] {
-        &["application/x-typst", "text/x-typst"]
+        &["text/vnd.typst", "text/x-typst", "application/x-typst"]
     }
 
     fn priority(&self) -> i32 {

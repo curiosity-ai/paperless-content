@@ -4,6 +4,7 @@
 //! Uses shared download/checksum utilities from [`crate::model_download`].
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::layout::error::LayoutError;
@@ -197,6 +198,36 @@ struct ModelDefinition {
     size_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ModelCacheProbe {
+    Present,
+    Missing,
+    Invalid(String),
+}
+
+fn probe_model_file(path: &Path, expected_size: u64, label: &str) -> ModelCacheProbe {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return ModelCacheProbe::Missing,
+        Err(error) => return ModelCacheProbe::Invalid(format!("cannot inspect cached {label} model: {error}")),
+    };
+    if metadata.len() != expected_size {
+        return ModelCacheProbe::Invalid(format!(
+            "cached {label} model has size {} bytes; expected {expected_size}",
+            metadata.len()
+        ));
+    }
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => return ModelCacheProbe::Invalid(format!("cached {label} model is not readable: {error}")),
+    };
+    let mut byte = [0_u8; 1];
+    match file.read_exact(&mut byte) {
+        Ok(()) => ModelCacheProbe::Present,
+        Err(error) => ModelCacheProbe::Invalid(format!("cached {label} model is not readable: {error}")),
+    }
+}
+
 fn hf_cache_relative_path(definition: &ModelDefinition) -> String {
     let repo = definition.hf_repo_id.replace('/', "--");
     format!(
@@ -204,6 +235,8 @@ fn hf_cache_relative_path(definition: &ModelDefinition) -> String {
         definition.hf_revision, definition.remote_filename
     )
 }
+
+pub(crate) const RTDETR_MODEL_SIZE_BYTES: u64 = 169_089_059;
 
 const MODELS: &[ModelDefinition] = &[
     ModelDefinition {
@@ -213,7 +246,7 @@ const MODELS: &[ModelDefinition] = &[
         remote_filename: "rtdetr/model.onnx",
         local_filename: "model.onnx",
         sha256_checksum: "3bf2fb0ee6df87435b7ae47f0f3930ec3dc97ec56fd824acc6d57bc7a6b89ef2",
-        size_bytes: 169_089_059,
+        size_bytes: RTDETR_MODEL_SIZE_BYTES,
     },
     ModelDefinition {
         model_type: "tatr",
@@ -472,9 +505,11 @@ impl LayoutModelManager {
     }
 
     fn is_model_cached(&self, model_type: &str) -> bool {
-        let Some(definition) = MODELS.iter().find(|model| model.model_type == model_type) else {
-            return false;
-        };
+        self.verified_model_path(model_type).is_some()
+    }
+
+    pub(crate) fn verified_model_path(&self, model_type: &str) -> Option<PathBuf> {
+        let definition = MODELS.iter().find(|model| model.model_type == model_type)?;
         if self.stage_in_xberg_cache {
             let path = self.cache_dir.join(model_type).join(definition.local_filename);
             return verify_model_file(
@@ -483,7 +518,8 @@ impl LayoutModelManager {
                 definition.sha256_checksum,
                 definition.model_type,
             )
-            .is_ok();
+            .is_ok()
+            .then_some(path);
         }
         model_download::hf_cached_revision(
             definition.hf_repo_id,
@@ -492,7 +528,7 @@ impl LayoutModelManager {
         )
         .ok()
         .flatten()
-        .is_some_and(|path| {
+        .and_then(|path| {
             verify_model_file(
                 &path,
                 definition.size_bytes,
@@ -500,7 +536,41 @@ impl LayoutModelManager {
                 definition.model_type,
             )
             .is_ok()
+            .then_some(path)
         })
+    }
+
+    #[cfg(feature = "pdf")]
+    pub(crate) fn is_model_verified(&self, model_type: &str) -> bool {
+        self.verified_model_path(model_type).is_some()
+    }
+
+    #[cfg(all(test, feature = "layout-detection", feature = "pdf"))]
+    pub(crate) fn model_test_spec(model_type: &str) -> Option<(&'static str, u64)> {
+        MODELS
+            .iter()
+            .find(|model| model.model_type == model_type)
+            .map(|model| (model.local_filename, model.size_bytes))
+    }
+
+    pub(crate) fn probe_model_cache(&self, model_type: &str) -> ModelCacheProbe {
+        let Some(definition) = MODELS.iter().find(|model| model.model_type == model_type) else {
+            return ModelCacheProbe::Invalid(format!("unknown model type: {model_type}"));
+        };
+        if self.stage_in_xberg_cache {
+            let path = self.cache_dir.join(model_type).join(definition.local_filename);
+            return probe_model_file(&path, definition.size_bytes, definition.model_type);
+        }
+        let path = match model_download::hf_cached_revision(
+            definition.hf_repo_id,
+            definition.remote_filename,
+            definition.hf_revision,
+        ) {
+            Ok(Some(path)) => path,
+            Ok(None) => return ModelCacheProbe::Missing,
+            Err(error) => return ModelCacheProbe::Invalid(error),
+        };
+        probe_model_file(&path, definition.size_bytes, definition.model_type)
     }
 
     /// Returns the manifest of all layout model files with checksums and sizes.
@@ -552,6 +622,39 @@ impl LayoutModelManager {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn cache_only_capability_checks_do_not_create_directories() {
+        let root = TempDir::new().unwrap();
+        let cache = root.path().join("absent-layout-cache");
+        let manager = LayoutModelManager::new(Some(cache.clone()));
+
+        assert!(!manager.is_rtdetr_cached());
+        assert!(!manager.is_pp_doclayout_v3_cached());
+        assert!(!manager.is_tatr_cached());
+        assert_eq!(manager.probe_model_cache("slanet_wired"), ModelCacheProbe::Missing);
+        assert_eq!(manager.probe_model_cache("slanet_wireless"), ModelCacheProbe::Missing);
+        assert_eq!(manager.probe_model_cache("slanet_plus"), ModelCacheProbe::Missing);
+        assert_eq!(manager.probe_model_cache("table_classifier"), ModelCacheProbe::Missing);
+        assert!(
+            !cache.exists(),
+            "cache-only doctor probes must not create model directories"
+        );
+    }
+
+    #[test]
+    fn doctor_cache_probe_uses_metadata_without_hashing_model_contents() {
+        let root = TempDir::new().unwrap();
+        let definition = MODELS.iter().find(|model| model.model_type == "rtdetr").unwrap();
+        let model_dir = root.path().join(definition.model_type);
+        fs::create_dir_all(&model_dir).unwrap();
+        let model_path = model_dir.join(definition.local_filename);
+        let model_file = fs::File::create(&model_path).unwrap();
+        model_file.set_len(definition.size_bytes).unwrap();
+
+        let manager = LayoutModelManager::new(Some(root.path().to_path_buf()));
+        assert_eq!(manager.probe_model_cache("rtdetr"), ModelCacheProbe::Present);
+    }
 
     #[test]
     fn atomic_publish_yields_complete_file_under_concurrency() {

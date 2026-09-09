@@ -25,10 +25,15 @@ def _get_peak_memory_bytes() -> int:
     return usage.ru_maxrss
 
 
-def extract_sync(file_path: str) -> dict:
+def extract_sync(file_path: str, ocr_enabled: bool) -> dict:
     """Extract using PyMuPDF4LLM."""
     start = time.perf_counter()
-    markdown = pymupdf4llm.to_markdown(file_path, show_progress=False, write_images=False)
+    markdown = pymupdf4llm.to_markdown(
+        file_path,
+        show_progress=False,
+        use_ocr=ocr_enabled,
+        write_images=False,
+    )
     duration_ms = (time.perf_counter() - start) * 1000.0
 
     return {
@@ -108,7 +113,7 @@ def _parse_path(line: str) -> str:
     return stripped
 
 
-def run_server(timeout=None) -> None:
+def run_server(ocr_enabled: bool, timeout=None) -> None:
     """Persistent server mode."""
     print("READY", flush=True)
     for line in sys.stdin:
@@ -116,10 +121,10 @@ def run_server(timeout=None) -> None:
         if not file_path:
             continue
         if timeout is not None:
-            result = _run_with_timeout(extract_sync, (file_path,), timeout)
+            result = _run_with_timeout(extract_sync, (file_path, ocr_enabled), timeout)
         else:
             try:
-                result = extract_sync(file_path)
+                result = extract_sync(file_path, ocr_enabled)
             except Exception as e:
                 result = {"error": str(e), "_extraction_time_ms": 0}
         print(json.dumps(result), flush=True)
@@ -151,21 +156,21 @@ def main() -> None:
 
     mode = args[0]
     if mode == "server":
-        run_server(timeout=timeout)
+        run_server(ocr_enabled, timeout=timeout)
     elif mode == "sync":
         if len(args) < 2:
             print("Error: sync mode requires a file path", file=sys.stderr)
             sys.exit(1)
         file_path = args[1]
         try:
-            payload = extract_sync(file_path)
+            payload = extract_sync(file_path, ocr_enabled)
             print(json.dumps(payload), end="")
         except Exception as e:
             print(f"Error extracting with PyMuPDF4LLM: {e}", file=sys.stderr)
             sys.exit(1)
     else:
         try:
-            payload = extract_sync(args[0])
+            payload = extract_sync(args[0], ocr_enabled)
             print(json.dumps(payload), end="")
         except Exception as e:
             print(f"Error extracting with PyMuPDF4LLM: {e}", file=sys.stderr)

@@ -83,6 +83,11 @@ All extraction behavior is controlled through `ExtractionConfig`. Pass it direct
 
 Three formats are supported. TOML is recommended.
 
+Xberg rejects unrecognized keys in its extraction configuration tables. A misspelled nested
+setting fails loading instead of being ignored; use the
+[Configuration Reference](/reference/configuration/) for the authoritative wire names. Settings
+inside `url.crawl` follow crawlberg's configuration schema.
+
 <Tabs syncKey="lang">
 <TabItem label="TOML (Recommended)">
 
@@ -93,9 +98,6 @@ enable_quality_processing = true
 [ocr]
 backend = "tesseract"
 language = "eng"
-
-[ocr.tesseract_config]
-psm = 3
 ```
 
 </TabItem>
@@ -108,8 +110,6 @@ enable_quality_processing: true
 ocr:
   backend: tesseract
   language: eng
-  tesseract_config:
-    psm: 3
 ```
 
 </TabItem>
@@ -121,10 +121,7 @@ ocr:
   "enable_quality_processing": true,
   "ocr": {
     "backend": "tesseract",
-    "language": "eng",
-    "tesseract_config": {
-      "psm": 3
-    }
+    "language": "eng"
   }
 }
 ```

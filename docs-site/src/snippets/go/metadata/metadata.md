@@ -22,11 +22,11 @@ func main() {
 		if pdf.PageCount != nil {
 			fmt.Printf("Pages: %d\n", *pdf.PageCount)
 		}
-		if pdf.Author != nil {
-			fmt.Printf("Author: %s\n", *pdf.Author)
+		if len(result.Results[0].Metadata.Authors) > 0 {
+			fmt.Printf("Authors: %s\n", strings.Join(result.Results[0].Metadata.Authors, ", "))
 		}
-		if pdf.Title != nil {
-			fmt.Printf("Title: %s\n", *pdf.Title)
+		if result.Results[0].Metadata.Title != nil {
+			fmt.Printf("Title: %s\n", *result.Results[0].Metadata.Title)
 		}
 	}
 

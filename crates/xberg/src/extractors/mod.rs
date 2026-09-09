@@ -74,6 +74,9 @@ pub mod security;
 #[cfg(test)]
 mod security_tests;
 
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
+
 #[cfg(any(feature = "ocr", feature = "ocr-wasm", feature = "ocr-pipeline"))]
 pub mod image;
 
@@ -134,6 +137,7 @@ pub mod fictionbook;
 pub mod doctags;
 
 pub mod markdown;
+pub(crate) mod myst;
 
 #[cfg(feature = "mdx")]
 pub mod mdx;
@@ -193,6 +197,9 @@ pub use markdown::MarkdownExtractor;
 pub use structured::StructuredExtractor;
 pub use text::PlainTextExtractor;
 pub use vtt::WebVttExtractor;
+
+#[cfg(feature = "sqlite")]
+pub use sqlite::SqliteExtractor;
 
 #[cfg(any(feature = "ocr", feature = "ocr-wasm", feature = "ocr-pipeline"))]
 pub use image::ImageExtractor;
@@ -357,6 +364,9 @@ pub(crate) fn register_default_extractors() -> Result<()> {
     registry.register_internal(Arc::new(CsvExtractor::new()))?;
     registry.register_internal(Arc::new(DocTagsExtractor::new()))?;
 
+    #[cfg(feature = "sqlite")]
+    registry.register_internal(Arc::new(SqliteExtractor::new()))?;
+
     #[cfg(any(feature = "ocr", feature = "ocr-wasm", feature = "ocr-pipeline"))]
     registry.register_internal(Arc::new(ImageExtractor::new()))?;
 
@@ -477,6 +487,12 @@ mod tests {
         assert!(extractor_names.contains(&"djot-extractor".to_string()));
         assert!(extractor_names.contains(&"csv-extractor".to_string()));
         assert!(extractor_names.contains(&"doctags-extractor".to_string()));
+
+        #[cfg(feature = "sqlite")]
+        {
+            expected_count += 1;
+            assert!(extractor_names.contains(&"sqlite-extractor".to_string()));
+        }
 
         #[cfg(any(feature = "ocr", feature = "ocr-wasm", feature = "ocr-pipeline"))]
         {

@@ -39,6 +39,8 @@ use crate::Result;
 use std::path::Path;
 
 #[cfg(all(feature = "profiling", not(target_os = "windows")))]
+use std::fmt::Write as _;
+#[cfg(all(feature = "profiling", not(target_os = "windows")))]
 use std::time::Duration;
 
 /// CPU profiler with RAII semantics
@@ -212,14 +214,35 @@ impl ProfilingResult {
         let file = std::fs::File::create(output_path)
             .map_err(|e| crate::Error::Profiling(format!("Failed to create output file: {}", e)))?;
 
-        self.report
-            .flamegraph(file)
-            .map_err(|e| crate::Error::Profiling(format!("Failed to generate flamegraph: {}", e)))?;
+        let folded_stacks = folded_stack_lines(&self.report.data);
+        if !folded_stacks.is_empty() {
+            let mut options = inferno::flamegraph::Options::default();
+            inferno::flamegraph::from_lines(&mut options, folded_stacks.iter().map(String::as_str), file)
+                .map_err(|e| crate::Error::Profiling(format!("Failed to generate flamegraph: {}", e)))?;
+        }
 
         eprintln!("Flamegraph written to: {}", output_path.display());
 
         Ok(())
     }
+}
+
+#[cfg(all(feature = "profiling", not(target_os = "windows")))]
+fn folded_stack_lines(samples: &std::collections::HashMap<pprof::Frames, isize>) -> Vec<String> {
+    samples
+        .iter()
+        .map(|(frames, sample_count)| {
+            let mut line = frames.thread_name_or_id();
+            for frame in frames.frames.iter().rev() {
+                for symbol in frame.iter().rev() {
+                    write!(&mut line, ";{symbol}").expect("writing a folded stack into a String cannot fail");
+                }
+            }
+            line.push(' ');
+            line.push_str(&sample_count.to_string());
+            line
+        })
+        .collect()
 }
 
 /// No-op profiling support when feature is disabled or on Windows
@@ -368,8 +391,39 @@ mod tests {
 
     #[cfg(all(feature = "profiling", not(target_os = "windows")))]
     mod profiling_enabled {
-        use crate::profiling::ProfileGuard;
+        use crate::profiling::{ProfileGuard, folded_stack_lines};
+        use pprof::{Frames, Symbol};
+        use std::collections::HashMap;
+        use std::time::SystemTime;
         use tempfile::TempDir;
+
+        #[test]
+        fn folded_stack_lines_preserve_pprof_stack_order_and_counts() {
+            let frames = Frames {
+                frames: vec![
+                    vec![symbol("leaf-inner"), symbol("leaf-outer")],
+                    vec![symbol("root-inner"), symbol("root-outer")],
+                ],
+                thread_name: "worker".to_string(),
+                thread_id: 42,
+                sample_timestamp: SystemTime::UNIX_EPOCH,
+            };
+            let samples = HashMap::from([(frames, 7)]);
+
+            assert_eq!(
+                folded_stack_lines(&samples),
+                vec!["worker;root-outer;root-inner;leaf-outer;leaf-inner 7"]
+            );
+        }
+
+        fn symbol(name: &str) -> Symbol {
+            Symbol {
+                name: Some(name.as_bytes().to_vec()),
+                addr: None,
+                lineno: None,
+                filename: None,
+            }
+        }
 
         #[test]
         #[ignore]

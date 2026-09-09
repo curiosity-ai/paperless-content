@@ -31,8 +31,8 @@ fn stream_with_filter_and_decode_parms(
 ) -> Object {
     let mut dict = HashMap::new();
     dict.insert("Filter".to_string(), Object::Name(filter.to_string()));
-    if let Some(parms) = decode_parms {
-        dict.insert("DecodeParms".to_string(), Object::Dictionary(parms));
+    if let Some(params) = decode_parms {
+        dict.insert("DecodeParms".to_string(), Object::Dictionary(params));
     }
     Object::Stream {
         dict,
@@ -41,12 +41,12 @@ fn stream_with_filter_and_decode_parms(
 }
 
 fn decode_parms_dict(predictor: i64, columns: i64, colors: i64, bits_per_component: i64) -> HashMap<String, Object> {
-    let mut parms = HashMap::new();
-    parms.insert("Predictor".to_string(), Object::Integer(predictor));
-    parms.insert("Columns".to_string(), Object::Integer(columns));
-    parms.insert("Colors".to_string(), Object::Integer(colors));
-    parms.insert("BitsPerComponent".to_string(), Object::Integer(bits_per_component));
-    parms
+    let mut params = HashMap::new();
+    params.insert("Predictor".to_string(), Object::Integer(predictor));
+    params.insert("Columns".to_string(), Object::Integer(columns));
+    params.insert("Colors".to_string(), Object::Integer(colors));
+    params.insert("BitsPerComponent".to_string(), Object::Integer(bits_per_component));
+    params
 }
 
 // ---------------------------------------------------------------------------

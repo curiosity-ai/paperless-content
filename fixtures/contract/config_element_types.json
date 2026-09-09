@@ -14,8 +14,7 @@
           "fields": [
             "element_type",
             "text"
-          ],
-          "display": true
+          ]
         }
       ]
     },

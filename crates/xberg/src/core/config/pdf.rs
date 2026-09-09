@@ -60,6 +60,7 @@ impl fmt::Display for PdfBackend {
 /// PDF-specific configuration.
 #[cfg(feature = "pdf")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PdfConfig {
     /// Extract images from PDF
     #[serde(default)]
@@ -95,7 +96,7 @@ pub struct PdfConfig {
     /// Ignored when `ContentFilterConfig.include_headers` is `true`.
     /// Effective nonzero margins require per-page OCR so geometry can be filtered;
     /// document-capable OCR backends use their image-processing path in that case.
-    /// Default: 0.06 (6%)
+    /// Default: 0.0 (disabled; set explicitly to filter header content)
     #[serde(default)]
     pub top_margin_fraction: Option<f32>,
 
@@ -103,7 +104,7 @@ pub struct PdfConfig {
     /// Ignored when `ContentFilterConfig.include_footers` is `true`.
     /// Effective nonzero margins require per-page OCR so geometry can be filtered;
     /// document-capable OCR backends use their image-processing path in that case.
-    /// Default: 0.05 (5%)
+    /// Default: 0.0 (disabled; set explicitly to filter footer content)
     #[serde(default)]
     pub bottom_margin_fraction: Option<f32>,
 
@@ -170,6 +171,7 @@ pub struct PdfConfig {
 /// clustering and semantic analysis. When enabled, hierarchical blocks are
 /// included in page content.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HierarchyConfig {
     /// Enable hierarchy extraction
     #[serde(default = "default_true")]
@@ -509,25 +511,14 @@ mod tests {
         assert!(error.contains("pdfium"), "error must list pdfium, got: {error}");
     }
 
-    /// Documents the known gap from `fixture_config_round_trip.rs`: `PdfConfig` does not
-    /// carry `#[serde(deny_unknown_fields)]` (only `ExtractionConfig` and
-    /// `UrlExtractionConfig` do, repo-wide), so a plausible-but-wrong nested key --
-    /// someone reasonably guessing the field is called `pdf_backend`, mirroring the
-    /// top-level CLI flag and JSON key, rather than the actual wire name `backend` --
-    /// silently parses and the setting never applies; `backend` quietly stays at its
-    /// default (`Native`) with no warning. This test is a regression net: if `PdfConfig`
-    /// ever gains `deny_unknown_fields`, this assertion starts failing (the typo becomes a
-    /// hard parse error) and should be deleted in the same change.
     #[test]
     #[cfg(feature = "pdf")]
-    fn pdf_config_typod_backend_key_is_silently_dropped() {
+    fn pdf_config_rejects_typod_backend_key() {
         let json = serde_json::json!({"extract_tables": true, "pdf_backend": "pdfium"});
-        let config: PdfConfig = serde_json::from_value(json).expect("an unknown key must not be a parse error today");
-        assert_eq!(
-            config.backend,
-            PdfBackend::Native,
-            "the wrong key 'pdf_backend' (the correct wire name is 'backend') must be silently \
-             ignored, leaving backend at its default"
+        let error = serde_json::from_value::<PdfConfig>(json).expect_err("unknown keys must fail deserialization");
+        assert!(
+            error.to_string().contains("pdf_backend"),
+            "the error must name the unknown field: {error}"
         );
     }
 }

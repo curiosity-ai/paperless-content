@@ -1,5 +1,10 @@
 //! Heading classification for paragraphs using font-size clustering.
 
+// TODO(xberg-io/xberg#1567): 4 cyclomatic-complexity and 12 size/complexity findings
+// in this file, currently excluded via the quality-debt baseline in alef.toml. Splitting
+// these needs compiler-in-the-loop verification, not a mechanical pass. Delete this
+// note and the file's baseline entry together once it goes green. Help wanted.
+
 use super::constants::{
     MAX_BOLD_HEADING_WORD_COUNT, MAX_HEADING_DISTANCE_MULTIPLIER, MAX_HEADING_WORD_COUNT, MIN_BLOCKS_FOR_FONT_HEADING,
     MIN_HEADING_FONT_GAP, MIN_HEADING_FONT_RATIO,
@@ -99,7 +104,14 @@ pub(super) fn classify_paragraphs(paragraphs: &mut [PdfParagraph], heading_map: 
         .find(|(_, level)| level.is_none())
         .map(|(centroid, _)| *centroid)
         .unwrap_or(0.0);
-    for para in paragraphs.iter_mut() {
+    let assigned_heading_levels = paragraphs
+        .iter()
+        .map(|paragraph| paragraph.heading_level)
+        .collect::<Vec<_>>();
+    for (para, assigned_heading_level) in paragraphs.iter_mut().zip(&assigned_heading_levels) {
+        if assigned_heading_level.is_some() {
+            continue;
+        }
         let word_count = para.word_count;
 
         let layout_says_text = para.layout_class == Some(super::types::LayoutHintClass::Text);
@@ -246,6 +258,11 @@ pub(super) fn classify_paragraphs(paragraphs: &mut [PdfParagraph], heading_map: 
     }
 
     demote_continuation_headings(paragraphs);
+    for (paragraph, assigned_heading_level) in paragraphs.iter_mut().zip(assigned_heading_levels) {
+        if assigned_heading_level.is_some() {
+            paragraph.heading_level = assigned_heading_level;
+        }
+    }
 
     for para in paragraphs.iter_mut() {
         if para.heading_level.is_some()
@@ -433,7 +450,7 @@ fn is_numeric_prose_continuation(text: &str) -> bool {
 /// marked as code blocks. This handles code snippets that don't have explicit
 /// code block markers.
 fn detect_monospace_code_blocks(paragraphs: &mut [PdfParagraph]) {
-    if paragraphs.len() < 2 {
+    if paragraphs.is_empty() {
         return;
     }
 
@@ -449,6 +466,23 @@ fn detect_monospace_code_blocks(paragraphs: &mut [PdfParagraph]) {
         let is_all_monospace = !para.lines.is_empty() && para.lines.iter().all(|l| l.is_monospace);
 
         if !is_all_monospace {
+            i += 1;
+            continue;
+        }
+
+        // A lone paragraph that already carries two or more monospace lines is a
+        // complete multi-line code listing by itself — it does not need a consecutive
+        // monospace neighbor to qualify, unlike the one-monospace-line-per-paragraph
+        // case merged below (common when code line-leading splits each line into its
+        // own paragraph). This purely font-based signal cannot distinguish a genuine
+        // code listing from a document set entirely in a monospace face, or from a
+        // 2-line caption/table cell that happens to share that font — both are
+        // accepted, pre-existing limitations of this heuristic (unchanged by this
+        // addition, which only mirrors pipeline.rs's identical paragraph-level gate),
+        // not something overlooked here. ~keep
+        if para.lines.len() >= 2 {
+            paragraphs[i].is_code_block = true;
+            paragraphs[i].layout_class = Some(LayoutHintClass::Code);
             i += 1;
             continue;
         }
@@ -1260,6 +1294,36 @@ fn paragraph_plain_text(para: &PdfParagraph) -> String {
         .map(|s| s.text.as_str())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+pub(super) fn is_body_size_bold_signal(para: &PdfParagraph, body_font_size: f32) -> bool {
+    if para.heading_level.is_some()
+        || !para.is_bold
+        || para.is_list_item
+        || para.is_code_block
+        || para.is_formula
+        || para.is_page_furniture
+        || para.lines.len() != 1
+        || !body_font_size.is_finite()
+        || body_font_size <= 0.0
+        || (para.dominant_font_size - body_font_size).abs() > 0.5
+        || para.word_count > MAX_BOLD_HEADING_WORD_COUNT
+    {
+        return false;
+    }
+
+    let text = paragraph_plain_text(para);
+    let trimmed = text.trim();
+    !trimmed.is_empty()
+        && (!ends_with_sentence_period(trimmed) || is_section_pattern(trimmed))
+        && (!trimmed.ends_with(':') || is_all_caps_text(trimmed))
+        && !looks_like_figure_label(trimmed)
+        && !looks_like_bare_url(trimmed)
+        && !super::layout_classify::is_separator_text(trimmed)
+}
+
+pub(super) fn is_body_size_bold_heading_candidate(para: &PdfParagraph, body_font_size: f32) -> bool {
+    is_body_size_bold_signal(para, body_font_size) && para.word_count > 2
 }
 
 /// Preserve peer H2 sections when a sparse document repeats their font tier at
@@ -3175,6 +3239,110 @@ mod tests {
         mark_cross_page_repeating_short_text(&mut pages);
 
         assert!(pages.iter().all(|page| !page[0].is_page_furniture));
+    }
+
+    fn make_line_paragraph(line_count: usize, is_monospace: bool) -> PdfParagraph {
+        let lines: Vec<super::super::types::PdfLine> = (0..line_count)
+            .map(|i| super::super::types::PdfLine {
+                segments: vec![SegmentData {
+                    text: format!("line{i}"),
+                    x: 0.0,
+                    y: 700.0 - i as f32 * 12.0,
+                    width: 40.0,
+                    height: 10.0,
+                    font_size: 10.0,
+                    is_bold: false,
+                    is_italic: false,
+                    is_monospace,
+                    baseline_y: 700.0 - i as f32 * 12.0,
+                    rotation_degrees: 0.0,
+                    assigned_role: None,
+                }],
+                baseline_y: 700.0 - i as f32 * 12.0,
+                dominant_font_size: 10.0,
+                is_bold: false,
+                is_monospace,
+            })
+            .collect();
+        let word_count = PdfParagraph::compute_word_count("", &lines);
+
+        PdfParagraph {
+            text: String::new(),
+            lines,
+            dominant_font_size: 10.0,
+            heading_level: None,
+            is_bold: false,
+            is_list_item: false,
+            is_code_block: false,
+            is_formula: false,
+            is_page_furniture: false,
+            layout_class: None,
+            layout_region_path: None,
+            caption_for: None,
+            block_bbox: None,
+            word_count,
+        }
+    }
+
+    #[test]
+    fn detect_monospace_code_blocks_fences_a_lone_multi_line_paragraph() {
+        // Regression test for GH#1557: a standalone 2-line monospace paragraph (no
+        // consecutive monospace neighbor) must still be recognized as a code block. ~keep
+        let mut paragraphs = vec![make_line_paragraph(2, true), make_line_paragraph(3, false)];
+
+        detect_monospace_code_blocks(&mut paragraphs);
+
+        assert!(
+            paragraphs[0].is_code_block,
+            "a standalone 2-line all-monospace paragraph must be fenced as code"
+        );
+        assert_eq!(paragraphs[0].layout_class, Some(LayoutHintClass::Code));
+        assert!(
+            !paragraphs[1].is_code_block,
+            "an ordinary multi-line prose paragraph must not be fenced as code"
+        );
+    }
+
+    #[test]
+    fn detect_monospace_code_blocks_still_merges_one_line_per_paragraph_listings() {
+        // Pre-existing behavior must be unaffected: a code listing split into
+        // one-line-per-paragraph still merges across consecutive monospace paragraphs. ~keep
+        let mut paragraphs = vec![
+            make_line_paragraph(1, true),
+            make_line_paragraph(1, true),
+            make_line_paragraph(1, true),
+            make_line_paragraph(1, false),
+        ];
+
+        detect_monospace_code_blocks(&mut paragraphs);
+
+        assert!(paragraphs[0].is_code_block);
+        assert!(paragraphs[1].is_code_block);
+        assert!(paragraphs[2].is_code_block);
+        assert!(!paragraphs[3].is_code_block);
+    }
+
+    #[test]
+    fn detect_monospace_code_blocks_renders_singleton_with_original_lines() {
+        let mut paragraph = make_line_paragraph(3, true);
+        paragraph.lines[0].segments[0].text = "import java.net.URI;".to_string();
+        paragraph.lines[1].segments[0].text = "public class Example {".to_string();
+        paragraph.lines[2].segments[0].text = "}".to_string();
+        let mut paragraphs = vec![paragraph];
+
+        detect_monospace_code_blocks(&mut paragraphs);
+
+        assert!(
+            paragraphs[0].is_code_block,
+            "a singleton multi-line listing must be fenced"
+        );
+        let document = super::super::assembly::assemble_internal_document(vec![paragraphs], &[], None, &[]);
+        let markdown = crate::rendering::render_markdown(&document);
+        assert_eq!(
+            markdown.trim(),
+            "```\nimport java.net.URI;\npublic class Example {\n}\n```",
+            "assembly and Markdown rendering must preserve the code listing's physical lines"
+        );
     }
 }
 

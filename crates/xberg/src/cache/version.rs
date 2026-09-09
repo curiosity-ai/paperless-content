@@ -81,7 +81,11 @@
 /// from each other; entries already on disk were written with the always-`1` page baked into
 /// their cached content and a key that cannot distinguish them, and this bump is what makes
 /// them unreachable.
-pub(crate) const CACHE_SCHEMA_VERSION: u32 = 6;
+///
+/// Bumped for built-in extractor provenance: successful built-in extraction now defaults a
+/// missing or unrecognized `extraction_method` to `native`. Cached `ExtractedDocument` values
+/// are returned before extractor dispatch, so schema-6 entries could otherwise retain `None`.
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 7;
 
 /// Number of hex characters in the cache version tag.
 const VERSION_TAG_HEX_LEN: usize = 8;
