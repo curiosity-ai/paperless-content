@@ -62,7 +62,7 @@ steps:
 
 # No test step: the unit tests under dotnet/tests read fixtures from the `test_documents`
 # submodule, whose binaries are not in git — they come from a ~580 MiB bucket fetch (see
-# dotnet/Claude.md, "Re-syncing after an upstream merge"). Parity and corpus runs stay a local
+# CLAUDE.md, "Re-syncing after an upstream merge"). Parity and corpus runs stay a local
 # job; add a test stage here once the corpus is available to the agent.
 
 - task: DotNetCoreCLI@2

@@ -117,9 +117,6 @@ dotnet add package XbergIo.Xberg
 
 See [C# README](https://github.com/xberg-io/xberg/tree/main/packages/csharp) for full documentation.
 
-> This is the FFI binding over the Rust core. For the native managed engine, see
-> [X-Ray.Content](#x-raycontent-native-net-engine) below.
-
 </details>
 
 <details>
@@ -200,48 +197,6 @@ Add via `zig fetch`. See [Zig README](https://github.com/xberg-io/xberg/tree/mai
 Build from source as part of this workspace. See [C (FFI) README](https://github.com/xberg-io/xberg/tree/main/crates/xberg-ffi) for full documentation.
 
 </details>
-
-### X-Ray.Content (native .NET engine)
-
-<img src="dotnet/src/XRay.Content/logo.png" alt="X-Ray" width="160" align="right" />
-
-[![X-Ray.Content on NuGet](https://img.shields.io/nuget/v/X-Ray.Content?label=X-Ray.Content&color=5c2d91&logo=nuget&logoColor=white)](https://www.nuget.org/packages/X-Ray.Content/)
-
-This repository also carries a **native C# port** of the extraction engine under
-[`dotnet/`](dotnet/), published to NuGet as
-[**`X-Ray.Content`**](https://www.nuget.org/packages/X-Ray.Content/) — the content-extraction package of the
-**X-Ray** family of .NET libraries. It is not a binding over the Rust core and shares no
-code with it: every extractor, type and renderer is reimplemented in managed C#, so the package
-is portable and pulls no native dependencies — the opt-in OCR pass is the one documented
-exception. Content extraction only, no transcription, embeddings, chunking or server mode.
-
-```sh
-dotnet add package X-Ray.Content
-```
-
-```csharp
-using XRay.Content.Core;
-
-var result = new Extractor().Extract(
-    ExtractInput.FromUri("report.pdf"),
-    new ExtractionConfig { OutputFormat = OutputFormat.Markdown });
-
-Console.WriteLine(result.Results[0].Content);
-```
-
-| | |
-|---|---|
-| Package | [`X-Ray.Content`](https://www.nuget.org/packages/X-Ray.Content/) on NuGet |
-| Namespace | `XRay.Content` — the package id is hyphenated, a C# identifier cannot be |
-| Package docs | [`dotnet/src/XRay.Content/README.md`](dotnet/src/XRay.Content/README.md) |
-| Architecture & scope | [`dotnet/Claude.md`](dotnet/Claude.md) |
-| Port status | [`dotnet/TODO.md`](dotnet/TODO.md) |
-| Source | [`dotnet/src/XRay.Content/`](dotnet/src/XRay.Content/) |
-| Target framework | `net10.0` |
-| License | `MIT AND Apache-2.0` — see [notices](dotnet/THIRD_PARTY_NOTICES.md) |
-
-> Not to be confused with `XbergIo.Xberg` above: that is upstream's FFI binding over the Rust
-> core, and the two are unrelated packages.
 
 ### CLI & Deployment
 

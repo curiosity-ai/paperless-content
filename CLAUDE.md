@@ -2,13 +2,13 @@
 
 Part of the **X-Ray** family of .NET libraries; this is its content-extraction package.
 
-This directory contains a **native C# port** of the content-extraction engine from the
-Rust [`xberg`](../crates/xberg) crate. It is *not* a wrapper around the Rust library or its
+This repository contains a **native C# port** of the content-extraction engine from the
+Rust [`xberg`](.reference/crates/xberg) crate. It is *not* a wrapper around the Rust library or its
 NuGet package — every extractor, type, and renderer is reimplemented in managed C#, shipped
 as the `X-Ray.Content` NuGet package, whose API lives in the `XRay.Content` namespace (a NuGet id may carry
 a hyphen; a C# identifier may not).
 
-The original Rust sources under [`../crates`](../crates) are left untouched so that upstream
+The original Rust sources under [`.reference/`](.reference) are left untouched so that upstream
 Rust work can be merged and the C# port re-synchronized.
 
 ---
@@ -57,7 +57,7 @@ intermediate representation — `InternalDocument` — and the output format is 
 
 ### The intermediate representation — `InternalDocument`
 
-Rust: `crates/xberg/src/types/internal.rs`. This is the spine of the whole system.
+Rust: `.reference/crates/xberg/src/types/internal.rs`. This is the spine of the whole system.
 
 - `InternalDocument`
   - `Elements: List<InternalElement>` — flat, in reading order.
@@ -92,7 +92,7 @@ Rust: `crates/xberg/src/types/internal.rs`. This is the spine of the whole syste
 
 ### The public result — `ExtractedDocument`
 
-Rust: `crates/xberg/src/types/extraction.rs`. This is the public output type. Fields we
+Rust: `.reference/crates/xberg/src/types/extraction.rs`. This is the public output type. Fields we
 keep: `Content`, `MimeType`, `Metadata`, `ExtractionMethod` (Native/Ocr/Mixed — `Native`
 in the port unless the optional OCR pass contributed, which makes it `Mixed`), `Tables`, `DetectedLanguages`, `Images`, `Pages`, `Elements`
 (element-based format), `DjotContent`, `Document` (DocumentStructure tree), `Uris`,
@@ -103,7 +103,7 @@ ocr_elements, keywords, quality_score, llm_usage.
 
 ### Renderers
 
-Rust: `crates/xberg/src/rendering/`. One function per output format, all consuming
+Rust: `.reference/crates/xberg/src/rendering/`. One function per output format, all consuming
 `InternalDocument`:
 
 | Format | Rust file | Notes |
@@ -120,7 +120,7 @@ renderers depend on it.
 
 ### Config
 
-Rust: `crates/xberg/src/core/config/`. Port a trimmed `ExtractionConfig` with the fields
+Rust: `.reference/crates/xberg/src/core/config/`. Port a trimmed `ExtractionConfig` with the fields
 content extraction actually reads: `OutputFormat`, format-specific options (PDF, HTML,
 Excel, email), `IncludeDocumentStructure`, image-extraction toggles, `ResultFormat`
 (Unified vs ElementBased). Drop the embedding/chunking/LLM config sections. `Ocr` is
@@ -132,7 +132,7 @@ Excel, email), `IncludeDocumentStructure`, image-extraction toggles, `ResultForm
 
 ### MIME detection & format registry
 
-Rust: `crates/xberg/src/core/mime.rs`, `core/formats.rs`. Maps extension + magic bytes to
+Rust: `.reference/crates/xberg/src/core/mime.rs`, `core/formats.rs`. Maps extension + magic bytes to
 a canonical MIME type, which selects the extractor. Port the detection table and magic-byte
 sniffing. Each extractor advertises the MIME types / extensions it handles; a registry
 dispatches by MIME.
@@ -163,7 +163,7 @@ Port the native-only path. `derive.rs` is large; port incrementally, guided by g
 | `roxmltree`/`org`/`biblatex`/`biblib`/`dbase`/`unhwp`/`sevenz-rust2`/`tar`/`flate2` | misc | Port or find managed equivalents (see TODO per-format). |
 
 > **Rule:** if a Rust crate dependency has no suitable managed C# equivalent, port it
-> (into `src/XRay.Content/Internal/<name>/`). Prefer BCL types where they are faithful.
+> (into `dotnet/src/XRay.Content/Internal/<name>/`). Prefer BCL types where they are faithful.
 
 ---
 
@@ -173,27 +173,44 @@ Port the native-only path. `derive.rs` is large; port incrementally, guided by g
 dotnet/
   XRay.Content.sln
   Directory.Build.props          # net10.0, nullable, implicit usings
-  src/XRay.Content/                     # the NuGet library
+  src/XRay.Content/              # the NuGet library
     Types/                       #   InternalDocument, ElementKind, Metadata, Table, ExtractedDocument, ...
     Rendering/                   #   Plain / Markdown / Html / Json renderers + common
     Core/                        #   Config, MIME detection, format registry, pipeline, derive
     Extractors/                  #   one file/folder per format
     Internal/                    #   ported dependencies (Cfb, Blake3, Zip helpers, ...)
-  tests/XRay.Content.Tests/             # xUnit unit tests (renderers, types, per-extractor)
-  tools/XRay.Content.TestRunner/        # CLI: runs every test_documents fixture, diffs vs *-results-rust.json
+  tests/XRay.Content.Tests/      # xUnit unit tests (renderers, types, per-extractor)
+  tools/XRay.Content.TestRunner/ # CLI: runs every test_documents fixture, diffs vs *-results-rust.json
   tools/xberg-reference-gen/     # Rust helper that produces the golden *-results-rust.json files
+.reference/                      # the upstream Xberg tree, byte-identical (see below)
+test_documents/                  # the fixture corpus submodule
+CLAUDE.md                        # this file
+README.md                        # hand-maintained; NOT generated — see below
+.devops/                         # the Azure Pipelines job that publishes the package
+.claude/skills/                  # this project's own skills
 ```
+
+**`.reference/` is not part of this package** and is never built, published or edited. Keeping
+it identical to upstream is what makes an upstream sync a mechanical replay; a local edit there
+turns the next sync into a conflict. If one is unavoidable, record it in
+`.reference/UPSTREAM.md`.
+
+**`README.md` is hand-maintained.** It used to be generated by alef from what is now
+`.reference/templates/readme/root.md`, driven by `.reference/alef.toml`. That config is pristine
+upstream and still declares a root README target — but it now lives inside `.reference/`, so
+running alef there writes `.reference/README.md` and cannot reach this one. Do not copy that
+config back to the repository root, and do not run a README generator here.
 
 ---
 
 ## Testing & validation strategy
 
-1. **Golden reference generation (Rust):** `tools/xberg-reference-gen` walks
-   `../test_documents`, runs the *original* Rust extractors in each output format, and
+1. **Golden reference generation (Rust):** `dotnet/tools/xberg-reference-gen` walks
+   `test_documents`, runs the *original* Rust extractors in each output format, and
    writes `{filename}-results-rust.json` next to each fixture. The goldens are **generated
    locally, not committed** — `test_documents` is upstream's repo, and the goldens must be
    re-derived from whatever Rust revision you are syncing against anyway. Regenerate them
-   whenever `crates/xberg` or the submodule pin moves. Format:
+   whenever `.reference/crates/xberg` or the submodule pin moves. Format:
 
    ```json
    {
@@ -221,12 +238,21 @@ whitespace where the Rust path uses comrak — document any deliberate normaliza
 
 ---
 
-## Re-syncing after an upstream merge
+## Re-syncing after an upstream sync
 
-The Rust tree under `../crates` is deliberately left untouched, so merging upstream is
-clean and the whole job is re-deriving the C# port's behaviour. The loop that works:
+The Rust tree under `.reference/` is deliberately left byte-identical to upstream, so pulling
+upstream in is mechanical and the whole job is re-deriving the C# port's behaviour.
 
-1. **Merge upstream, then materialize the corpus.** The `test_documents` submodule is
+**Getting upstream in is its own procedure**, because upstream's files live under `.reference/`
+here and its commits are written against the repository root. A `git merge` cannot bridge that;
+the commits are replayed with `git am --directory=.reference` instead. That is a skill:
+[`.claude/skills/sync-upstream-reference`](.claude/skills/sync-upstream-reference/SKILL.md), and
+`.reference/UPSTREAM.md` records the last upstream commit replayed. Everything below is what
+happens *after* the tree is up to date.
+
+The loop that works:
+
+1. **Sync upstream, then materialize the corpus.** The `test_documents` submodule is
    LFS-free: text fixtures are in git, but every binary (office, PDF, epub, images) lives
    in a public bucket listed in `corpus.lock.json`. Fetch them first, or the office and
    PDF fixtures silently do not exist:
@@ -241,8 +267,8 @@ clean and the whole job is re-deriving the C# port's behaviour. The loop that wo
    upstream changes that still need porting:
 
    ```sh
-   cargo build --release --manifest-path tools/xberg-reference-gen/Cargo.toml
-   tools/xberg-reference-gen/target/release/xberg-reference-gen ../test_documents
+   cargo build --release --manifest-path dotnet/tools/xberg-reference-gen/Cargo.toml
+   dotnet/tools/xberg-reference-gen/target/release/xberg-reference-gen test_documents
    ```
 
    It skips fixtures that already have a golden, so pass `--overwrite` after a Rust bump.
@@ -252,9 +278,9 @@ clean and the whole job is re-deriving the C# port's behaviour. The loop that wo
    fail" into "395 of them diverge at the same smart-quote character":
 
    ```sh
-   dotnet run --project tools/XRay.Content.TestRunner -c Release -- ../test_documents --ext md --cluster
-   dotnet run --project tools/XRay.Content.TestRunner -c Release -- ../test_documents --ext docx --diff --show 3
-   dotnet run --project tools/XRay.Content.TestRunner -c Release -- --dump-metadata ../test_documents/x.pdf
+   dotnet run --project dotnet/tools/XRay.Content.TestRunner -c Release -- test_documents --ext md --cluster
+   dotnet run --project dotnet/tools/XRay.Content.TestRunner -c Release -- test_documents --ext docx --diff --show 3
+   dotnet run --project dotnet/tools/XRay.Content.TestRunner -c Release -- --dump-metadata test_documents/x.pdf
    ```
 
 4. **Fix against the Rust source, not against the golden.** Read the current Rust for the
@@ -267,7 +293,7 @@ clean and the whole job is re-deriving the C# port's behaviour. The loop that wo
 
 ---
 
-## Porting order (see `TODO.md` for the full checklist)
+## Porting order (see `dotnet/TODO.md` for the full checklist)
 
 1. **Core spine:** types, renderers, config, MIME, registry, minimal pipeline. Validate with
    text/markdown/csv/json fixtures (no heavy deps).
@@ -289,7 +315,7 @@ clean and the whole job is re-deriving the C# port's behaviour. The loop that wo
 - No `unsafe`, no P/Invoke to native libs — pure managed so the NuGet package is portable.
   This is why layout detection ships as a hand-written ONNX runtime (`Internal/Onnx`)
   rather than a binding to ONNX Runtime: the Rust build links `ort` natively, which a
-  portable package cannot. See `tools/onnx-parity/README.md` for how that runtime is
+  portable package cannot. See `dotnet/tools/onnx-parity/README.md` for how that runtime is
   validated against ONNX Runtime layer by layer.
   The optional OCR pass is the single documented exception — it pulls native code in
   transitively, which is why it is off by default. See
@@ -300,7 +326,7 @@ clean and the whole job is re-deriving the C# port's behaviour. The loop that wo
 ## Deviation: optional OCR
 
 This is the port's **largest intentional divergence from upstream `xberg`**. Everything else
-in this directory aims at parity; this does not. It is recorded here because a future
+in this repository aims at parity; this does not. It is recorded here because a future
 re-sync will otherwise read it as drift and try to "fix" it.
 
 ### What changed, and why it is a deviation
@@ -323,7 +349,7 @@ deviation rather than a port:
    but does not rasterise, and a scanned page's text exists *only* as pixels, so `ScanOnly`
    could not work at all without a rasteriser.
 3. **Upstream's config shape is not mirrored.** `OcrOptions` is designed for this pass, not
-   ported from `crates/xberg/src/core/config/`. Do not try to reconcile the two.
+   ported from `.reference/crates/xberg/src/core/config/`. Do not try to reconcile the two.
 
 ### The three modes
 

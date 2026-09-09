@@ -12,7 +12,7 @@ namespace XRay.Content.Core.Ocr;
 /// <c>PaddleOCR.Pdf</c>. The port's own PDF reader extracts text and geometry but does not
 /// rasterise, and a scanned page's text exists only as pixels — so without a rasteriser
 /// <see cref="OcrMode.ScanOnly"/> could not work at all. See "Deviation: optional OCR" in
-/// <c>dotnet/Claude.md</c> for why that trade-off was taken.
+/// <c>CLAUDE.md</c> for why that trade-off was taken.
 /// </para>
 /// <para>
 /// Pages come back PNG-encoded rather than as the library's own image type, which costs an

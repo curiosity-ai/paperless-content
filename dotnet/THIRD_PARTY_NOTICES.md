@@ -69,7 +69,7 @@ crates ships a `NOTICE` file, so §4(d) does not apply.
 ## Dependencies of the optional OCR pass — not derivative works
 
 The sections above cover *translated* code. The OCR pass (see the deviation
-section of `Claude.md`) instead takes a dependency on code it does not derive
+section of `../CLAUDE.md`) instead takes a dependency on code it does not derive
 from, so nothing here is a derivative work — but it changes what the package
 carries, which the packagers' note above is about:
 
@@ -80,7 +80,7 @@ carries, which the packagers' note above is about:
 
 Two consequences worth stating plainly. **Native binaries** now reach a consumer
 who restores the package — SkiaSharp's and PDFium's — which is the trade-off the
-`Claude.md` deviation section records; the pass is off by default and neither is
+`../CLAUDE.md` deviation section records; the pass is off by default and neither is
 loaded until it is enabled. And these are two more Apache-2.0 components in a
 package declaring `MIT`, so the mismatch the note above describes now covers
 dependencies as well as derived files. That declaration is still left as it is,

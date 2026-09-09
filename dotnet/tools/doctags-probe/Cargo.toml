@@ -14,7 +14,7 @@ name = "doctags-probe"
 path = "src/main.rs"
 
 [dependencies]
-xberg = { path = "../../../crates/xberg", default-features = false, features = [
+xberg = { path = "../../../.reference/crates/xberg", default-features = false, features = [
     "tokio-runtime",
     "office",
     "excel",
