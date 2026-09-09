@@ -894,7 +894,17 @@ internal static partial class PdfTableReconstruct
         var dataRows = table.GetRange(dataStart, table.Count - dataStart);
 
         if (headerRows.Count > 2)
-            headerRows = headerRows.GetRange(headerRows.Count - 2, 2);
+        {
+            // Keep the two-row header cap, but do not discard an unusually long prefix the
+            // data-start inference produced: earlier rows are still table content. They are
+            // demoted to data in their original order, and the two rows closest to the detected
+            // boundary stay the header (xberg-io/xberg#1558).
+            int surplus = headerRows.Count - 2;
+            var demoted = headerRows.GetRange(0, surplus);
+            headerRows.RemoveRange(0, surplus);
+            demoted.AddRange(dataRows);
+            dataRows = demoted;
+        }
 
         if (headerRows.Count == 0)
         {

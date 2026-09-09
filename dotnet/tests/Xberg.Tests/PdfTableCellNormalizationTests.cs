@@ -67,3 +67,40 @@ public sealed class PdfTableCellNormalizationTests
         Assert.Equal(new List<string> { "Afschrijving", "-12", "-9" }, processed[4]);
     }
 }
+
+/// <summary>
+/// Upstream <c>fix extraction regressions reported in open issues</c> (xberg-io/xberg#1558):
+/// table reconstruction dropped early rows when data-start inference classified more than two
+/// leading rows as headers. The two-row cap is right; discarding what it cut is not.
+/// </summary>
+public sealed class PdfTableHeaderCapTests
+{
+    [Fact]
+    public void SurplusInferredHeaderRowsAreDemotedNotDropped()
+    {
+        var table = new List<List<string>>();
+        for (int row = 1; row <= 18; row++)
+            table.Add(new List<string>
+            {
+                $"{row} 8000{row:D2}",
+                "Fastening screw",
+                $"{row},10",
+                row == 7 ? "package of 30" : "available",
+            });
+
+        var processed = PdfTableReconstruct.PostProcessTable(
+            table, layoutGuided: true, allowSingleColumn: false);
+
+        Assert.NotNull(processed);
+        string flattened = string.Join(" ", processed!.SelectMany(r => r));
+        for (int row = 1; row <= 18; row++)
+        {
+            string article = $"8000{row:D2}";
+            int occurrences = 0;
+            for (int i = flattened.IndexOf(article, StringComparison.Ordinal); i >= 0;
+                 i = flattened.IndexOf(article, i + 1, StringComparison.Ordinal))
+                occurrences++;
+            Assert.Equal(1, occurrences);
+        }
+    }
+}

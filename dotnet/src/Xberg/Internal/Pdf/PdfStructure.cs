@@ -1313,6 +1313,12 @@ public static class PdfStructure
             if (trailingSegments.Count == 0 || leadingSegments.Count == 0) continue;
 
             var trailingSeg = trailingSegments[^1];
+            // A paragraph line boundary is not always a visual one: inline style and
+            // font-resource splitting introduce them mid-line, so a suspended hyphen
+            // ("vracht- en verzendkosten") can end one logical line and begin the next while
+            // both runs share a baseline. Joining is licensed only across a real line break
+            // (xberg-io/xberg#1561).
+            if (!CrossesVisualLineBreak(trailingSeg, leadingSegments[0])) continue;
             if (maxRightEdge > 0f && trailingSeg.X + trailingSeg.Width < threshold) continue;
 
             string trailingText = trailingSeg.Text;

@@ -596,4 +596,31 @@ public class OoxmlTests
         Assert.Equal(3, doc.Images.Count);
         Assert.Equal(new uint?[] { 1u, 2u, 3u }, doc.Images.Select(i => i.PageNumber).ToArray());
     }
+
+    /// <summary>
+    /// Upstream <c>fix extraction regressions reported in open issues</c> (xberg-io/xberg#1562):
+    /// DrawingML and VML text boxes dropped XML and numeric character references. Upstream's
+    /// pull parser surfaces an entity reference as its own event, which that walk ignored; the
+    /// reader here resolves them while parsing, so this pins the behaviour rather than fixing it.
+    /// </summary>
+    [Fact]
+    public void Docx_TextBoxKeepsCharacterReferences()
+    {
+        byte[] docx = Zip(
+            ("word/document.xml",
+                "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" " +
+                "xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" " +
+                "xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" " +
+                "xmlns:wps=\"http://schemas.microsoft.com/office/word/2010/wordprocessingShape\"><w:body>" +
+                "<w:p><w:r><w:drawing><wp:inline><a:graphic><a:graphicData>" +
+                "<wps:wsp><wps:txbx><w:txbxContent><w:p><w:r>" +
+                "<w:t>Tom &amp; Jerry cost &#8364;5</w:t>" +
+                "</w:r></w:p></w:txbxContent></wps:txbx></wps:wsp>" +
+                "</a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>" +
+                "</w:body></w:document>"));
+
+        var doc = new DocxExtractor().Extract(docx, DocxMime, new ExtractionConfig());
+
+        Assert.Contains("Tom & Jerry cost \u20ac5", Render(doc, OutputFormat.Plain), StringComparison.Ordinal);
+    }
 }
