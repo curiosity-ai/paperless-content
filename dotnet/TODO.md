@@ -907,11 +907,11 @@ pre-`c09caac0` Rust; regenerating them is still the next session's first job.
 
 Fetching the corpus was itself informative. The suite had been running against a corpus-less
 checkout for the whole sync, reporting 2097 passing, because roughly thirty fixture-backed tests
-open with `if (path is null) return;`. With the fixtures present, one of them fails:
-`OxStructureOrderTests.ATaggedRtlFormYieldsNoSpatialTable`. It is **not** a regression from this
-work — the identical failure reproduces on `1b1097ad`, the branch point — and it had never once
-run. `CorpusPresenceTests` now says so in one place rather than leaving thirty tests to decide
-quietly. See "The RTL spatial-table gap" below.
+open with `if (path is null) return;`. With the fixtures present one of them failed —
+`ATaggedRtlFormYieldsNoSpatialTable`, which had never once run — and checking it against the Rust
+reference showed the *test* was wrong, not the port. `CorpusPresenceTests` now says in one place
+that the suite is running degraded, rather than leaving thirty tests to decide quietly. See "The
+RTL spatial-table gap" below. The suite is green: **2122 passing, 0 failing**.
 
 Every fix below was landed with a guard proven to fail without it: the fix was reverted, the test
 was watched to fail, and the fix restored. Where a guard did not fail, that is recorded too, and
@@ -1054,20 +1054,23 @@ the local header and the central directory.
   `#1550` silently undoes `#77` for every document carrying a `PAPX` layer — which is every real
   one. This port keeps emitting those sections after the body; see `PushSubdocumentSections`.
 
-### The RTL spatial-table gap
+### The RTL spatial-table "gap" — settled: the test was wrong, not the port
 
-`OxStructureOrderTests.ATaggedRtlFormYieldsNoSpatialTable` fails on
-`vendored/docling/pdf/right_to_left_03.pdf`: the port emits one spatial table where the test says
-upstream emits none. The test's own docstring explains the mechanism it expects — read in
-structure order the label and value cells are reading-order-adjacent, so merging adjacent words
-fuses each label with its value into one word spanning the row, leaving three of four columns
-empty, which the validity check rejects.
+`ATaggedRtlFormYieldsNoSpatialTable` asserted that upstream emits **no** table for
+`vendored/docling/pdf/right_to_left_03.pdf`, reasoning that structure-order word merging fuses
+each label with its value into one row-spanning word, empties three of four columns, and fails the
+validity check. It was written while the corpus was absent, so it had never run; fetching the
+fixtures made it fail on its first execution.
 
-Two things are worth stating plainly. It is not a regression: the same failure reproduces on
-`1b1097ad`. And the expectation itself is **unverified** — the test was written while the corpus
-was absent, so its author could not have run it, and nothing here has yet checked what the Rust
-reference actually produces for this fixture. Settle that against the reference before treating
-the port as wrong; the test may be asserting a behaviour upstream does not have.
+`tools/xberg-reference-gen` settles it. Upstream emits **exactly one** table for that fixture —
+page 1, (85, 254)-(506, 495), 11 rows, markdown opening
+`|  |  | پذيرش در بورس - 3 |` — and the port already produced precisely that, same box, same page,
+same markdown. The port was never wrong. The test is corrected to assert that parity rather than
+deleted, and its fixture is now required instead of optional.
+
+The lesson is the one the corpus keeps teaching: an expectation reasoned out from upstream's
+source, never executed, is a guess wearing a test's clothes. The reference generator is cheap to
+build — about six minutes — and answers these questions outright.
 
 ### Still open from this merge
 
