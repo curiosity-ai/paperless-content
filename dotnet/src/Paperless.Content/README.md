@@ -1,5 +1,9 @@
 # Paperless.Content
 
+[![NuGet](https://img.shields.io/nuget/v/Paperless.Content?label=NuGet&color=5c2d91&logo=nuget&logoColor=white)](https://www.nuget.org/packages/Paperless.Content/)
+[![Downloads](https://img.shields.io/nuget/dt/Paperless.Content?label=downloads&color=5c2d91)](https://www.nuget.org/packages/Paperless.Content/)
+[![License](https://img.shields.io/badge/license-MIT%20AND%20Apache--2.0-007ec6)](https://github.com/curiosity-ai/xberg/blob/main/dotnet/THIRD_PARTY_NOTICES.md)
+
 Content extraction for .NET. Point it at a document — Office, PDF, HTML, email, an archive —
 and get back the text, metadata, tables, images and a structured element tree, in whichever
 output format you ask for.
@@ -91,6 +95,13 @@ becomes a `ProcessingWarning`, not an exception.
 Turning it on loads [PaddleOCR](https://github.com/theolivenbaum/PaddleOCR/), which brings
 SkiaSharp and PDFium. A caller that never sets `Ocr` loads neither. Nothing is downloaded on
 your behalf: point `OcrOptions.ModelDirectory` at a checkpoint you already have.
+
+## Links
+
+- [Source](https://github.com/curiosity-ai/xberg/tree/main/dotnet) — the port lives under `dotnet/` in the Xberg repository
+- [Architecture, scope and conventions](https://github.com/curiosity-ai/xberg/blob/main/dotnet/Claude.md)
+- [Port status and work breakdown](https://github.com/curiosity-ai/xberg/blob/main/dotnet/TODO.md)
+- [Issues](https://github.com/curiosity-ai/xberg/issues)
 
 ## License
 
