@@ -343,22 +343,11 @@ public sealed class DocxExtractor : IExtractor
         }
     }
 
-    /// <summary>Ports `Table::to_plain_text` → tab-separated cells (v-merge continue → empty).</summary>
+    /// <summary>Ports `Table::to_plain_text` → tab-separated cells, over the shared
+    /// <see cref="ToCellGrid"/>.</summary>
     private static string TablePlainText(DocxTable table)
     {
-        var cells = new List<List<string>>();
-        foreach (var row in table.Rows)
-        {
-            var rowCells = new List<string>();
-            foreach (var cell in row.Cells)
-            {
-                string text = cell.VMergeContinue
-                    ? ""
-                    : string.Join(" ", cell.Paragraphs.Select(p => ParagraphPlainText(p.Runs))).Trim();
-                for (int s = 0; s < cell.GridSpan; s++) rowCells.Add(text);
-            }
-            cells.Add(rowCells);
-        }
+        var cells = ToCellGrid(table, p => ParagraphPlainText(p.Runs));
         var sb = new StringBuilder();
         foreach (var row in cells)
         {
@@ -534,8 +523,21 @@ public sealed class DocxExtractor : IExtractor
         return list;
     }
 
-    // ── table cell grid (docx.rs build_internal_document Table arm) ────────────
-    private static List<List<string>> BuildTableCells(DocxTable table)
+    // ── table cell grid (docx parser `Table::to_cell_grid`) ───────────────────
+    /// <summary>
+    /// Lay a DOCX table out as a rectangular grid, writing a cell that spans several grid
+    /// columns (<c>w:gridSpan</c>) or rows (<c>w:vMerge</c>) <em>once</em>, at its origin, and
+    /// leaving every column and row it covers blank.
+    /// </summary>
+    /// <remarks>
+    /// Ports `Table::to_cell_grid` (xberg-io/xberg#1549). The grid used to clone a spanned
+    /// cell's text into every column it covered, and a <c>w:vMerge</c> continuation then copied
+    /// the row above down over all of them, so a cell merged across 4 columns and 3 rows came
+    /// back 12 times — in the table's cells, its markdown and the document content alike.
+    /// <paramref name="render"/> is the only difference between the markdown and plain-text
+    /// grids, so both share this builder and cannot drift apart.
+    /// </remarks>
+    private static List<List<string>> ToCellGrid(DocxTable table, Func<DocxParagraph, string> render)
     {
         var cells = new List<List<string>>();
         foreach (var row in table.Rows)
@@ -543,26 +545,19 @@ public sealed class DocxExtractor : IExtractor
             var rowCells = new List<string>();
             foreach (var cell in row.Cells)
             {
-                string text = string.Join(" ", cell.Paragraphs.Select(p => RunsToMarkdown(p.Runs))).Trim();
-                for (int s = 0; s < cell.GridSpan; s++) rowCells.Add(text);
+                string text = cell.VMergeContinue
+                    ? ""
+                    : string.Join(" ", cell.Paragraphs.Select(render)).Trim();
+                rowCells.Add(text);
+                for (uint s = 1; s < cell.GridSpan; s++) rowCells.Add("");
             }
             cells.Add(rowCells);
         }
-        // Fill vertically merged cells from the row above.
-        for (int r = 1; r < table.Rows.Count; r++)
-        {
-            int col = 0;
-            foreach (var cell in table.Rows[r].Cells)
-            {
-                int span = (int)cell.GridSpan;
-                if (cell.VMergeContinue)
-                    for (int c = col; c < col + span; c++)
-                        if (c < cells[r].Count && c < cells[r - 1].Count) cells[r][c] = cells[r - 1][c];
-                col += span;
-            }
-        }
         return cells;
     }
+
+    private static List<List<string>> BuildTableCells(DocxTable table) =>
+        ToCellGrid(table, p => RunsToMarkdown(p.Runs));
 
     // ── runs_to_markdown (docx parser) ─────────────────────────────────────────
     private static string RunsToMarkdown(List<DocxRun> runs)

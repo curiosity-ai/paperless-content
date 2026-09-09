@@ -480,4 +480,82 @@ public class OoxmlTests
         Assert.True(plain.IndexOf("Cell", StringComparison.Ordinal)
             < plain.IndexOf("Bullet text", StringComparison.Ordinal), plain);
     }
+
+    // ── gridSpan / vMerge deduplication (xberg-io/xberg#1549) ──────────────────
+
+    private const string MergedAnswerText =
+        "The platform has been deployed at the primary site with full redundancy across two " +
+        "availability zones, and the secondary site remains on standby for disaster recovery " +
+        "drills conducted every quarter under the current operations runbook.";
+
+    /// <summary>
+    /// The three-column, five-row table from the issue's reproduction: a <c>gridSpan=3</c>
+    /// title row, a <c>vMerge</c>d two-row group, and a <c>gridSpan=2</c> + <c>vMerge</c>d
+    /// two-row group.
+    /// </summary>
+    private static byte[] MergedCellDocx() => Zip(
+        ("word/document.xml",
+            "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body>" +
+            "<w:tbl>" +
+            "<w:tblGrid><w:gridCol w:w=\"2000\"/><w:gridCol w:w=\"2000\"/><w:gridCol w:w=\"2000\"/></w:tblGrid>" +
+            "<w:tr><w:tc><w:tcPr><w:gridSpan w:val=\"3\"/></w:tcPr>" +
+            "<w:p><w:r><w:t>Overview</w:t></w:r></w:p></w:tc></w:tr>" +
+            "<w:tr><w:tc><w:tcPr><w:vMerge w:val=\"restart\"/></w:tcPr>" +
+            "<w:p><w:r><w:t>Services</w:t></w:r></w:p></w:tc>" +
+            "<w:tc><w:p><w:r><w:t>A1</w:t></w:r></w:p></w:tc>" +
+            "<w:tc><w:p><w:r><w:t>B1</w:t></w:r></w:p></w:tc></w:tr>" +
+            "<w:tr><w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p/></w:tc>" +
+            "<w:tc><w:p><w:r><w:t>A2</w:t></w:r></w:p></w:tc>" +
+            "<w:tc><w:p><w:r><w:t>B2</w:t></w:r></w:p></w:tc></w:tr>" +
+            "<w:tr><w:tc><w:p><w:r><w:t>Reference</w:t></w:r></w:p></w:tc>" +
+            "<w:tc><w:tcPr><w:gridSpan w:val=\"2\"/><w:vMerge w:val=\"restart\"/></w:tcPr>" +
+            $"<w:p><w:r><w:t>{MergedAnswerText}</w:t></w:r></w:p></w:tc></w:tr>" +
+            "<w:tr><w:tc><w:p><w:r><w:t>Sector</w:t></w:r></w:p></w:tc>" +
+            "<w:tc><w:tcPr><w:gridSpan w:val=\"2\"/><w:vMerge/></w:tcPr><w:p/></w:tc></w:tr>" +
+            "</w:tbl></w:body></w:document>"));
+
+    /// <summary>
+    /// Upstream <c>fix(docx): return a merged cell once instead of per covered column and row</c>.
+    /// A cell spanning N grid columns was cloned into every one of them, and a <c>w:vMerge</c>
+    /// continuation then copied the row above down over all of them, so a cell merged across
+    /// 4 columns and 3 rows came back 12 times.
+    /// </summary>
+    [Fact]
+    public void Docx_MergedCellAppearsOnceAtItsOrigin()
+    {
+        var doc = new DocxExtractor().Extract(MergedCellDocx(), DocxMime, new ExtractionConfig());
+
+        var table = Assert.Single(doc.Tables);
+        Assert.Equal(
+            new List<List<string>>
+            {
+                new() { "Overview", "", "" },
+                new() { "Services", "A1", "B1" },
+                new() { "", "A2", "B2" },
+                new() { "Reference", MergedAnswerText, "" },
+                new() { "Sector", "", "" },
+            },
+            table.Cells);
+    }
+
+    /// <summary>
+    /// The rendered content is the second consumer-visible grid the issue reports duplicating
+    /// cell text.
+    /// </summary>
+    [Fact]
+    public void Docx_MergedCellTextIsNotRepeatedInRenderedContent()
+    {
+        var doc = new DocxExtractor().Extract(MergedCellDocx(), DocxMime, new ExtractionConfig());
+
+        foreach (var format in new[] { OutputFormat.Plain, OutputFormat.Markdown })
+        {
+            string content = Render(doc, format);
+            int occurrences = 0;
+            for (int i = content.IndexOf(MergedAnswerText, StringComparison.Ordinal); i >= 0;
+                 i = content.IndexOf(MergedAnswerText, i + 1, StringComparison.Ordinal))
+                occurrences++;
+
+            Assert.Equal(1, occurrences);
+        }
+    }
 }

@@ -19,6 +19,28 @@ public sealed class DocExtractor : IExtractor
     // Higher than the default so it wins over any generic handler for application/msword.
     public int Priority => 60;
 
+    /// <summary>
+    /// Index of the <c>fcClx</c>/<c>lcbClx</c> pair in the FIB's <c>FibRgFcLcb97</c> array.
+    /// </summary>
+    /// <remarks>
+    /// [MS-DOC] 2.5.5 orders the array <c>fcStshfOrig</c>(0) … <c>fcSttbfAssoc</c>(32),
+    /// <c>fcClx</c>(33). This read used index 66 (<c>fcBkdFtnOldOld</c>, an obsolete field Word
+    /// writes as zero), so <c>fcClx == 0</c> held for every real document and the piece table was
+    /// never walked — the whole <c>Clx</c> path was unreachable and only the contiguous fallback
+    /// ever ran, reading <c>reserved5</c>/<c>reserved6</c> at <c>0x18</c>/<c>0x1C</c>, bytes
+    /// [MS-DOC] says a reader must ignore (xberg-io/xberg#1551).
+    /// </remarks>
+    private const int FibFcLcbIdxClx = 33;
+
+    // Indices into the FIB's `FibRgLw97` long-word array ([MS-DOC] 2.5.4).
+    private const int FibLwIdxCcpText = 3;
+    private const int FibLwIdxCcpFtn = 4;
+    private const int FibLwIdxCcpHdd = 5;
+    private const int FibLwIdxCcpAtn = 7;
+    private const int FibLwIdxCcpEdn = 8;
+    private const int FibLwIdxCcpTxbx = 9;
+    private const int FibLwIdxCcpHdrTxbx = 10;
+
     public InternalDocument Extract(ReadOnlySpan<byte> content, string mimeType, ExtractionConfig config)
     {
         var comp = CompoundFile.Open(content);
@@ -95,23 +117,17 @@ public sealed class DocExtractor : IExtractor
         int cslw = OleUtil.U16(wordDoc, cslwOffset);
         int rgLwOffset = cslwOffset + 2;
 
-        int ccpTextOffset = rgLwOffset + 3 * 4;
+        int ccpTextOffset = rgLwOffset + FibLwIdxCcpText * 4;
         if (wordDoc.Length < ccpTextOffset + 4) throw new InvalidDataException("FIB too short for ccpText");
         int ccpText = (int)OleUtil.U32(wordDoc, ccpTextOffset);
 
-        long totalCp = ccpText;
-        for (int i = 4; i <= 9; i++)
-        {
-            int off = rgLwOffset + i * 4;
-            if (wordDoc.Length >= off + 4) totalCp += OleUtil.U32(wordDoc, off);
-        }
-        if (totalCp > 0) totalCp += 1;
+        var ranges = SubdocRanges.FromFib(wordDoc, rgLwOffset, ccpText);
 
         int cbrgOffset = rgLwOffset + cslw * 4;
         if (wordDoc.Length < cbrgOffset + 2) throw new InvalidDataException("FIB too short for cbRgFcLcb");
         int rgFcLcbOffset = cbrgOffset + 2;
 
-        int fcClxOffset = rgFcLcbOffset + 66 * 8;
+        int fcClxOffset = rgFcLcbOffset + FibFcLcbIdxClx * 8;
         int lcbClxOffset = fcClxOffset + 4;
         if (wordDoc.Length < lcbClxOffset + 4) throw new InvalidDataException("FIB too short for fcClx/lcbClx");
 
@@ -134,7 +150,7 @@ public sealed class DocExtractor : IExtractor
                 pos += 1;
                 if (pos + 4 > clxEnd) throw new InvalidDataException("Pcdt truncated at lcb");
                 pos += 4; // lcb of PlcPcd
-                return ExtractFromPieceTable(wordDoc, table, pos, clxEnd, ccpText, totalCp);
+                return ExtractFromPieceTable(wordDoc, table, pos, clxEnd, ranges);
             }
             if (clxt == 0x01)
             {
@@ -148,14 +164,30 @@ public sealed class DocExtractor : IExtractor
         return ExtractTextFallback(wordDoc);
     }
 
-    private static string ExtractFromPieceTable(byte[] wordDoc, byte[] table, int plcStart, int plcEnd, int ccpText, long totalCp)
+    /// <summary>
+    /// Walk the piece table (<c>PlcPcd</c>), bucketing each piece's characters into the
+    /// subdocument CP range they fall in, and assemble the labelled sections.
+    /// </summary>
+    /// <remarks>
+    /// Ports upstream's <c>extract_text_from_piece_table</c>. Any piece whose CP range started
+    /// at or after <c>ccpText</c> — that is, every footnote, header/footer, comment and text-box
+    /// piece — used to be skipped outright, so none of that content ever appeared
+    /// (xberg-io/xberg#77).
+    /// </remarks>
+    private static string ExtractFromPieceTable(
+        byte[] wordDoc, byte[] table, int plcStart, int plcEnd, SubdocRanges ranges)
     {
         int plcSize = plcEnd - plcStart;
         if (plcSize < 16) throw new InvalidDataException("PlcPcd too small");
         int n = (plcSize - 4) / 12;
         if (n == 0) return "";
 
-        var result = new StringBuilder(ccpText);
+        var main = new StringBuilder(ranges.Main.Length);
+        var footnote = new StringBuilder();
+        var header = new StringBuilder();
+        var annotation = new StringBuilder();
+        var textbox = new StringBuilder();
+
         for (int i = 0; i < n; i++)
         {
             int cpStartOff = plcStart + i * 4;
@@ -165,49 +197,122 @@ public sealed class DocExtractor : IExtractor
 
             int cpStart = (int)OleUtil.U32(table, cpStartOff);
             int cpEnd = (int)OleUtil.U32(table, cpEndOff);
-            if (cpStart >= totalCp) break;
+            if (cpStart >= ranges.TotalCp) break;
 
             uint fcRaw = OleUtil.U32(table, pcdOff + 2);
-            bool isCompressed = (fcRaw & 0x4000_0000) != 0;
             int charCount = Math.Max(0, cpEnd - cpStart);
+            string piece = DecodePieceChars(wordDoc, fcRaw, charCount);
+            if (piece.Length == 0) continue;
 
-            int charsToRead;
-            if (cpStart + charCount > ccpText && cpStart < ccpText) charsToRead = ccpText - cpStart;
-            else if (cpStart >= ccpText) continue;
-            else charsToRead = charCount;
-
-            if (isCompressed)
-            {
-                int byteOffset = (int)(fcRaw & 0x3FFF_FFFF) / 2;
-                int end = byteOffset + charsToRead;
-                if (end <= wordDoc.Length)
-                    for (int k = byteOffset; k < end; k++) result.Append(OleUtil.Cp1252ToChar(wordDoc[k]));
-            }
-            else
-            {
-                int before = result.Length;
-                int byteOffset = (int)(fcRaw & 0x3FFF_FFFF);
-                int end = byteOffset + charsToRead * 2;
-                if (end <= wordDoc.Length)
-                    for (int k = byteOffset; k + 1 < end; k += 2)
-                    {
-                        ushort cu = (ushort)(wordDoc[k] | (wordDoc[k + 1] << 8));
-                        result.Append((char)cu);
-                    }
-
-                // Heuristic: mostly-CJK decode means the compression bit was wrong → redo as CP1252.
-                string piece = result.ToString(before, result.Length - before);
-                int suspicious = piece.Count(c => c >= 0x4E00 && c <= 0x9FFF);
-                if (piece.Length > 4 && suspicious > piece.Length / 4)
-                {
-                    result.Length = before;
-                    int end2 = byteOffset + charsToRead;
-                    if (end2 <= wordDoc.Length)
-                        for (int k = byteOffset; k < end2; k++) result.Append(OleUtil.Cp1252ToChar(wordDoc[k]));
-                }
-            }
+            AppendRangeOverlap(piece, cpStart, ranges.Main, main);
+            AppendRangeOverlap(piece, cpStart, ranges.Footnote, footnote);
+            AppendRangeOverlap(piece, cpStart, ranges.Header, header);
+            AppendRangeOverlap(piece, cpStart, ranges.Annotation, annotation);
+            AppendRangeOverlap(piece, cpStart, ranges.Textbox, textbox);
         }
-        return NormalizeDocText(result.ToString());
+
+        var content = new StringBuilder(NormalizeDocText(main.ToString()));
+        foreach (var (label, section) in new[]
+        {
+            ("Footnotes", footnote),
+            ("Headers and Footers", header),
+            ("Comments", annotation),
+            ("Text Boxes", textbox),
+        })
+        {
+            string normalized = NormalizeDocText(section.ToString());
+            if (normalized.Length == 0) continue;
+            if (content.Length > 0) content.Append("\n\n");
+            content.Append(label).Append("\n\n").Append(normalized);
+        }
+        return content.ToString();
+    }
+
+    /// <summary>Decode one piece's characters, choosing CP1252 or UTF-16LE from its FC.</summary>
+    private static string DecodePieceChars(byte[] wordDoc, uint fcRaw, int charCount)
+    {
+        var sb = new StringBuilder(charCount);
+        if ((fcRaw & 0x4000_0000) != 0)
+        {
+            int byteOffset = (int)(fcRaw & 0x3FFF_FFFF) / 2;
+            int end = byteOffset + charCount;
+            if (end <= wordDoc.Length)
+                for (int k = byteOffset; k < end; k++) sb.Append(OleUtil.Cp1252ToChar(wordDoc[k]));
+            return sb.ToString();
+        }
+
+        int utf16Offset = (int)(fcRaw & 0x3FFF_FFFF);
+        int utf16End = utf16Offset + charCount * 2;
+        if (utf16End <= wordDoc.Length)
+            for (int k = utf16Offset; k + 1 < utf16End; k += 2)
+                sb.Append((char)(ushort)(wordDoc[k] | (wordDoc[k + 1] << 8)));
+
+        // Heuristic: a mostly-CJK decode means the compression bit was wrong → redo as CP1252.
+        string piece = sb.ToString();
+        int suspicious = piece.Count(c => c >= 0x4E00 && c <= 0x9FFF);
+        if (piece.Length > 4 && suspicious > piece.Length / 4)
+        {
+            sb.Clear();
+            int end2 = utf16Offset + charCount;
+            if (end2 <= wordDoc.Length)
+                for (int k = utf16Offset; k < end2; k++) sb.Append(OleUtil.Cp1252ToChar(wordDoc[k]));
+            return sb.ToString();
+        }
+        return piece;
+    }
+
+    /// <summary>Append the part of <paramref name="piece"/> that falls inside a CP range.</summary>
+    private static void AppendRangeOverlap(string piece, int cpStart, SubdocRange range, StringBuilder outText)
+    {
+        if (range.Length == 0) return;
+        int pieceEnd = cpStart + piece.Length;
+        int overlapStart = Math.Max(cpStart, range.Start);
+        int overlapEnd = Math.Min(pieceEnd, range.End);
+        if (overlapStart < overlapEnd)
+            outText.Append(piece, overlapStart - cpStart, overlapEnd - overlapStart);
+    }
+
+    /// <summary>A half-open CP-space range belonging to one subdocument.</summary>
+    private readonly record struct SubdocRange(int Start, int End)
+    {
+        public int Length => Math.Max(0, End - Start);
+    }
+
+    /// <summary>
+    /// The CP-space subdocument layout, derived from the FIB's <c>ccp*</c> fields.
+    /// </summary>
+    /// <remarks>
+    /// Order matches the FIB's <c>FibRgLw97</c> field declaration order, which is also the
+    /// document's physical CP-space layout ([MS-DOC] 2.4.2): main document, footnotes,
+    /// headers/footers, comments, endnotes, text boxes, header text boxes. <c>ccpMcr</c> (the
+    /// deprecated macro subdocument) is skipped: it does not occupy CP space. Endnotes and
+    /// header text boxes are not extracted, but their spans must still be counted so later
+    /// subdocuments resolve to the right offsets.
+    /// </remarks>
+    private readonly record struct SubdocRanges(
+        SubdocRange Main, SubdocRange Footnote, SubdocRange Header,
+        SubdocRange Annotation, SubdocRange Endnote, SubdocRange Textbox,
+        SubdocRange HeaderTextbox)
+    {
+        public int TotalCp => HeaderTextbox.End;
+
+        public static SubdocRanges FromFib(byte[] wordDoc, int rgLwOffset, int ccpText)
+        {
+            int Read(int index)
+            {
+                int off = rgLwOffset + index * 4;
+                return wordDoc.Length >= off + 4 ? (int)OleUtil.U32(wordDoc, off) : 0;
+            }
+
+            var main = new SubdocRange(0, ccpText);
+            var footnote = new SubdocRange(main.End, main.End + Read(FibLwIdxCcpFtn));
+            var header = new SubdocRange(footnote.End, footnote.End + Read(FibLwIdxCcpHdd));
+            var annotation = new SubdocRange(header.End, header.End + Read(FibLwIdxCcpAtn));
+            var endnote = new SubdocRange(annotation.End, annotation.End + Read(FibLwIdxCcpEdn));
+            var textbox = new SubdocRange(endnote.End, endnote.End + Read(FibLwIdxCcpTxbx));
+            var headerTextbox = new SubdocRange(textbox.End, textbox.End + Read(FibLwIdxCcpHdrTxbx));
+            return new SubdocRanges(main, footnote, header, annotation, endnote, textbox, headerTextbox);
+        }
     }
 
     private static string ExtractTextContiguous(byte[] wordDoc, int ccpText)
