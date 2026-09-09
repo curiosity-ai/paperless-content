@@ -68,6 +68,28 @@ public sealed class ImageExtractor : IExtractor
         var doc = builder.Build();
         doc.Metadata = new Metadata { Format = FormatMetadata.Image(imageMeta) };
         doc.MimeType = mimeType;
+
+        // The one image this document has is the file itself, and the OCR pass reads bytes off
+        // `doc.Images` — so without this an image file is the one thing `AllImages` could not
+        // read. Attached only when the mode asked for it, so extraction output is unchanged
+        // otherwise (upstream's `build_image_internal_document` stores no bytes).
+        if (XRay.Content.Core.Ocr.OcrImageSource.WantsEmbeddedImages(config))
+        {
+            bool measured = imageMeta.Width > 0 && imageMeta.Height > 0;
+
+            doc.Images.Add(new ExtractedImage
+            {
+                ImageIndex = 0,
+                Data = bytes,
+                Format = imageMeta.Format,
+                // Left unset when the dimensions could not be read — a HEIF container's often
+                // cannot — because zero would read as "smaller than the floor" and skip the
+                // image, where unknown means "recognise it anyway".
+                Width = measured ? imageMeta.Width : null,
+                Height = measured ? imageMeta.Height : null,
+            });
+        }
+
         return doc;
     }
 
