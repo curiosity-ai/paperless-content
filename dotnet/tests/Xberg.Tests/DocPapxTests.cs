@@ -261,4 +261,56 @@ public sealed class DocPapxTests
         var (cycleWordDoc, cycleTable) = StyleSheetOnly((Sti: 46, IstdBase: 1), (Sti: 47, IstdBase: 0));
         Assert.Null(DocPapx.StyleSheet.Build(cycleWordDoc, cycleTable, 0).HeadingLevel(0));
     }
+
+    // ── the sprm walk, in isolation ───────────────────────────────────────────
+
+    /// <summary>
+    /// Operand length comes from a sprm's <c>spra</c> field. Getting one wrong desynchronises the
+    /// whole walk, since each sprm's length decides where the next one starts.
+    /// </summary>
+    [Theory]
+    [InlineData(0x260A, 1)]  // sprmPIlvl, spra 1
+    [InlineData(0x460B, 2)]  // sprmPIlfo, spra 2
+    [InlineData(0x6000, 4)]  // spra 3
+    [InlineData(0xE000, 3)]  // spra 7
+    public void SprmOperandLengthComesFromSpra(int sprm, int expected) =>
+        Assert.Equal(expected, DocPapx.SprmOperandLen((ushort)sprm));
+
+    /// <summary>spra 6 is variable-length, so the caller reads the count from the operand.</summary>
+    [Fact]
+    public void AVariableLengthSprmHasNoFixedOperandLength() =>
+        Assert.Null(DocPapx.SprmOperandLen(0xC000));
+
+    /// <summary>A grpprl carrying other paragraph properties is not a list binding.</summary>
+    [Fact]
+    public void AGrpprlWithoutIlfoIsNotAListParagraph()
+    {
+        // sprmPJc (0x2403), spra 1: a paragraph property that is not a list binding.
+        Assert.Null(DocPapx.ListBindingFromGrpprl(new byte[] { 0x03, 0x24, 0x01 }));
+    }
+
+    /// <summary><c>ilfo == 0</c> is Word's encoding for "no list", not a binding to list 0.</summary>
+    [Fact]
+    public void IlfoZeroMeansNotInAListRatherThanListZero() =>
+        Assert.Null(DocPapx.ListBindingFromGrpprl(new byte[] { 0x0B, 0x46, 0x00, 0x00 }));
+
+    /// <summary>Depth and membership are read together, in either order.</summary>
+    [Fact]
+    public void IlfoAndIlvlAreReadTogether()
+    {
+        var binding = DocPapx.ListBindingFromGrpprl(new byte[]
+        {
+            0x0A, 0x26, 0x02,       // sprmPIlvl = 2
+            0x0B, 0x46, 0x09, 0x00, // sprmPIlfo = 9
+        });
+
+        Assert.Equal(new DocPapx.ListBinding(9, 2), binding);
+    }
+
+    /// <summary>An absent <c>sprmPIlvl</c> means level 0, not "no binding".</summary>
+    [Fact]
+    public void IlvlDefaultsToZeroWhenOnlyIlfoIsPresent() =>
+        Assert.Equal(
+            new DocPapx.ListBinding(3, 0),
+            DocPapx.ListBindingFromGrpprl(new byte[] { 0x0B, 0x46, 0x03, 0x00 }));
 }

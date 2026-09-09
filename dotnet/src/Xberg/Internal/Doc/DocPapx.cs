@@ -457,8 +457,6 @@ internal static class DocPapx
 
         public ushort? StyleForParagraphEnd(uint endFc) =>
             _styleByEndFc.TryGetValue(endFc, out ushort istd) ? istd : null;
-
-        public int Count => _byEndFc.Count;
     }
 
     /// <summary>
@@ -470,14 +468,6 @@ internal static class DocPapx
         public required ParagraphListIndex Index { get; init; }
         public required ListFormats Formats { get; init; }
         public required StyleSheet Styles { get; init; }
-
-        /// <summary>An empty set, for the paths that carry no paragraph properties at all.</summary>
-        public static ListTables Empty { get; } = new()
-        {
-            Index = ParagraphListIndex.Build(Array.Empty<byte>(), Array.Empty<byte>(), 0),
-            Formats = ListFormats.Build(Array.Empty<byte>(), Array.Empty<byte>(), 0),
-            Styles = StyleSheet.Build(Array.Empty<byte>(), Array.Empty<byte>(), 0),
-        };
 
         public static ListTables Build(byte[] wordDoc, byte[] tableStream, int rgFcLcbOffset) => new()
         {
