@@ -1,5 +1,6 @@
 using System.Text;
 using Xberg.Core;
+using Xberg.Extractors;
 using Xunit;
 
 namespace Xberg.Tests;
@@ -314,5 +315,37 @@ public class MimeTests
 
         Assert.Equal(expected, fromExtension);
         Assert.Equal(expected, Mime.ResolveWithContent(fromExtension, Encoding.UTF8.GetBytes(content)));
+    }
+
+    /// <summary>
+    /// Upstream <c>feat(diagram): extract flat ODF drawings (.fodg)</c>. Flat ODF drawings
+    /// advertised no extractor at all. A flat document carries the packaged MIME type inside
+    /// itself, as the root element's <c>office:mimetype</c>, so content detection reads that
+    /// attribute rather than sniffing a ZIP container — and identifies one even without the
+    /// extension.
+    /// </summary>
+    [Fact]
+    public void AFlatOdfDrawingIsDetectedFromItsOwnMimetypeAttribute()
+    {
+        byte[] content = Encoding.UTF8.GetBytes(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" +
+            "<office:document xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" " +
+            "office:mimetype=\"application/vnd.oasis.opendocument.graphics\">" +
+            "<office:body/></office:document>");
+
+        Assert.Equal(Mime.OdgFlatMimeType, Mime.DetectMimeType("diagram.fodg", checkExists: false));
+        Assert.Equal(Mime.OdgFlatMimeType, Mime.DetectMimeTypeFromBytes(content));
+        Assert.Contains(Mime.OdgFlatMimeType, new XmlExtractor().SupportedMimeTypes);
+    }
+
+    /// <summary>The attribute is trusted only on a real <c>office:document</c> root in the ODF
+    /// office namespace — a stylesheet that merely mentions the type is not a drawing.</summary>
+    [Fact]
+    public void AnUnrelatedRootCarryingTheAttributeIsNotAFlatDrawing()
+    {
+        byte[] content = Encoding.UTF8.GetBytes(
+            "<wrapper office:mimetype=\"application/vnd.oasis.opendocument.graphics\"/>");
+
+        Assert.NotEqual(Mime.OdgFlatMimeType, Mime.DetectMimeTypeFromBytes(content));
     }
 }

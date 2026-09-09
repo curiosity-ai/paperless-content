@@ -46,6 +46,20 @@ public static class Mime
     /// <summary>KML — XML syntax, routed to the XML extractor.</summary>
     public const string KmlMimeType = "application/vnd.google-earth.kml+xml";
 
+    /// <summary>A packaged OpenDocument drawing.</summary>
+    public const string OdgMimeType = "application/vnd.oasis.opendocument.graphics";
+
+    /// <summary>
+    /// The flat single-file XML variant of <see cref="OdgMimeType"/> (<c>.fodg</c>): the whole
+    /// package's <c>content.xml</c> inlined as one document, with no ZIP layer.
+    /// </summary>
+    public const string OdgFlatMimeType = "application/vnd.oasis.opendocument.graphics-flat-xml";
+
+    /// <summary>The ODF namespace bound to the <c>office:</c> prefix, used to confirm that a flat
+    /// ODF document's root really is <c>office:document</c> before trusting its
+    /// <c>office:mimetype</c>.</summary>
+    private const string OdfOfficeNamespace = "urn:oasis:names:tc:opendocument:xmlns:office:1.0";
+
     /// <summary>The MS-CFB (compound binary file) signature, shared by legacy .doc/.xls/.ppt.</summary>
     private static bool IsOle2(ReadOnlySpan<byte> b) =>
         b.Length >= 8 && b[0] == 0xD0 && b[1] == 0xCF && b[2] == 0x11 && b[3] == 0xE0 &&
@@ -224,7 +238,36 @@ public static class Mime
         }
         string? root = RootStartTag(trimmed);
         if (root is null) return null;
-        return RootIsInNamespace(root, "http://docbook.org/ns/docbook") ? DocbookMimeType : null;
+        if (RootIsInNamespace(root, "http://docbook.org/ns/docbook")) return DocbookMimeType;
+        // A flat ODF document carries the packaged MIME type inside itself, as the root
+        // element's `office:mimetype`, rather than as a separate file in a ZIP — so content
+        // detection reads that attribute rather than sniffing a container.
+        if (RootIsInNamespace(root, OdfOfficeNamespace)
+            && RootLocalNameIs(root, "document")
+            && RootAttributeValue(root, "office:mimetype") == OdgMimeType)
+            return OdgFlatMimeType;
+        return null;
+    }
+
+    /// <summary>The local name of the root element, ignoring any namespace prefix.</summary>
+    private static bool RootLocalNameIs(string root, string localName)
+    {
+        string name = root.TrimStart('<').Split(' ', '\t', '\n', '\r', '>', '/')[0];
+        int colon = name.IndexOf(':');
+        return (colon >= 0 ? name[(colon + 1)..] : name) == localName;
+    }
+
+    /// <summary>The value of a quoted attribute on the root start tag, or null when absent.</summary>
+    private static string? RootAttributeValue(string root, string attribute)
+    {
+        int start = root.IndexOf(attribute + "=", StringComparison.Ordinal);
+        if (start < 0) return null;
+        string value = root[(start + attribute.Length + 1)..];
+        if (value.Length == 0) return null;
+        char quote = value[0];
+        if (quote != '"' && quote != '\'') return null;
+        int end = value.IndexOf(quote, 1);
+        return end > 0 ? value[1..end] : null;
     }
 
     /// <summary>
@@ -593,6 +636,7 @@ public static class Mime
         Add("application/toml", "toml");
         Add("application/xml", "xml");
         Add(KmlMimeType, "kml");
+        Add(OdgFlatMimeType, "fodg");
         Add("image/svg+xml", "svg");
         Add("message/rfc822", "eml");
         Add("application/vnd.ms-outlook", "msg");

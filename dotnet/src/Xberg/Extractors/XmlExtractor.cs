@@ -20,6 +20,7 @@ public sealed class XmlExtractor : IExtractor
         Mime.KmlMimeType,
         "image/svg+xml",
         "application/x-endnote+xml",
+        Mime.OdgFlatMimeType,
     };
 
     public int Priority => 50;
