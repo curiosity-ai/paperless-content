@@ -98,8 +98,8 @@ internal sealed class AsciiDocParser
     private readonly List<ProcessingWarning> _warnings = new();
 
     public List<string> Headers { get; } = new();
-    public List<string[]> Links { get; } = new();
-    public List<string[]> CodeBlocks { get; } = new();
+    public List<MarkdownLink> Links { get; } = new();
+    public List<MarkdownCodeBlock> CodeBlocks { get; } = new();
 
     public AsciiDocParser(string text) => _lines = text.Split('\n');
 
@@ -353,7 +353,7 @@ internal sealed class AsciiDocParser
 
         uint idx = _builder.PushCode(body, language, null, null);
         if (title is not null) _builder.SetAttributes(idx, new Dictionary<string, string> { ["title"] = title });
-        CodeBlocks.Add(new[] { language ?? "", body });
+        CodeBlocks.Add(new MarkdownCodeBlock { Language = language ?? "", Code = body });
         _pendingAttrs.Clear();
     }
 
@@ -656,7 +656,7 @@ internal sealed class AsciiDocParser
                     End = (uint)Utf8Length(outBuf),
                     Kind = new AnnotationKind { Which = AnnotationKind.Tag.Link, Url = link.Url },
                 });
-                Links.Add(new[] { link.Display, link.Url });
+                Links.Add(new MarkdownLink { Text = link.Display, Url = link.Url });
                 pos += link.Consumed;
                 atBoundary = false;
                 continue;
