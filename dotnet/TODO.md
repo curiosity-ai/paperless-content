@@ -2160,6 +2160,54 @@ and each probe lives in `dotnet/tools/` alongside the reference generator.
       "Unsupported format" and the comparison above is against libheif directly, through
       `pillow-heif`.
 
+## Optional OCR (added 2026-09-09) — a deviation, not a port
+
+Requested feature, not upstream parity. Recorded as a deviation in `Claude.md`
+("Deviation: optional OCR"); the short version, for anyone re-syncing:
+
+- [x] **`Core/OcrOptions.cs`** — `OcrMode { Disabled, ScanOnly, AllImages }` plus
+      `ModelDirectory` / `LayoutModelDirectory`, `Dpi`, `MaxImages`, `MinImagePixels`,
+      `PerImageTimeout`. Reached through `ExtractionConfig.Ocr`; **default `Disabled`**, and a
+      null `Ocr` behaves the same. Not a port of upstream's OCR config — do not reconcile them.
+- [x] **`Core/Ocr/IOcrEngine.cs`** — the seam, plus `OcrImageResult` and
+      `OcrUnavailableException`. Exists because the shipped recognizer needs a multi-gigabyte
+      checkpoint: without it every flow assertion would be unrunnable, or silently skipped.
+- [x] **`Core/Ocr/PaddleOcrEngine.cs`** — PaddleOCR-VL through the `PaddleOCR` package. Weights
+      load lazily on first call and are reused for the document; construction does no I/O.
+      Resolves `ModelDirectory` first, then PaddleOCR's own cache root. **Nothing downloads**;
+      a missing checkpoint raises `OcrUnavailableException` naming the directory it looked in.
+- [x] **`Core/Ocr/OcrPageRasterizer.cs`** — PDF pages to PNG via `PaddleOCR.Pdf` (PDFium).
+      Needed because the port's PDF reader does not rasterise and a scanned page's text exists
+      only as pixels. Renders from page 1 and discards unwanted pages — the underlying renderer
+      does not seek, and rendering a chosen page directly would mean a further dependency.
+- [x] **`Core/Ocr/OcrProcessor.cs`** — the pass itself, run from `Extractor` **before**
+      `Derive.DeriveExtractionResult` (unlike `QrPostProcessor`, which runs after rendering).
+      Working on the element stream is what lets an image's text be *inserted* after the `Image`
+      element that produced it, so every renderer places it inline for free; a pass over
+      rendered text could only append. Insertions are collected and applied back-to-front.
+      Additive only, never fatal (failures become `ProcessingWarning` source `"ocr"`), and no
+      engine is constructed until there is work. Sets `ExtractionMethod.Mixed` — not `Ocr` —
+      when it contributes, since the native text is still there.
+- [x] **`Xberg.csproj`** — `PaddleOCR` + `PaddleOCR.Pdf` 26.8.4668, and the `<Description>`
+      corrected: it claimed "No native dependencies", which these packages make false.
+      They bring SkiaSharp and PDFium transitively, which is why the feature is off by default
+      and why this breaks the "pure managed" convention in `Claude.md`.
+- [x] **`OcrProcessorTests.cs`** — 16 tests through a fake recognizer. Thirteen mutations of
+      `OcrProcessor` were applied one at a time and each watched to fail a specific test.
+      The first pass found one hole: the `Disabled` test used an image document, which the later
+      "is there any work?" check catches anyway — so it passed with the mode gate removed, while
+      a `Disabled` **scanned PDF** would have been recognised. The test now covers both.
+
+**No golden fixture compares OCR text with upstream, and none should be written.** Upstream
+recognizes with Tesseract or a candle-hosted VLM; two OCR engines never agree
+character-for-character. What is under test is the flow — gating, placement, budgets, failure
+handling. Recognition quality is PaddleOCR's own business.
+
+**Not covered by the suite:** that the real recognizer reads real text. The checkpoint is
+gigabytes and is not present in CI, so `PaddleOcrEngine` itself is exercised only by having
+been compiled against a live API probe of the package. An integration test gated on a staged
+checkpoint would close this and has not been written.
+
 ## Speed against the Rust library (measured 2026-08-26)
 
 `dotnet/tools/bench.sh` runs both implementations over the same corpus in one process tree,
@@ -2205,7 +2253,9 @@ Three caveats worth carrying:
 
 ## Excluded (dropped per requirements)
 
-- [-] OCR (Tesseract/Paddle/candle), doc orientation.
+- [-] OCR **as upstream implements it** — Tesseract/Paddle/candle bindings, hOCR parsing, the
+      OCR structure heuristics, doc orientation. The port instead ships its own opt-in OCR pass
+      on a different engine; see *Optional OCR* below and the deviation section of `Claude.md`.
 - [-] Audio/video transcription.
 - [-] Embeddings, reranking, NER/GLiNER, keyword extraction, chunking-for-RAG.
 - [-] LLM / structured LLM extraction, captioning.

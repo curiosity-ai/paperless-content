@@ -102,6 +102,17 @@ public sealed class ExtractionConfig
     public bool? QrCodes { get; set; }
 
     /// <summary>
+    /// The optional OCR pass. Null or <see cref="OcrMode.Disabled"/> — the default — means no
+    /// OCR, which is the port's behaviour before OCR existed.
+    /// </summary>
+    /// <remarks>
+    /// This is not upstream's OCR configuration. OCR is a deviation for this port, on a
+    /// different engine; see "Deviation: optional OCR" in <c>dotnet/Claude.md</c>.
+    /// </remarks>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public OcrOptions? Ocr { get; set; }
+
+    /// <summary>
     /// Limits applied to hostile input. <c>null</c> takes <see cref="SecurityLimits"/>' defaults,
     /// which is what upstream's <c>Option&lt;SecurityLimits&gt;</c> does with <c>None</c>.
     /// </summary>

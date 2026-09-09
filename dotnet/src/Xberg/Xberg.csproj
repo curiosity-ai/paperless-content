@@ -9,7 +9,7 @@
     <PackageId>Xberg</PackageId>
     <Version>0.1.0-alpha</Version>
     <Authors>Curiosity GmbH</Authors>
-    <Description>Native C# port of the Xberg document content-extraction engine. Extracts text, metadata, tables and structured content from Office documents, PDF, HTML, email, archives and more. No native dependencies.</Description>
+    <Description>Native C# port of the Xberg document content-extraction engine. Extracts text, metadata, tables and structured content from Office documents, PDF, HTML, email, archives and more. Extraction itself is pure managed; the optional OCR pass is off by default and brings native dependencies (SkiaSharp, PDFium) when enabled.</Description>
     <Packagelicense>MIT</Packagelicense>
     <PackageTags>document;extraction;pdf;docx;xlsx;pptx;text;markdown;html</PackageTags>
     <RepositoryUrl>https://github.com/curiosity-ai/xberg</RepositoryUrl>
@@ -30,6 +30,12 @@
     <PackageReference Include="SixLabors.Fonts" Version="2.0.9" />
     <PackageReference Include="System.Numerics.Tensors" Version="10.0.11" />
     <PackageReference Include="System.Text.Encoding.CodePages" Version="10.0.0" />
+    <!-- The optional OCR pass; see the OCR section of dotnet/Claude.md. `PaddleOCR` is a managed
+         recognizer whose only native dependency is SkiaSharp; `PaddleOCR.Pdf` adds PDFium, which
+         is what rasterises a scanned page so ScanOnly has pixels to read. Both load lazily and
+         only once a caller turns OCR on. -->
+    <PackageReference Include="PaddleOCR" Version="26.8.4668" />
+    <PackageReference Include="PaddleOCR.Pdf" Version="26.8.4668" />
   </ItemGroup>
 
 </Project>

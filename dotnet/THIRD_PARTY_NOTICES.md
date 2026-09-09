@@ -63,3 +63,27 @@ crates ships a `NOTICE` file, so §4(d) does not apply.
 - Modifications: only the element kinds `mathemascii` builds are ported, with
   the builder and writer behaviour of `BufMathMlWriter` reproduced; the crate's
   type-state builders, renderer trait, and unused elements are omitted.
+
+## Dependencies of the optional OCR pass — not derivative works
+
+The sections above cover *translated* code. The OCR pass (see the deviation
+section of `Claude.md`) instead takes a dependency on code it does not derive
+from, so nothing here is a derivative work — but it changes what the package
+carries, which the packagers' note above is about:
+
+| Package | License | Brings |
+|---|---|---|
+| `PaddleOCR` 26.8.4668 | Apache-2.0 | the recognizer; SkiaSharp (MIT) transitively |
+| `PaddleOCR.Pdf` 26.8.4668 | Apache-2.0 | page rasterisation; `PDFtoImage` (MIT) and PDFium (Apache-2.0) transitively |
+
+Two consequences worth stating plainly. **Native binaries** now reach a consumer
+who restores the package — SkiaSharp's and PDFium's — which is the trade-off the
+`Claude.md` deviation section records; the pass is off by default and neither is
+loaded until it is enabled. And these are two more Apache-2.0 components in a
+package declaring `MIT`, so the mismatch the note above describes now covers
+dependencies as well as derived files. That declaration is still left as it is,
+for the same reason.
+
+Model weights are **not** redistributed: nothing in this repository or its
+package downloads or ships a checkpoint. `OcrOptions.ModelDirectory` names where
+one already is, so whoever stages it accepts its own license.

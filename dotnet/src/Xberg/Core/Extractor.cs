@@ -39,6 +39,10 @@ public sealed class Extractor
             else
             {
                 var internalDoc = extractor.Extract(bytes, mimeType, config);
+                // Before derive, unlike the QR pass: working on the element stream lets an
+                // image's recognised text be inserted where the image sits, so every renderer
+                // places it inline rather than appending it to the end of the document.
+                Ocr.OcrProcessor.Process(internalDoc, bytes, mimeType, config);
                 var extracted = Derive.DeriveExtractionResult(
                     internalDoc, config.IncludeDocumentStructure, config.OutputFormat, config.HtmlOutput);
                 // Record the format the content was rendered in (Rust `pipeline::format`).
