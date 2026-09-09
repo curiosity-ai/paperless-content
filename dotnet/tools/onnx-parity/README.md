@@ -1,6 +1,6 @@
 # ONNX parity pipeline
 
-Validates the pure-C# ONNX runtime under `src/Paperless.Content/Internal/Onnx` against ONNX Runtime,
+Validates the pure-C# ONNX runtime under `src/XRay/Internal/Onnx` against ONNX Runtime,
 one graph value at a time.
 
 ## Why per-layer
@@ -57,7 +57,7 @@ committed. Raise `--max-elements` to cover the large early feature maps too.
 Compare:
 
 ```bash
-cd ../../ && dotnet run --project tools/Paperless.Content.OnnxParity -c Release -- \
+cd ../../ && dotnet run --project tools/XRay.OnnxParity -c Release -- \
     --model .../rtdetr.onnx --reference .../ref/rtdetr --limit 0 --detections 0.3
 ```
 
@@ -76,7 +76,7 @@ largest single win in the multiply was visible only there:
 
 ```bash
 DOTNET_TieredCompilation=0 DOTNET_JitDisasm="TwelveRows512" \
-    dotnet run --project tools/Paperless.Content.OnnxParity -c Release -- --gemm
+    dotnet run --project tools/XRay.OnnxParity -c Release -- --gemm
 ```
 
 ## Reading the results
@@ -133,7 +133,7 @@ meant regenerating hundreds of megabytes of promoted intermediates before anyone
 a kernel change, which is enough friction to stop the measurement happening at all:
 
 ```bash
-dotnet run --project tools/Paperless.Content.OnnxParity -c Release -- --model rtdetr.onnx --benchmark 3
+dotnet run --project tools/XRay.OnnxParity -c Release -- --model rtdetr.onnx --benchmark 3
 ```
 
 **Cold code measures the compiler.** .NET starts methods in a quick-JIT tier and promotes
@@ -372,7 +372,7 @@ matters is unmeasured.
 ## Two bugs this caught
 
 Worth recording, because neither would have been visible from the final output alone and
-both are now regression-tested in `tests/Paperless.Content.Tests/OnnxRuntimeTests.cs`.
+both are now regression-tested in `tests/XRay.Tests/OnnxRuntimeTests.cs`.
 
 **Softmax overflow.** `TensorPrimitives.SoftMax` exponentiates raw values without
 subtracting the row maximum. RT-DETR's cross-attention produces logit rows around −164;

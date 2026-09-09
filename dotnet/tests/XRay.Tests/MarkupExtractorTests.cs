@@ -1,0 +1,247 @@
+using System.Text;
+using XRay.Core;
+using XRay.Extractors;
+using XRay.Rendering;
+using XRay.Types;
+using Xunit;
+
+namespace XRay.Tests;
+
+/// <summary>
+/// Tests for the lightweight markup/data extractors ported from the Rust crate:
+/// RST, Org, Typst, LaTeX, OPML, Jupyter, FictionBook, BibTeX, Citation, DBF.
+/// </summary>
+public class MarkupExtractorTests
+{
+    private static InternalDocument Extract(IExtractor e, string text, string mime) =>
+        e.Extract(Encoding.UTF8.GetBytes(text), mime, new ExtractionConfig());
+
+    [Fact]
+    public void Rst_HeadingAndFieldList()
+    {
+        var doc = Extract(new RstExtractor(), ":Author: John Doe\n\nTitle\n=====\n\nA paragraph.\n", "text/x-rst");
+        Assert.Equal(new List<string> { "John Doe" }, doc.Metadata.Authors);
+        string plain = PlainRenderer.Render(doc);
+        Assert.Contains("Title", plain);
+        Assert.Contains("A paragraph.", plain);
+    }
+
+    [Fact]
+    public void Rst_SimpleTable()
+    {
+        var doc = Extract(new RstExtractor(), "=====  =====\nName   Age\n=====  =====\nAlice  30\n=====  =====\n", "text/x-rst");
+        Assert.NotEmpty(doc.Tables);
+        Assert.Equal(new List<string> { "Name", "Age" }, doc.Tables[0].Cells[0]);
+    }
+
+    [Fact]
+    public void Org_MetadataAndHeadings()
+    {
+        var doc = Extract(new OrgExtractor(), "#+TITLE: Doc\n#+AUTHOR: Jane\n\n* Heading\n\nText.\n", "text/x-org");
+        Assert.Equal("Doc", doc.Metadata.Title);
+        Assert.Equal(new List<string> { "Jane" }, doc.Metadata.Authors);
+        Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.Heading && e.Text == "Heading");
+    }
+
+    [Fact]
+    public void Org_PipeTable()
+    {
+        var doc = Extract(new OrgExtractor(), "| Name | Age |\n|------+-----|\n| Alice | 30 |\n", "text/x-org");
+        Assert.NotEmpty(doc.Tables);
+    }
+
+    [Fact]
+    public void Typst_HeadingDropsItsMarkerAndKeepsMetadata()
+    {
+        var doc = Extract(new TypstExtractor(), "#set document(title: \"T\")\n= Intro\nBody.\n", "application/x-typst");
+        Assert.Equal("T", doc.Metadata.Title);
+        var heading = doc.Elements.Single(e => e.Kind.Tag == ElementKindTag.Heading);
+        // The marker run carries the level and must not survive into the text, or each renderer
+        // repeats it after emitting its own.
+        Assert.Equal("Intro", heading.Text);
+        Assert.Equal(1, heading.Kind.Level);
+    }
+
+    [Fact]
+    public void Typst_DisplayMathSpansLinesUntilItCloses()
+    {
+        var doc = Extract(new TypstExtractor(), "Before\n\n$\nx^2 + y^2\n= r^2\n$\n\nAfter\n", "application/x-typst");
+        var formula = doc.Elements.Single(e => e.Kind.Tag == ElementKindTag.Formula);
+        // The converter collapses the source's line breaks: the formula is one expression, not
+        // two lines of one.
+        Assert.Equal("x^2 + y^2 = r^2", formula.Text);
+        Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.Paragraph && e.Text == "After");
+    }
+
+    [Fact]
+    public void Typst_UnterminatedDisplayMathStillYieldsItsBody()
+    {
+        var doc = Extract(new TypstExtractor(), "$ a + b\nc + d\n", "application/x-typst");
+        var formula = doc.Elements.Single(e => e.Kind.Tag == ElementKindTag.Formula);
+        Assert.Equal("a + b c + d", formula.Text);
+    }
+
+    [Fact]
+    public void Typst_FigureIsConsumedToItsClosingParenthesis()
+    {
+        var doc = Extract(
+            new TypstExtractor(),
+            "Intro.\n\n#figure(\n  image(\"chart.png\"),\n  caption: [A chart],\n)\n\nOutro.\n",
+            "application/x-typst");
+
+        // The whole call is swallowed: none of its source may reach the text.
+        Assert.DoesNotContain(doc.Elements, e => e.Text.Contains("caption:", StringComparison.Ordinal));
+        Assert.Contains(doc.Elements, e => e.Text == "[Image: chart.png]");
+        Assert.Contains(doc.Elements, e => e.Text == "A chart");
+        Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.Paragraph && e.Text == "Outro.");
+    }
+
+    [Fact]
+    public void Typst_QuoteAndTermDefinitionAndBibliography()
+    {
+        var doc = Extract(
+            new TypstExtractor(),
+            "#quote[Cited words]\n\n/ Term: its meaning\n\n#bibliography(\"refs.bib\")\n",
+            "application/x-typst");
+
+        Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.QuoteStart);
+        Assert.Contains(doc.Elements, e => e.Text == "Cited words");
+        Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.DefinitionTerm && e.Text == "Term");
+        Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.DefinitionDescription && e.Text == "its meaning");
+        Assert.DoesNotContain(doc.Elements, e => e.Text.Contains("refs.bib", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Latex_SectionAndBoldAnnotation()
+    {
+        var doc = Extract(new LatexExtractor(), "\\begin{document}\n\\section{Intro}\nHello \\textbf{world}.\n\\end{document}\n", "text/x-tex");
+        Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.Heading && e.Text == "Intro");
+        var para = doc.Elements.First(e => e.Kind.Tag == ElementKindTag.Paragraph && e.Text.Contains("world"));
+        Assert.Contains(para.Annotations, a => a.Kind.Which == AnnotationKind.Tag.Bold);
+    }
+
+    /// <summary>
+    /// `longtable`, `tabularx` and `tabulary` hold the same `&amp;`-separated grid as `tabular`,
+    /// and longtable's page-break markers are scaffolding rather than rows.
+    /// </summary>
+    [Fact]
+    public void Latex_LongtableIsATableAndItsRuleLinesAreNotRows()
+    {
+        var doc = Extract(new LatexExtractor(),
+            "\\begin{document}\n\\begin{longtable}[]{@{}ll@{}}\n\\toprule\\noalign{}\n" +
+            "Metric & Type \\\\\n\\midrule\\noalign{}\n\\endhead\n\\bottomrule\\noalign{}\n\\endlastfoot\n" +
+            "hits & counter \\\\\n\\end{longtable}\n\\end{document}\n", "text/x-tex");
+
+        var table = Assert.Single(doc.Tables);
+        Assert.Equal(new[] { "Metric", "Type" }, table.Cells[0]);
+        Assert.Equal(new[] { "hits", "counter" }, table.Cells[1]);
+        Assert.Equal(2, table.Cells.Count);
+    }
+
+    [Fact]
+    public void Latex_TitleMetadata()
+    {
+        var doc = Extract(new LatexExtractor(), "\\title{My Title}\n\\author{Me}\n\\begin{document}\nx\n\\end{document}\n", "text/x-tex");
+        Assert.Equal("My Title", doc.Metadata.Title);
+        Assert.Equal("Me", doc.Metadata.CreatedBy);
+    }
+
+    [Fact]
+    public void Opml_OutlineHeadingsAndMetadata()
+    {
+        string opml = "<opml><head><title>Feeds</title><ownerName>Bob</ownerName></head>" +
+                      "<body><outline text=\"A\"><outline text=\"B\"/></outline></body></opml>";
+        var doc = Extract(new OpmlExtractor(), opml, "application/xml+opml");
+        Assert.Equal("Feeds", doc.Metadata.Title);
+        Assert.Equal("Bob", doc.Metadata.CreatedBy);
+        Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.Heading && e.Text == "A");
+    }
+
+    [Fact]
+    public void Jupyter_CellsAndMetadata()
+    {
+        string nb = "{\"cells\":[{\"cell_type\":\"markdown\",\"source\":[\"# Title\"]}," +
+                    "{\"cell_type\":\"code\",\"execution_count\":1,\"source\":[\"print(1)\"],\"outputs\":[]}]," +
+                    "\"metadata\":{\"language_info\":{\"name\":\"python\"}},\"nbformat\":4,\"nbformat_minor\":5}";
+        var doc = Extract(new JupyterExtractor(), nb, "application/x-ipynb+json");
+        Assert.Equal("python", doc.Metadata.Language);
+        Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.Heading && e.Text == "Title");
+        Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.Code && e.Text == "print(1)");
+    }
+
+    [Fact]
+    public void FictionBook_TitleAndParagraph()
+    {
+        string fb2 = "<?xml version=\"1.0\"?><FictionBook><description><title-info>" +
+                     "<book-title>Book</book-title><lang>en</lang></title-info></description>" +
+                     "<body><section><title><p>Chapter</p></title><p>Hello world.</p></section></body></FictionBook>";
+        var doc = Extract(new FictionBookExtractor(), fb2, "application/x-fictionbook+xml");
+        Assert.Equal("Book", doc.Metadata.Title);
+        Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.Paragraph && e.Text == "Hello world.");
+    }
+
+    [Fact]
+    public void Bibtex_EntryBecomesCitation()
+    {
+        string bib = "@article{k1,\n  title = {A Title},\n  author = {Alice Smith and Bob Jones},\n  year = {2020}\n}\n";
+        var doc = Extract(new BibtexExtractor(), bib, "application/x-bibtex");
+        var meta = Assert.IsType<BibtexMetadata>(doc.Metadata.Format!.Payload);
+        Assert.Equal(1, meta.EntryCount);
+        var cite = Assert.Single(doc.Elements.Where(e => e.Kind.Tag == ElementKindTag.Citation));
+        Assert.StartsWith("@article{k1,", cite.Text);
+        Assert.Contains("author = {Alice Smith and Bob Jones}", cite.Text);
+    }
+
+    [Fact]
+    public void Citation_RisParsesTitleAndAuthors()
+    {
+        string ris = "TY  - JOUR\nTI  - Sample Title\nAU  - Smith, John\nAU  - Doe, Jane\nPY  - 2024\nER  -\n";
+        var doc = Extract(new CitationExtractor(), ris, "application/x-research-info-systems");
+        Assert.Equal(new List<string> { "Jane Doe", "John Smith" }, doc.Metadata.Authors);
+
+        // The element carries the whole record, not just its title.
+        var citation = doc.Elements.Single(e => e.Kind.Tag == ElementKindTag.Citation);
+        Assert.Equal("Title: Sample Title\nAuthors: John Smith, Jane Doe\nYear: 2024", citation.Text);
+    }
+
+    [Fact]
+    public void Dbf_ParsesHeaderTable()
+    {
+        byte[] dbf = BuildMinimalDbf();
+        var doc = new DbfExtractor().Extract(dbf, "application/x-dbf", new ExtractionConfig());
+        var meta = Assert.IsType<DbfMetadata>(doc.Metadata.Format!.Payload);
+        Assert.Equal(2, meta.FieldCount);
+        Assert.Equal(1, meta.RecordCount);
+        Assert.Single(doc.Tables);
+        Assert.Equal(new List<string> { "NAME", "AGE" }, doc.Tables[0].Cells[0]);
+        Assert.Equal(new List<string> { "Alice", "30" }, doc.Tables[0].Cells[1]);
+    }
+
+    // Builds a tiny dBASE III file: 2 Character fields (NAME[10], AGE[3]), 1 record.
+    private static byte[] BuildMinimalDbf()
+    {
+        int recordSize = 1 + 10 + 3;
+        int headerSize = 32 + 2 * 32 + 1;
+        var buf = new byte[headerSize + recordSize + 1];
+        buf[0] = 0x03;
+        BitConverter.GetBytes(1).CopyTo(buf, 4);          // num records
+        BitConverter.GetBytes((ushort)headerSize).CopyTo(buf, 8);
+        BitConverter.GetBytes((ushort)recordSize).CopyTo(buf, 10);
+        WriteField(buf, 32, "NAME", 'C', 10);
+        WriteField(buf, 64, "AGE", 'C', 3);
+        buf[96] = 0x0D;                                    // header terminator
+        int rec = headerSize;
+        buf[rec] = 0x20;                                   // not deleted
+        Encoding.ASCII.GetBytes("Alice     ").CopyTo(buf, rec + 1);
+        Encoding.ASCII.GetBytes("30 ").CopyTo(buf, rec + 11);
+        buf[^1] = 0x1A;                                    // EOF
+        return buf;
+    }
+
+    private static void WriteField(byte[] buf, int off, string name, char type, byte len)
+    {
+        Encoding.ASCII.GetBytes(name).CopyTo(buf, off);
+        buf[off + 11] = (byte)type;
+        buf[off + 16] = len;
+    }
+}
