@@ -26,6 +26,15 @@ dependency.
   performs the outbound request; callers may add stricter policy but cannot replace the transport boundary.
 - `sceptre`: reusable Sceptre OCR models/runtime. Xberg owns its adapter, configuration, and integration behavior.
 
+One boundary is in-repo rather than a sibling repository:
+
+- `dotnet/` — **Paperless.Content**, a native C# port of the extraction engine, published to NuGet as
+  `Paperless.Content`. It is not a binding over the Rust core and shares no code with it, so a Rust change never
+  propagates there automatically and a change under `dotnet/` never affects the Rust crate or its bindings. Treat it
+  as its own project: read `dotnet/Claude.md` before touching it, keep `crates/` untouched from inside it (upstream
+  merges depend on that), and do not confuse it with upstream's `packages/csharp` FFI binding (`XbergIo.Xberg`),
+  which is a wrapper over the Rust core and unrelated.
+
 ## API placement
 
 Keep reusable primitives in the Rust crate when enterprise or Rust callers need them. Bindings should expose a
