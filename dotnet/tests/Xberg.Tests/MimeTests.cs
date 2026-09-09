@@ -375,4 +375,43 @@ public class MimeTests
                 "application/x-fictionbook+xml",
                 Encoding.UTF8.GetBytes("<?xml version=\"1.0\"?><FictionBook/>")));
     }
+
+    /// <summary>
+    /// Upstream <c>feat(mime): complete format and extension registry</c>. Each of these
+    /// extensions names a format an extractor here already claims, and each resolved to nothing:
+    /// an <c>.xhtml</c> file never reached the HTML extractor at all, and the HEIF sequence types
+    /// the image extractor advertises had no extension pointing at them.
+    /// </summary>
+    [Theory]
+    [InlineData("page.xhtml", "application/xhtml+xml")]
+    [InlineData("page.xht", "application/xhtml+xml")]
+    [InlineData("notes.dj", "text/x-djot")]
+    [InlineData("deck.pps", "application/vnd.ms-powerpoint")]
+    [InlineData("book.xltm", "application/vnd.ms-excel.template.macroEnabled.12")]
+    [InlineData("addin.xla", "application/vnd.ms-excel")]
+    [InlineData("photo.hif", "image/heif")]
+    [InlineData("burst.heifs", "image/heif-sequence")]
+    [InlineData("burst.heics", "image/heic-sequence")]
+    public void AnAliasExtensionResolvesToItsFormat(string fileName, string expected) =>
+        Assert.Equal(expected, Mime.DetectMimeType(fileName, checkExists: false));
+
+    /// <summary>
+    /// Each alias above has to reach a real extractor, not just resolve to a name. The registry
+    /// derives its "supported" set from the extension table itself, so that set cannot answer
+    /// this — only the extractor registry can.
+    /// </summary>
+    [Theory]
+    [InlineData("page.xhtml")]
+    [InlineData("notes.dj")]
+    [InlineData("deck.pps")]
+    [InlineData("photo.hif")]
+    [InlineData("burst.heifs")]
+    [InlineData("burst.heics")]
+    public void AnAliasExtensionReachesAnExtractor(string fileName)
+    {
+        string? mime = Mime.DetectMimeType(fileName, checkExists: false);
+
+        Assert.NotNull(mime);
+        Assert.NotNull(Registry.RegisterDefaults().ForMime(mime!));
+    }
 }
