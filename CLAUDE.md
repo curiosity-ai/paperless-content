@@ -389,8 +389,36 @@ deviation rather than a port:
 | Mode | What it recognises |
 |---|---|
 | `Disabled` | Nothing. No model is resolved, no native library is touched. |
-| `ScanOnly` | Pages a PDF's scan detector flagged (`PdfMetadata.ScannedPages`, from the existing `PdfScanDetect`). The pages are rasterised at `Dpi` and recognised whole; the text is **appended** as a page-level `OcrText` element carrying its `Page`, because a whole page's recognition has no single element to sit after. |
+| `ScanOnly` | Pages a PDF's scan detector flagged (`PdfMetadata.ScannedPages`, from the existing `PdfScanDetect`). The pages are rasterised at `Dpi` and recognised whole; the text is **appended** as a page-level `OcrText` element carrying its `Page`, because a whole page's recognition has no single element to sit after. A table the page held becomes a `Table` element instead — see [Tables come back as tables](#tables-come-back-as-tables-not-as-markup). |
 | `AllImages` | Every embedded image that carries bytes and clears `MinImagePixels`, plus the `ScanOnly` behaviour for PDFs. Each image's text is **inserted immediately after the `Image` element that references it**, so every renderer places it inline for free. An image no element references is appended rather than dropped. |
+
+### Tables come back as tables, not as markup
+
+PaddleOCR-VL reads a table region as OTSL and its pipeline converts that to an HTML
+`<table>` (`OtslTable.ToHtml`), so a recognition arrives as text with HTML tables embedded in
+it. Dropping that into a text element would make every output format wrong in its own way —
+Markdown emitting raw HTML where a pipe table belongs, plain text emitting the tags
+themselves.
+
+`OcrTables.Split` therefore cuts a recognition into its text runs and its tables before any of
+it becomes an element, and each table is pushed onto `InternalDocument.Tables` behind an
+ordinary `Table` element. From there nothing about it is OCR-specific: Markdown writes a pipe
+table, HTML writes a real `<table>`, plain text writes the cells, and the table shows up in
+`ExtractedDocument.Tables` where a consumer already looks for one.
+
+Two decisions inside it are worth keeping:
+
+- **Cells hold plain text, not rendered Markdown.** The HTML extractor renders its cells as
+  Markdown, because a cell there can contain real inline markup. An OCR cell cannot —
+  `OtslTable` encodes the recognised text — so rendering it would only escape characters the
+  camera saw, and the same grid is what the plain and HTML renderers read. Entities are
+  decoded, whitespace collapsed, nothing escaped; the Markdown renderer escapes what Markdown
+  needs, once, on the way out.
+- **Placement is the shared `GridFlatten` rule**, so a merged cell keeps the rest of its row
+  lined up with its headers exactly as it would in any other format.
+
+A `<table>` that yields no grid — unbalanced markup, or nothing but empty cells — stays in the
+text verbatim. Markup a consumer can still parse beats a table invented from a failed read.
 
 ### Where it runs, and why there
 
@@ -417,6 +445,9 @@ Note this differs from `QrPostProcessor`, which runs after rendering.
   cache warmed out of band works unconfigured. A missing checkpoint raises
   `OcrUnavailableException` — the pass will not pull gigabytes as a side effect of an
   extraction call.
+- **A recognised table is a table.** It goes into `InternalDocument.Tables` behind a `Table`
+  element rather than staying HTML in a text element, so the output format decides how it is
+  written. See [Tables come back as tables](#tables-come-back-as-tables-not-as-markup).
 - **`ExtractionMethod` becomes `Mixed`, not `Ocr`**, when the pass contributes. The native
   text is still there, and a consumer treating the whole document as machine-read would be
   wrong about most of it.
@@ -426,5 +457,5 @@ Note this differs from `QrPostProcessor`, which runs after rendering.
 `IOcrEngine` exists so the flow is testable: the shipped recognizer needs a multi-gigabyte
 checkpoint, so `OcrProcessorTests` drives everything through a fake. Recognition quality is
 PaddleOCR's own business and is not re-tested here. Every assertion in that file has been
-mutation-proved — each of the thirteen behaviours above was reverted in turn and the
+mutation-proved — each of the twenty-one behaviours above was reverted in turn and the
 corresponding test watched to fail.
