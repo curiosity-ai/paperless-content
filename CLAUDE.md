@@ -38,7 +38,9 @@ When a Rust code path branches into an excluded feature, the C# port takes the
 
 **OCR is the one exception, and a deliberate deviation from upstream** rather than a
 port of it — off by default, opt-in, and a different engine. See
-[Deviation: optional OCR](#deviation-optional-ocr).
+[Deviation: optional OCR](#deviation-optional-ocr). A second, much smaller deviation
+renders a spreadsheet's cells the way the spreadsheet shows them — see
+[Deviation: formatted Excel cells](#deviation-formatted-excel-cells).
 
 ---
 
@@ -351,6 +353,53 @@ The loop that works:
   The optional OCR pass is the single documented exception — it pulls native code in
   transitively, which is why it is off by default. See
   [Deviation: optional OCR](#deviation-optional-ocr).
+
+---
+
+## Deviation: formatted Excel cells
+
+Small, and unlike OCR it changes a default rather than adding an opt-in pass, so it is worth
+knowing about before a golden diff is read as a regression.
+
+**What upstream does.** calamine hands the Rust side a bare `f64` and `format_cell_to_string`
+prints it, so a cell displaying `3.2%` reaches a golden as `0.032280358222708555`, one
+displaying `$31,200` as `31200`, and a date as its serial number. The number format the
+workbook carries is never consulted.
+
+**What the port does.** `XRayOptions.ExcelNumberFormats`, **on by default**, renders a numeric
+cell through its own format code, so an extracted cell reads the way the spreadsheet shows it.
+Set it false — or `XRAY_EXCEL_NUMBER_FORMATS=0` for a harness — to get upstream's rendering
+back, which is what a run against the Rust goldens needs.
+
+**How it is put together.** One renderer, `Internal/Excel/ExcelNumberFormat`, holds the whole
+grammar; `ExcelCellFormats` is the two-level lookup (number formats, and the cell formats that
+cite them) each container fills from its own records:
+
+| Container | Where the formats are | Which cell formats count |
+|---|---|---|
+| `.xls` | BIFF `FORMAT` (0x041E) and `XF` (0x00E0) records in the globals substream | all of them — a cell's `ixfe` indexes one combined list |
+| `.xlsx` | `xl/styles.xml`, `numFmts` and `cellXfs` | `cellXfs`, indexed by a cell's `s` attribute |
+| `.xlsb` | `xl/styles.bin`, `BrtFmt` and `BrtXF` | only the `BrtXF`s inside the `cellXfs` block, since `cellStyleXfs` shares the record id |
+
+Nothing else in the extraction flow changes: cells are still strings on a grid, and every
+renderer downstream is untouched.
+
+**Two deliberate departures from what Excel draws.** `_x` reserves the width of a character and
+`* x` fills the cell with one; both are alignment, not content, so neither is emitted — the
+accounting format `_("$"* #,##0_)` yields `$31,200` where Excel draws `$␣␣31,200␣`. And a
+format the renderer has no shape for — a fraction, scientific notation, elapsed time — falls
+back to the unformatted value rather than to a guess, so an unusual workbook degrades to
+today's output.
+
+**What it does not touch.** A `General` cell, which is most of the corpus: of the Excel
+fixtures, only `xls/test_excel.xls` moves.
+
+**ODS is deliberately left out**, and stays at upstream parity. Its numeric cells reach
+`OdsExtractor` as `office:value` and are printed the same way calamine prints them, so a
+percentage there is still a ratio. Bringing it along is a separate change and a smaller one:
+an ODS cell already carries its displayed text in the `<text:p>` the extractor reads only for
+string cells, so it needs no format grammar at all — OpenDocument's `number:` style elements
+are a different language from Excel's format codes, and nothing above would be reused.
 
 ---
 
