@@ -37,7 +37,9 @@
 
   <ItemGroup>
     <None Include="README.md" Pack="true" PackagePath="/" />
-    <!-- The family's icon, shared with the member packages rather than duplicated. -->
+    <!-- The family's icon, shared with the member packages rather than duplicated. Packed
+         because PackageIcon names it; the README links the logo by absolute URL, since
+         nuget.org renders neither relative image paths nor raw HTML. -->
     <None Include="../XRay.Content/logo.png" Pack="true" PackagePath="/" />
   </ItemGroup>
 
